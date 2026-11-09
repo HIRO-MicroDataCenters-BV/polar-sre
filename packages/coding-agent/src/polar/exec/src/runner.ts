@@ -49,7 +49,7 @@ const INTERPRETERS: Record<ExecLanguage, string> = { python: "python3", bash: "b
 
 export function launcher(language: ExecLanguage): string {
 	const file = `"$d/${PROGRAM_FILES[language]}"`;
-	return `d="\${TMPDIR:-/tmp}/.pi"; mkdir -p "$d" && cat > ${file} && exec ${INTERPRETERS[language]} ${file} </dev/null`;
+	return `d="\${TMPDIR:-/tmp}/.polar"; mkdir -p "$d" && cat > ${file} && exec ${INTERPRETERS[language]} ${file} </dev/null`;
 }
 
 const OOM_LINE = /(?:Memory cgroup out of memory|Out of memory): Killed process[^\n]*/;

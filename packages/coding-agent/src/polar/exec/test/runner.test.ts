@@ -174,6 +174,9 @@ describe("ExecCall", () => {
 	});
 
 	it("gives the program an empty stdin and keeps the source out of it", async () => {
+		expect(launcher("python")).toContain("/tmp}/.polar");
+		expect(launcher("bash")).toContain("/tmp}/.polar");
+		expect(launcher("python")).not.toContain("/.pi");
 		const programs = await mkdtemp(join(tmpdir(), "exec-launcher-"));
 		const sh = (language: ExecLanguage, code: string) =>
 			spawnSync("sh", ["-c", launcher(language)], {
@@ -185,9 +188,9 @@ describe("ExecCall", () => {
 			const bash = sh("bash", 'cat\necho AFTER\nread -r line; echo "[$line]"\nhead -c 10; echo END\n');
 			expect(bash.status).toBe(0);
 			expect(bash.stdout).toBe("AFTER\n[]\nEND\n");
-			const python = sh("python", "import sys\nprint(repr(sys.stdin.read()))\nprint('AFTER')\n");
+			const python = sh("python", "import sys\nprint(repr(sys.stdin.read()), __file__)\nprint('AFTER')\n");
 			expect(python.status).toBe(0);
-			expect(python.stdout).toBe("''\nAFTER\n");
+			expect(python.stdout).toBe(`'' ${join(programs, ".polar", "program.py")}\nAFTER\n`);
 		} finally {
 			await rm(programs, { recursive: true, force: true });
 		}

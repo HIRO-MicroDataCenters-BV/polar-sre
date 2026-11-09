@@ -57,7 +57,7 @@ packages/coding-agent/src/polar/exec/
 3. **`src/runner.ts` (Layer 3 — Call Admission & `container run` Supervision)**
    - `admitCall`: admits a call when `runtime.state === "open"` and records `toolCallId` in `runtime.inFlight`.
    - `ExecCall`: cleans up leftover owned containers from prior calls (failing with `runtime_failed` if any remain), opens `<outputDirectory>/exec-<n>.part` via `openOutputFile`, and spawns `container run`.
-   - `ExecRun`: writes the script to `stdin` of the guest launcher (`cat > "$TMPDIR/.pi/program.<ext>" && exec <interpreter> ... </dev/null`), streams `stdout` into `OpenFile.sink` with backpressure, captures `stderr` up to `1 MiB`, and stops the container on timeout, abort, output limit, or shutdown via `container kill <name>` followed by `SIGKILL` after `killGraceMs` (`2s`).
+   - `ExecRun`: writes the script to `stdin` of the guest launcher (`cat > "$TMPDIR/.polar/program.<ext>" && exec <interpreter> ... </dev/null`), streams `stdout` into `OpenFile.sink` with backpressure, captures `stderr` up to `1 MiB`, and stops the container on timeout, abort, output limit, or shutdown via `container kill <name>` followed by `SIGKILL` after `killGraceMs` (`2s`).
    - On non-zero exit: for `exitCode === 137`, checks `container logs --boot <name>` for a kernel OOM line (`out_of_memory`); otherwise inspects container presence (`present | absent | unknown`) before deleting the container via `cleanupContainer`.
 
 4. **`src/reply.ts` (Layer 4 — Sandbox Reply Builder)**
