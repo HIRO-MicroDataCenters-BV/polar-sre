@@ -1,5 +1,7 @@
+import { mkdir, readFile, rm, writeFile } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
+import { getAgentDir } from "../../config.ts";
 import type { ExtensionAPI, ExtensionContext } from "../../core/extensions/types.ts";
 import { killProcessGroup } from "../shared/process.ts";
 import { buildReply } from "../shared/reply.ts";
@@ -58,6 +60,39 @@ function registerTools(pi: ExtensionAPI, runtime: K8sRuntime): void {
 	pi.registerTool(createProducerTool(inspectSpec, runtime, deps));
 }
 
+const STATE_FILE = "k8s.json";
+
+function stateFilePath(): string {
+	return join(getAgentDir(), STATE_FILE);
+}
+
+async function readSavedLaunchConfig(): Promise<LaunchConfig | undefined> {
+	try {
+		const raw = JSON.parse(await readFile(stateFilePath(), "utf8")) as Partial<LaunchConfig>;
+		if (
+			typeof raw.kubeconfigPath === "string" &&
+			raw.kubeconfigPath !== "" &&
+			typeof raw.context === "string" &&
+			raw.context !== ""
+		) {
+			return { kubeconfigPath: raw.kubeconfigPath, context: raw.context };
+		}
+		return undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+async function saveLaunchConfig(launch: LaunchConfig): Promise<void> {
+	const dir = getAgentDir();
+	await mkdir(dir, { recursive: true });
+	await writeFile(stateFilePath(), `${JSON.stringify(launch, null, "\t")}\n`, "utf8");
+}
+
+async function clearSavedLaunchConfig(): Promise<void> {
+	await rm(stateFilePath(), { force: true }).catch(() => undefined);
+}
+
 function readKubeconfigFlag(pi: ExtensionAPI): string {
 	return (pi.getFlag("k8s-kubeconfig") as string | undefined) ?? "";
 }
@@ -68,27 +103,41 @@ function formatDiscoveryErrors(errors: readonly DiscoveryError[]): string {
 
 function stayOff(ctx: ExtensionContext, warning: string): undefined {
 	ctx.ui.notify(warning, "warning");
-	ctx.ui.setStatus("k8s", "k8s: off (/kubeconfig)");
+	ctx.ui.setStatus("k8s", "kubeconfig: off, run /kubeconfig");
 	return undefined;
 }
 
-function readLaunchConfigOrStayOff(pi: ExtensionAPI, ctx: ExtensionContext): LaunchConfig | undefined {
+async function resolveLaunchConfigOrStayOff(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+): Promise<LaunchConfig | undefined> {
 	const context = pi.getFlag("k8s-context");
-	if (typeof context !== "string" || context === "") {
-		return stayOff(ctx, "k8s: no context selected (tools are off). Run /kubeconfig to select a context.");
+	if (typeof context === "string" && context !== "") {
+		const paths = splitKubeconfigPaths(readKubeconfigFlag(pi));
+		const [kubeconfigPath] = paths;
+		if (kubeconfigPath === undefined) {
+			return stayOff(ctx, "kubeconfig: no kubeconfig file specified, run /kubeconfig to select");
+		}
+		if (paths.length > 1) {
+			return stayOff(ctx, "kubeconfig: --k8s-kubeconfig lists multiple files, run /kubeconfig to select");
+		}
+		return { kubeconfigPath, context };
 	}
-	const paths = splitKubeconfigPaths(readKubeconfigFlag(pi));
-	const [kubeconfigPath] = paths;
-	if (kubeconfigPath === undefined) {
-		return stayOff(ctx, "k8s: no kubeconfig file specified (tools are off). Run /kubeconfig to select a context.");
+
+	const saved = await readSavedLaunchConfig();
+	if (saved === undefined) {
+		return stayOff(ctx, "kubeconfig: no context selected, run /kubeconfig to select");
 	}
-	if (paths.length > 1) {
+
+	const { items } = await discoverKubeContexts([saved.kubeconfigPath], "kubectl", process.env);
+	if (!items.some((item) => item.context === saved.context && item.kubeconfigPath === saved.kubeconfigPath)) {
+		await clearSavedLaunchConfig();
 		return stayOff(
 			ctx,
-			"k8s: --k8s-kubeconfig lists multiple files (tools are off). Run /kubeconfig to select a context.",
+			`kubeconfig: saved context "${saved.context}" was not found in ${saved.kubeconfigPath}, run /kubeconfig to select`,
 		);
 	}
-	return { kubeconfigPath, context };
+	return saved;
 }
 
 function killProcessGroups(processGroups: Set<number>): void {
@@ -112,7 +161,7 @@ export default function k8sExtension(pi: ExtensionAPI): void {
 		const runtime = createRuntime(launch, process.env, handle);
 		registerTools(pi, runtime);
 		current = runtime;
-		ctx.ui.setStatus("k8s", `k8s: ${launch.context}`);
+		ctx.ui.setStatus("k8s", `kubeconfig: ${launch.context}`);
 		return true;
 	}
 
@@ -176,16 +225,17 @@ export default function k8sExtension(pi: ExtensionAPI): void {
 				if (!(await activate(ctx, nextLaunch))) return;
 			} else {
 				current.launch = nextLaunch;
-				ctx.ui.setStatus("k8s", `k8s: ${selected.context}`);
+				ctx.ui.setStatus("k8s", `kubeconfig: ${selected.context}`);
 			}
 
-			ctx.ui.notify(`k8s: context set to "${selected.context}" (${selected.kubeconfigPath})`, "info");
+			await saveLaunchConfig(nextLaunch);
+			ctx.ui.notify(`kubeconfig: context set to "${selected.context}" (${selected.kubeconfigPath})`, "info");
 		},
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
 		shuttingDown = false;
-		const launch = readLaunchConfigOrStayOff(pi, ctx);
+		const launch = await resolveLaunchConfigOrStayOff(pi, ctx);
 		if (launch === undefined) return;
 		await activate(ctx, launch);
 	});

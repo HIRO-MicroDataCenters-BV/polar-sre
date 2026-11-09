@@ -162,16 +162,16 @@ describe("exec extension", () => {
 	it("offers exec only from a clean state", async () => {
 		const labels = { "polar-session": SESSION_ID, "polar-root": root };
 		const refusals: [string, Record<string, string>, string][] = [
-			["readiness", { STATUS_EXIT: "1" }, "exec is off: container system status failed: exit 1"],
+			["readiness", { STATUS_EXIT: "1" }, "sandbox is off: container system status failed: exit 1"],
 			[
 				"unknown listing",
 				{ LIST_GARBAGE: "1" },
-				"exec is off: runtime state could not be established: unreadable listing",
+				"sandbox is off: runtime state could not be established: unreadable listing",
 			],
 			[
 				"leftover",
 				{ DELETE_FAIL: "1" },
-				`exec is off: leftovers of exec stayed; polar-exec-${SESSION_ID}-1-aaaaaaaa (delete: Error: runtime temporarily unavailable; still listed) could not be deleted; delete them with: container delete --force polar-exec-${SESSION_ID}-1-aaaaaaaa`,
+				`sandbox is off: leftovers of sandbox stayed; polar-exec-${SESSION_ID}-1-aaaaaaaa (delete: Error: runtime temporarily unavailable; still listed) could not be deleted; delete them with: container delete --force polar-exec-${SESSION_ID}-1-aaaaaaaa`,
 			],
 		];
 		await state.addContainer(`polar-exec-${SESSION_ID}-1-aaaaaaaa`, labels);
@@ -181,7 +181,7 @@ describe("exec extension", () => {
 			await off.startSession();
 			expect(off.tools, refusal).toEqual([]);
 			expect(off.notices, refusal).toEqual([[message, "warning"]]);
-			expect(off.footer.get("exec"), refusal).toBe("exec: off");
+			expect(off.footer.get("exec"), refusal).toBeUndefined();
 			await off.shutdown();
 			expect(await exists(lockPath()), refusal).toBe(false);
 		}
@@ -192,11 +192,11 @@ describe("exec extension", () => {
 		expect(foreign.tools).toEqual([]);
 		expect(foreign.notices).toEqual([
 			[
-				`exec is off: the volume polar-work-${SESSION_ID} is not this session's: its polar-root label is /elsewhere, expected ${root}`,
+				`sandbox is off: the volume polar-work-${SESSION_ID} is not this session's: its polar-root label is /elsewhere, expected ${root}`,
 				"warning",
 			],
 		]);
-		expect(foreign.footer.get("exec")).toBe("exec: off");
+		expect(foreign.footer.get("exec")).toBeUndefined();
 		expect(await state.containers()).toEqual([]);
 		await foreign.shutdown();
 		expect(await exists(lockPath())).toBe(false);
@@ -206,7 +206,7 @@ describe("exec extension", () => {
 		await ready.startSession();
 		expect(ready.tools.map((tool) => tool.name)).toEqual(["exec"]);
 		expect(ready.tools[0].executionMode).toBe("sequential");
-		expect(ready.footer.get("exec")).toBe(`exec: ${DEFAULT_IMAGE}`);
+		expect(ready.footer.get("exec")).toBeUndefined();
 		expect(ready.notices).toEqual([]);
 		expect(await state.volumes()).toEqual([{ name: `polar-work-${SESSION_ID}`, labels, size: "4096M" }]);
 		expect(await readFile(lockPath(), "utf8")).toBe(`${process.pid}\n`);
@@ -219,7 +219,7 @@ describe("exec extension", () => {
 		const [tool] = pi.tools;
 
 		expect(pi.flagDefaults.get("exec-image")).toBe(DEFAULT_IMAGE);
-		expect(pi.footer.get("exec")).toBe(`exec: ${image}`);
+		expect(pi.footer.get("exec")).toBeUndefined();
 		expect(await state.calls()).toContainEqual(["image", "inspect", image]);
 		expect(tool.description).toContain(" Session output files are available read-only at /data/<file>. ");
 		for (const phrase of [
@@ -287,7 +287,7 @@ describe("exec extension", () => {
 		);
 		expect(pi.notices).toEqual([
 			[
-				`exec: ${name} (delete: Error: runtime temporarily unavailable; still listed) could not be deleted`,
+				`sandbox: ${name} (delete: Error: runtime temporarily unavailable; still listed) could not be deleted`,
 				"warning",
 			],
 		]);
@@ -335,11 +335,11 @@ describe("exec extension", () => {
 		await shutdown;
 		expect(pi.notices).toEqual([
 			[
-				`exec: ${name} (delete: Error: runtime temporarily unavailable; still listed) could not be deleted`,
+				`sandbox: ${name} (delete: Error: runtime temporarily unavailable; still listed) could not be deleted`,
 				"warning",
 			],
 			[
-				`exec: ${name} (delete: Error: runtime temporarily unavailable; still listed) could not be deleted at shutdown`,
+				`sandbox: ${name} (delete: Error: runtime temporarily unavailable; still listed) could not be deleted at shutdown`,
 				"warning",
 			],
 		]);

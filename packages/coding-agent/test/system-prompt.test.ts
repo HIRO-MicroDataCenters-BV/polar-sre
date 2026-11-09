@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import type { Skill } from "../src/core/skills.ts";
+import { BUILTIN_SLASH_COMMANDS } from "../src/core/slash-commands.ts";
 import { createSyntheticSourceInfo } from "../src/core/source-info.ts";
 import { buildSystemPrompt } from "../src/core/system-prompt.ts";
 
@@ -25,7 +26,7 @@ describe("buildSystemPrompt", () => {
 			expect(prompt).toContain("<tools>\n(none)\n");
 		});
 
-		test("shows file paths guideline even with no tools", () => {
+		test("shows concise guideline and omits file paths guideline", () => {
 			const prompt = buildSystemPrompt({
 				selectedTools: [],
 				contextFiles: [],
@@ -33,7 +34,8 @@ describe("buildSystemPrompt", () => {
 				cwd: process.cwd(),
 			});
 
-			expect(prompt).toContain("Show file paths clearly");
+			expect(prompt).toContain("Be concise in your responses");
+			expect(prompt).not.toContain("Show file paths clearly");
 		});
 	});
 
@@ -48,8 +50,10 @@ describe("buildSystemPrompt", () => {
 				skills: [],
 			});
 
-			expect(defaultPrompt.startsWith("You are an expert coding assistant operating inside pi")).toBe(true);
-			expect(customPrompt.startsWith("You are Exact.\n\n<cwd>")).toBe(true);
+			expect(defaultPrompt.startsWith("You are Polar, a read-only SRE and incident investigation assistant.")).toBe(
+				true,
+			);
+			expect(customPrompt).toBe("You are Exact.");
 		});
 
 		test("preserves an exact forced prompt without sections", () => {
@@ -70,7 +74,7 @@ describe("buildSystemPrompt", () => {
 			expect(prompt).toContain(
 				'<project_context>\nProject-specific instructions and guidelines:\n\n<project_instructions path="/tmp/AGENTS.md">',
 			);
-			expect(prompt).toContain("<cwd>\n/tmp\n</cwd>");
+			expect(prompt).not.toContain("<cwd>");
 		});
 	});
 
@@ -108,17 +112,15 @@ describe("buildSystemPrompt", () => {
 			expect(prompt).toContain(expected);
 		});
 
-		test("instructs models to resolve pi docs and examples under absolute base paths", () => {
+		test("omits pi documentation and cwd sections", () => {
 			const prompt = buildSystemPrompt({
 				contextFiles: [],
 				skills: [],
 				cwd: process.cwd(),
 			});
 
-			expect(prompt).toContain(
-				"- When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory",
-			);
-			expect(prompt).toContain("environment variables (docs/environment-variables.md), MCP servers (docs/mcp.md)");
+			expect(prompt).not.toContain("<docs>");
+			expect(prompt).not.toContain("<cwd>");
 		});
 	});
 
@@ -234,5 +236,17 @@ describe("buildSystemPrompt", () => {
 			expect(build(["read"])).toContain("Use bash to load a skill's file");
 			expect(build([])).toContain("Use the read tool to load a skill's file");
 		});
+	});
+});
+
+describe("BUILTIN_SLASH_COMMANDS", () => {
+	test("omits disabled Pi commands and keeps Polar navigation commands", () => {
+		const names = BUILTIN_SLASH_COMMANDS.map((cmd) => cmd.name);
+		for (const disabled of ["reload", "trust", "share", "changelog", "bug", "scoped-models"]) {
+			expect(names).not.toContain(disabled);
+		}
+		for (const kept of ["tree", "fork", "clone", "model", "quit"]) {
+			expect(names).toContain(kept);
+		}
 	});
 });

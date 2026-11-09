@@ -38,7 +38,13 @@ const TOOLS: Record<ExtensionName, string[]> = { files: ["list_files"], k8s: K8S
 const READ_TOOL = { name: "read", description: "Read the contents of a file." };
 const LARGE_FILE = "k8s_logs-9.txt";
 const LARGE_FILE_BYTES = 17 * 1024 * 1024;
-const SAVED_VARIABLES = ["PATH", "POLAR_ARTIFACTS_DIR", "FAKE_CONTAINER_STATE", "FAKE_KUBECTL_STDOUT"];
+const SAVED_VARIABLES = [
+	"PATH",
+	"POLAR_ARTIFACTS_DIR",
+	"POLAR_CODING_AGENT_DIR",
+	"FAKE_CONTAINER_STATE",
+	"FAKE_KUBECTL_STDOUT",
+];
 const POD_COUNT = 2500;
 const PODS = Array.from({ length: POD_COUNT }, (_, index) => `web-${index + 1} 1/1 Running\n`).join("");
 const EXEC_LINE_COUNT = 3000;
@@ -89,6 +95,7 @@ beforeEach(async () => {
 	process.env.PATH = `${bin}${delimiter}${process.env.PATH}`;
 	process.env.FAKE_CONTAINER_STATE = containerState;
 	process.env.POLAR_ARTIFACTS_DIR = root;
+	process.env.POLAR_CODING_AGENT_DIR = join(root, "agent");
 });
 
 afterEach(async () => {
@@ -421,10 +428,7 @@ describe("extension composition", () => {
 		expect(session.extensions.find((extension) => extension.name === "k8s")?.tools).toEqual([]);
 		expect(toolNames(session)).toEqual(["list_files", "exec"]);
 		await expectReadPolicy(session);
-		expect(session.notices).toContainEqual([
-			"k8s: no context selected (tools are off). Run /kubeconfig to select a context.",
-			"warning",
-		]);
+		expect(session.notices).toContainEqual(["kubeconfig: no context selected, run /kubeconfig to select", "warning"]);
 	});
 
 	it("a standalone producer's reply names a path that read can open", async () => {

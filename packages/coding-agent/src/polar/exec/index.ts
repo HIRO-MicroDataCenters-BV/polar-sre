@@ -108,7 +108,10 @@ export function createExecTool(runtime: ExecRuntime) {
 			try {
 				const result = await call.run();
 				if (result.cleanupError !== undefined) {
-					ctx?.ui.notify(`exec: ${describeCleanupErrors([result.cleanupError])} could not be deleted`, "warning");
+					ctx?.ui.notify(
+						`sandbox: ${describeCleanupErrors([result.cleanupError])} could not be deleted`,
+						"warning",
+					);
 				}
 				return replyResult(await buildReply(result, request, runtime.limits, runtime.handle.paths));
 			} finally {
@@ -138,12 +141,10 @@ export default function execExtension(pi: ExtensionAPI): void {
 		if (runtime.state !== "unready") return;
 		if (!readiness.ready) {
 			warn(readiness.message);
-			ctx.ui.setStatus("exec", "exec: off");
 			return;
 		}
 		runtime.state = "open";
 		pi.registerTool(createExecTool(runtime));
-		ctx.ui.setStatus("exec", `exec: ${runtime.image}`);
 	});
 
 	pi.on("session_shutdown", async (event, ctx) => {

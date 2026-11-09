@@ -40,6 +40,7 @@ const SAVED_OUTPUT = "NAME    READY   STATUS    RESTARTS   AGE\nweb-0   1/1     
 const ENV_KEYS = [
 	"PATH",
 	"POLAR_ARTIFACTS_DIR",
+	"POLAR_CODING_AGENT_DIR",
 	"FAKE_KUBECTL_ECHO",
 	"FAKE_KUBECTL_CHILD",
 	"FAKE_KUBECTL_DELAY_MS",
@@ -73,6 +74,7 @@ beforeEach(async () => {
 	await chmod(kubectlWrapper, 0o755);
 	process.env.PATH = `${bin}${delimiter}${process.env.PATH ?? ""}`;
 	process.env.POLAR_ARTIFACTS_DIR = root;
+	process.env.POLAR_CODING_AGENT_DIR = join(root, "agent");
 });
 
 afterEach(async () => {
@@ -294,14 +296,11 @@ describe("k8s extension", () => {
 		const kubeconfigEmpty = { "k8s-kubeconfig": "", "k8s-context": "staging" };
 		const kubeconfigList = { "k8s-kubeconfig": ["a", "b"].join(delimiter), "k8s-context": "staging" };
 		const cases: [Record<string, string>, string][] = [
-			[contextMissing, "k8s: no context selected (tools are off). Run /kubeconfig to select a context."],
-			[contextEmpty, "k8s: no context selected (tools are off). Run /kubeconfig to select a context."],
-			[bothMissingAndMulti, "k8s: no context selected (tools are off). Run /kubeconfig to select a context."],
-			[kubeconfigEmpty, "k8s: no kubeconfig file specified (tools are off). Run /kubeconfig to select a context."],
-			[
-				kubeconfigList,
-				"k8s: --k8s-kubeconfig lists multiple files (tools are off). Run /kubeconfig to select a context.",
-			],
+			[contextMissing, "kubeconfig: no context selected, run /kubeconfig to select"],
+			[contextEmpty, "kubeconfig: no context selected, run /kubeconfig to select"],
+			[bothMissingAndMulti, "kubeconfig: no context selected, run /kubeconfig to select"],
+			[kubeconfigEmpty, "kubeconfig: no kubeconfig file specified, run /kubeconfig to select"],
+			[kubeconfigList, "kubeconfig: --k8s-kubeconfig lists multiple files, run /kubeconfig to select"],
 		];
 		for (const [flags, message] of cases) {
 			const context = fakeContext();
@@ -310,7 +309,7 @@ describe("k8s extension", () => {
 			expect(context.shutdown).not.toHaveBeenCalled();
 			expect(unbound.tools).toEqual([]);
 			expect(context.notices).toEqual([[message, "warning"]]);
-			expect(context.footer.get("k8s")).toBe("k8s: off (/kubeconfig)");
+			expect(context.footer.get("k8s")).toBe("kubeconfig: off, run /kubeconfig");
 			expect(existsSync(lockFile())).toBe(false);
 		}
 	});
@@ -326,14 +325,14 @@ describe("k8s extension", () => {
 
 		expect(pi.tools).toEqual([]);
 		expect(existsSync(lockFile())).toBe(false);
-		expect(context.footer.get("k8s")).toBe("k8s: off (/kubeconfig)");
+		expect(context.footer.get("k8s")).toBe("kubeconfig: off, run /kubeconfig");
 
 		await pi.runCommand("kubeconfig", "prod");
 
 		expect(existsSync(lockFile())).toBe(true);
 		expect(pi.tools.map((tool) => tool.name)).toEqual(TOOL_NAMES);
-		expect(context.footer.get("k8s")).toBe("k8s: prod");
-		expect(context.notices).toContainEqual([`k8s: context set to "prod" (${kcB})`, "info"]);
+		expect(context.footer.get("k8s")).toBe("kubeconfig: prod");
+		expect(context.notices).toContainEqual([`kubeconfig: context set to "prod" (${kcB})`, "info"]);
 
 		const reply = await pi.execute("k8s_get", { resource: "pods" });
 		const echo = JSON.parse((reply.content[0] as { text: string }).text) as { argv: string[] };
@@ -342,6 +341,35 @@ describe("k8s extension", () => {
 
 		await pi.shutdown();
 		expect(existsSync(lockFile())).toBe(false);
+	});
+
+	it("persists selected context across restarts and stays off if the saved context disappeared", async () => {
+		const kc = await writeKubeconfig("kc.json", [{ name: "staging" }, { name: "prod" }]);
+
+		const firstCtx = fakeContext();
+		const first = loadExtension({ "k8s-kubeconfig": kc }, firstCtx);
+		await first.startSession();
+		await first.runCommand("kubeconfig", "prod");
+		await first.shutdown();
+
+		// Restart without --k8s-context: picks up saved prod context
+		const secondCtx = fakeContext();
+		const second = loadExtension({ "k8s-kubeconfig": kc }, secondCtx);
+		await second.startSession();
+		expect(second.tools.map((tool) => tool.name)).toEqual(TOOL_NAMES);
+		expect(secondCtx.footer.get("k8s")).toBe("kubeconfig: prod");
+		await second.shutdown();
+
+		// Remove "prod" from kubeconfig -> next start stays off with warning
+		await writeKubeconfig("kc.json", [{ name: "staging" }]);
+		const thirdCtx = fakeContext();
+		const third = loadExtension({ "k8s-kubeconfig": kc }, thirdCtx);
+		await third.startSession();
+		expect(third.tools).toEqual([]);
+		expect(thirdCtx.footer.get("k8s")).toBe("kubeconfig: off, run /kubeconfig");
+		expect(thirdCtx.notices).toEqual([
+			[`kubeconfig: saved context "prod" was not found in ${kc}, run /kubeconfig to select`, "warning"],
+		]);
 	});
 
 	it("cold-activates or cancels through the interactive TUI picker", async () => {
@@ -366,7 +394,7 @@ describe("k8s extension", () => {
 
 		expect(cancelledPi.tools).toEqual([]);
 		expect(existsSync(lockFile())).toBe(false);
-		expect(cancelContext.footer.get("k8s")).toBe("k8s: off (/kubeconfig)");
+		expect(cancelContext.footer.get("k8s")).toBe("kubeconfig: off, run /kubeconfig");
 
 		// 2. Navigate down and press Enter -> activates second item ("prod")
 		const selectContext = fakeContext("tui", (component) => {
@@ -380,7 +408,7 @@ describe("k8s extension", () => {
 
 		expect(existsSync(lockFile())).toBe(true);
 		expect(selectedPi.tools.map((t) => t.name)).toEqual(TOOL_NAMES);
-		expect(selectContext.footer.get("k8s")).toBe("k8s: prod");
+		expect(selectContext.footer.get("k8s")).toBe("kubeconfig: prod");
 
 		const reply = await selectedPi.execute("k8s_get", { resource: "pods" });
 		const echo = JSON.parse((reply.content[0] as { text: string }).text) as { argv: string[] };
@@ -402,8 +430,8 @@ describe("k8s extension", () => {
 			expect.stringContaining(`k8s: failed to read some kubeconfig files (${missingKc}:`),
 			"warning",
 		]);
-		expect(context.notices).toContainEqual([`k8s: context set to "staging" (${validKc})`, "info"]);
-		expect(context.footer.get("k8s")).toBe("k8s: staging");
+		expect(context.notices).toContainEqual([`kubeconfig: context set to "staging" (${validKc})`, "info"]);
+		expect(context.footer.get("k8s")).toBe("kubeconfig: staging");
 		expect(pi.tools.map((t) => t.name)).toEqual(TOOL_NAMES);
 	});
 
@@ -435,7 +463,7 @@ describe("k8s extension", () => {
 
 		await pi.runCommand("kubeconfig", "prod");
 		expect(pi.tools).toHaveLength(5);
-		expect(context.footer.get("k8s")).toBe("k8s: prod");
+		expect(context.footer.get("k8s")).toBe("kubeconfig: prod");
 
 		const secondReply = await pi.execute("k8s_get", { resource: "pods" });
 		const firstReply = await firstCallPromise;
@@ -461,15 +489,12 @@ describe("k8s extension", () => {
 		expect(pi.tools).toEqual([]);
 	});
 
-	it("registers the prompt rule", async () => {
+	it("registers no prompt guidelines on k8s tools", async () => {
 		const pi = loadExtension(OPERATOR_FLAGS);
 		await pi.startSession();
 
-		const rules = [
-			"k8s_get: when the object name is unknown, list with the default wide output, then narrow with labelSelector or fieldSelector.",
-		];
 		expect(pi.tools.map((tool) => tool.promptGuidelines)).toEqual([
-			rules,
+			undefined,
 			undefined,
 			undefined,
 			undefined,
@@ -487,7 +512,7 @@ describe("k8s extension", () => {
 	it("supports TUI and headless modes", async () => {
 		const tui = fakeContext("tui");
 		await loadExtension(OPERATOR_FLAGS, tui).startSession();
-		expect(tui.footer.get("k8s")).toBe("k8s: staging");
+		expect(tui.footer.get("k8s")).toBe("kubeconfig: staging");
 
 		for (const mode of ["print", "json"] as const) {
 			const headless = loadExtension(OPERATOR_FLAGS, fakeContext(mode));

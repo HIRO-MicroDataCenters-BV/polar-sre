@@ -29,7 +29,7 @@ export type Recovery = { clean: true } | { leftover: CleanupError[] } | { unknow
 export type Warn = (message: string) => void;
 
 const START_ENDED = "the session is shutting down";
-const LEFTOVERS_STAYED = "leftovers of exec stayed";
+const LEFTOVERS_STAYED = "leftovers of sandbox stayed";
 const TICKET_POLL_MS = 20;
 
 export function workVolumeName(sessionId: string): string {
@@ -62,7 +62,7 @@ function mebibytes(bytes: number): number {
 
 function off(reason: string, leftovers: CleanupError[] = []): Readiness {
 	const stayed = leftovers.length === 0 ? "" : `; ${leftoverNotice(leftovers)}`;
-	return { ready: false, message: `exec is off: ${reason}${stayed}`, leftovers };
+	return { ready: false, message: `sandbox is off: ${reason}${stayed}`, leftovers };
 }
 
 function labelOf(labels: Record<string, unknown>, key: string): string | undefined {
@@ -142,7 +142,7 @@ export async function recoverLeftovers(runtime: ExecRuntime, warn: Warn): Promis
 				liveness = await sessionLiveness(root, owner);
 				judged.set(owner, liveness);
 				if (liveness === "unknown") {
-					warn(`exec: the lock of session ${owner} could not be read; its containers and volume are kept`);
+					warn(`sandbox: the lock of session ${owner} could not be read; its containers and volume are kept`);
 				}
 			}
 			if (liveness !== "ended") continue;
@@ -245,7 +245,7 @@ export async function shutdownRuntime(
 	await ticketsDrained(runtime, deadlineAt);
 	if (runtime.starting === undefined && runtime.inFlight.size === 0) {
 		const leftovers = await cleanupOwned(runtime, deadlineAt);
-		if (leftovers.length > 0) warn(`exec: ${describeCleanupErrors(leftovers)} could not be deleted at shutdown`);
+		if (leftovers.length > 0) warn(`sandbox: ${describeCleanupErrors(leftovers)} could not be deleted at shutdown`);
 	} else {
 		killChildren(runtime, "run");
 	}
@@ -254,7 +254,7 @@ export async function shutdownRuntime(
 		killChildren(runtime);
 	}
 	const programs = runtime.inFlight.size;
-	if (programs > 0) warn(`exec: ${programs} program(s) still stopping`);
+	if (programs > 0) warn(`sandbox: ${programs} program(s) still stopping`);
 	await closeIfDrained(runtime);
 }
 

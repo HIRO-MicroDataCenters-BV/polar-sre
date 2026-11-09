@@ -91,13 +91,13 @@ describe("start", () => {
 		expect(await checkReadiness(fakeRuntime(state, handle))).toEqual({ ready: true });
 		expect(await checkReadiness(fakeRuntime(state, handle, { STATUS_EXIT: "1" }))).toEqual({
 			ready: false,
-			message: "exec is off: container system status failed: exit 1",
+			message: "sandbox is off: container system status failed: exit 1",
 			leftovers: [],
 		});
 		expect(await checkReadiness(fakeRuntime(state, handle, { IMAGE_MISSING: "1" }))).toEqual({
 			ready: false,
 			message:
-				"exec is off: container image inspect polar-exec:test failed: Error: image polar-exec:test not found. Build the image as extensions/exec/ARCHITECTURE.md describes.",
+				"sandbox is off: container image inspect polar-exec:test failed: Error: image polar-exec:test not found. Build the image as extensions/exec/ARCHITECTURE.md describes.",
 			leftovers: [],
 		});
 	});
@@ -115,7 +115,7 @@ describe("start", () => {
 			const runtime = startingRuntime(state, handle, { [knob]: value });
 			expect(await startRuntime(runtime, warn), `${knob}=${value}`).toEqual({
 				ready: false,
-				message: `exec is off: runtime state could not be established: ${said}`,
+				message: `sandbox is off: runtime state could not be established: ${said}`,
 				leftovers: [],
 			});
 			expect(runtime.state).toBe("unready");
@@ -179,7 +179,7 @@ describe("start", () => {
 			"unlabeled",
 		]);
 		expect(notices).toEqual([
-			"exec: the lock of session locked could not be read; its containers and volume are kept",
+			"sandbox: the lock of session locked could not be read; its containers and volume are kept",
 		]);
 		expect((await callsOf("delete")).map((call) => call.at(-1)).sort()).toEqual([
 			"polar-exec-current-3-aaaaaaaa",
@@ -204,7 +204,7 @@ describe("start", () => {
 			const runtime = startingRuntime(state, handle);
 			expect(await startRuntime(runtime, warn)).toEqual({
 				ready: false,
-				message: `exec is off: the volume polar-work-current is not this session's: its polar-root label is ${actual}, expected ${artifactsRoot()}`,
+				message: `sandbox is off: the volume polar-work-current is not this session's: its polar-root label is ${actual}, expected ${artifactsRoot()}`,
 				leftovers: [],
 			});
 			expect(await state.volumes()).toEqual([{ name: "polar-work-current", labels, size: "4M" }]);
@@ -278,7 +278,7 @@ describe("start", () => {
 			const runtime = startingRuntime(state, handle, knobs);
 			expect(await startRuntime(runtime, warn)).toEqual({
 				ready: false,
-				message: `exec is off: the /work volume could not be inspected: ${said}`,
+				message: `sandbox is off: the /work volume could not be inspected: ${said}`,
 				leftovers: [],
 			});
 		}
@@ -295,7 +295,7 @@ describe("start", () => {
 		expect(await startRuntime(runtime, warn)).toEqual({
 			ready: false,
 			message:
-				"exec is off: leftovers of exec stayed; polar-exec-current-2-ffffffff (delete: Error: runtime temporarily unavailable; still listed) could not be deleted; delete them with: container delete --force polar-exec-current-2-ffffffff",
+				"sandbox is off: leftovers of sandbox stayed; polar-exec-current-2-ffffffff (delete: Error: runtime temporarily unavailable; still listed) could not be deleted; delete them with: container delete --force polar-exec-current-2-ffffffff",
 			leftovers: [
 				{
 					container: "polar-exec-current-2-ffffffff",
@@ -311,7 +311,7 @@ describe("start", () => {
 	it("reports the preparation failure and the container that stayed together", async () => {
 		const cases: [Record<string, string>, string][] = [
 			[{ CHOWN_EXIT: "1", DELETE_FAIL: "1" }, "the /work volume could not be prepared: exit 1"],
-			[{ DELETE_FAIL: "1" }, "leftovers of exec stayed"],
+			[{ DELETE_FAIL: "1" }, "leftovers of sandbox stayed"],
 		];
 		for (const [knobs, reason] of cases) {
 			await rm(join(state.directory, "containers"), { recursive: true, force: true });
@@ -323,7 +323,7 @@ describe("start", () => {
 			const cleanup = "delete: Error: runtime temporarily unavailable; still listed";
 			expect(readiness, reason).toEqual({
 				ready: false,
-				message: `exec is off: ${reason}; ${prep} (${cleanup}) could not be deleted; delete them with: container delete --force ${prep}`,
+				message: `sandbox is off: ${reason}; ${prep} (${cleanup}) could not be deleted; delete them with: container delete --force ${prep}`,
 				leftovers: [{ container: prep, message: cleanup }],
 			});
 			expect(runtime.owned, reason).toEqual(new Set([prep]));
@@ -364,7 +364,7 @@ describe("shutdown", () => {
 
 		expect(elapsed).toBeGreaterThanOrEqual(280);
 		expect(elapsed).toBeLessThan(1500);
-		expect(notices).toEqual(["exec: 1 program(s) still stopping"]);
+		expect(notices).toEqual(["sandbox: 1 program(s) still stopping"]);
 		expect(runCommand.killed).toBe(true);
 		expect(runtime.state).toBe("closing");
 		expect(runtime.inFlight).toEqual(new Set(["call-1"]));
@@ -394,7 +394,7 @@ describe("shutdown", () => {
 		await shutdownRuntime(runtime, "reload", warn);
 
 		expect(notices).toEqual([
-			`exec: ${name} (delete: timed out; no time left to list) could not be deleted at shutdown`,
+			`sandbox: ${name} (delete: timed out; no time left to list) could not be deleted at shutdown`,
 		]);
 		expect(runtime.owned).toEqual(new Set([name]));
 		expect(runtime.state).toBe("closed");
@@ -419,7 +419,7 @@ describe("shutdown", () => {
 		await shutdownRuntime(runtime, "quit", warn);
 
 		expect(performance.now() - started).toBeLessThan(1500);
-		expect(notices).toEqual(["exec: 1 program(s) still stopping"]);
+		expect(notices).toEqual(["sandbox: 1 program(s) still stopping"]);
 		expect(runtime.cliStopped).toBe(true);
 		for (const [child] of [...before, ...runtime.children]) expect(child.killed).toBe(true);
 		expect(await hanging).toMatchObject({ code: null, timedOut: false });
@@ -476,7 +476,7 @@ describe("shutdown", () => {
 		const readiness = await starting;
 		expect(readiness).toEqual({
 			ready: false,
-			message: "exec is off: the session is shutting down",
+			message: "sandbox is off: the session is shutting down",
 			leftovers: [],
 		});
 		expect(runtime.starting).toBeUndefined();

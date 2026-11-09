@@ -6,10 +6,6 @@ import { isObjectName, isTypeToken, NAMESPACE_DESCRIPTION, namespaceError } from
 
 const TOOL_NAME = "k8s_get";
 
-const GET_GUIDELINES = [
-	"k8s_get: when the object name is unknown, list with the default wide output, then narrow with labelSelector or fieldSelector.",
-];
-
 const getParameters = Type.Object(
 	{
 		resource: Type.String({
@@ -120,7 +116,6 @@ export const getSpec: ToolSpec<typeof getParameters, GetRequest> = {
 	description:
 		"'kubectl get' on the cluster bound to this session. Returns stdout as is. Long output is cut and saved to a file; the notice says how to read the rest.",
 	promptSnippet: "'kubectl get' on the session cluster, read-only",
-	promptGuidelines: GET_GUIDELINES,
 	parameters: getParameters,
 	validate: (params) =>
 		resourceError(params) ?? nameError(params) ?? namespaceError(params.namespace) ?? outputError(params),

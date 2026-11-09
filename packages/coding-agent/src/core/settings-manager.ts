@@ -1111,7 +1111,7 @@ export class SettingsManager {
 
 	getQuietStartup(): QuietStartup {
 		const value = this.settings.quietStartup;
-		return value === true || value === "header" ? value : false;
+		return value === true || value === false ? value : "header";
 	}
 
 	setQuietStartup(quiet: QuietStartup): void {
@@ -1162,7 +1162,7 @@ export class SettingsManager {
 	}
 
 	getEnableInstallTelemetry(): boolean {
-		return this.settings.enableInstallTelemetry ?? true;
+		return this.settings.enableInstallTelemetry ?? false;
 	}
 
 	setEnableInstallTelemetry(enabled: boolean): void {
