@@ -1,0 +1,14 @@
+# The Python kit of the exec image. Pinned with hashes into requirements.txt by:
+#   uv pip compile --python-version 3.13 --python-platform aarch64-manylinux_2_28 --generate-hashes -o requirements.txt requirements.in
+duckdb
+polars
+pandas
+orjson
+ijson
+pyyaml
+jmespath
+python-dateutil
+ciso8601
+regex
+tabulate
+drain3
