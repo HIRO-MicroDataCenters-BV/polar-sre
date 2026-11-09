@@ -29,7 +29,7 @@ function createFixture(t, { importServer = false, declareServer = false } = {}) 
 	for (const name of packageNames) {
 		const isAgent = name === codingAgentName;
 		writePackage(
-			join(repoRoot, "packages", name.split("/")[1]),
+			join(repoRoot, "packages", name.split("/").pop()),
 			{
 				name,
 				version: "1.0.0",

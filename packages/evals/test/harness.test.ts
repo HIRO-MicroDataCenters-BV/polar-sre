@@ -69,10 +69,14 @@ describe("documentation variant", () => {
 		expect(() => resolveDocumentationVariant(variant)).toThrow("PI_EVAL_VARIANT");
 	});
 
-	it("strips only the documentation routing section from the default Pi prompt", () => {
+	it("strips only the documentation routing section from a prompt with docs and cwd", () => {
 		const prompt = buildSystemPrompt({
 			cwd: "/workspace",
 			selectedTools: [...DOCUMENTATION_EVAL_TOOLS],
+			sections: {
+				docs: `Pi documentation (read only):\n- Main: ${getReadmePath()}\n- Docs: ${getDocsPath()} (docs/models.md)\n- Examples: ${getExamplesPath()}`,
+				cwd: "/workspace",
+			},
 		});
 		expect(prompt).toContain("\n<docs>\nPi documentation (read only");
 		expect(prompt).toContain("\n<rules>\n");
@@ -94,6 +98,10 @@ describe("documentation variant", () => {
 		const prompt = buildSystemPrompt({
 			cwd: "/workspace",
 			selectedTools: [...DOCUMENTATION_EVAL_TOOLS],
+			sections: {
+				docs: "Pi documentation (read only):\n- Docs: docs/models.md",
+				cwd: "/workspace",
+			},
 		});
 		const stripped = excludePiDocumentation(prompt);
 

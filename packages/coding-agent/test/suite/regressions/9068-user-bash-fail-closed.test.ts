@@ -123,7 +123,9 @@ type InteractiveBashContext = {
 	chatContainer: { addChild(component: unknown): void };
 	pendingMessagesContainer: { addChild(component: unknown): void };
 	pendingBashComponents: unknown[];
+	pendingUserInputs: string[];
 	isBashMode: boolean;
+	flushPendingBashComponents(): void;
 	handleBashCommand(command: string, excludeFromContext?: boolean): Promise<void>;
 	showError(message: string): void;
 	updateEditorBorderColor(): void;
@@ -223,7 +225,7 @@ describe("Interactive user_bash failure handling (#9068)", () => {
 	test.each([
 		["!pwd", false],
 		["!!pwd", true],
-	])("fails closed for %s when a handler returns an empty result", async (input, excludeFromContext) => {
+	])("fails closed for %s when a handler returns an empty result", async (input, _excludeFromContext) => {
 		const events: UserBashEvent[] = [];
 		const harness = await createHarness({
 			extensionFactories: [
@@ -245,7 +247,9 @@ describe("Interactive user_bash failure handling (#9068)", () => {
 			chatContainer: { addChild: vi.fn() },
 			pendingMessagesContainer: { addChild: vi.fn() },
 			pendingBashComponents: [],
+			pendingUserInputs: [],
 			isBashMode: true,
+			flushPendingBashComponents: vi.fn(),
 			handleBashCommand: interactiveModePrototype.handleBashCommand,
 			showError: vi.fn(),
 			updateEditorBorderColor: vi.fn(),
@@ -255,14 +259,9 @@ describe("Interactive user_bash failure handling (#9068)", () => {
 		try {
 			await context.defaultEditor.onSubmit?.(input);
 
-			expect(events).toEqual([
-				{
-					type: "user_bash",
-					command: "pwd",
-					excludeFromContext,
-					cwd: harness.sessionManager.getCwd(),
-				},
-			]);
+			// In Polar, ! and !! are disabled in the editor and treated as plain user text.
+			expect(events).toEqual([]);
+			expect(context.pendingUserInputs).toEqual([input]);
 			expect(executeBash).not.toHaveBeenCalled();
 		} finally {
 			executeBash.mockRestore();
