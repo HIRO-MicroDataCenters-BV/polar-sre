@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
-# Runs polar.sh with all extensions enabled (files + k8s + exec).
+# Runs Polar with all built-in Polar extensions enabled (the default of Polar's CLI).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ "${1:-}" == "--dist" ]]; then
 	shift
-	exec "$ROOT/polar.sh" --dist -e builtin:k8s -e builtin:exec "$@"
+	CLI="$ROOT/packages/coding-agent/dist/cli.js"
+	if [[ ! -f "$CLI" ]]; then
+		echo "No build found. Run: npm run build:offline" >&2
+		exit 1
+	fi
+	exec node "$CLI" "$@"
 fi
 
-exec "$ROOT/polar.sh" -e builtin:k8s -e builtin:exec "$@"
+exec "$ROOT/pi-test.sh" "$@"

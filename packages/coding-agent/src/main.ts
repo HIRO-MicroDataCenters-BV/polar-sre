@@ -61,7 +61,11 @@ import { collectSettingsDiagnostics, deduplicateDiagnostics } from "./core/setti
 import { SettingsManager } from "./core/settings-manager.ts";
 import { printTimings, resetTimings, time } from "./core/timings.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "./core/trust-manager.ts";
-import { builtInExtensions } from "./extensions/index.ts";
+import {
+	builtInExtensions,
+	POLAR_DEFAULT_EXTENSION_SPECIFIERS,
+	POLAR_EXCLUDED_BUILTIN_TOOLS,
+} from "./extensions/index.ts";
 import { loadMcpCommand } from "./extensions/mcp/cli.lazy.ts";
 import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
 import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.ts";
@@ -545,9 +549,7 @@ function buildSessionOptions(
 	if (parsed.tools) {
 		options.tools = [...parsed.tools];
 	}
-	if (parsed.excludeTools) {
-		options.excludeTools = [...parsed.excludeTools];
-	}
+	options.excludeTools = parsed.excludeTools ? [...parsed.excludeTools] : [...POLAR_EXCLUDED_BUILTIN_TOOLS];
 
 	return { options, cliThinkingFromModel, diagnostics };
 }
@@ -723,7 +725,11 @@ export async function main(args: string[], options?: MainOptions) {
 	const trustPromptMode: AppMode = parsed.help || parsed.listModels !== undefined ? "print" : appMode;
 	const projectTrustByCwd = new Map<string, boolean>();
 
-	const resolvedExtensionPaths = resolveCliPaths(cwd, parsed.extensions);
+	const cliExtensionPaths = resolveCliPaths(cwd, parsed.extensions);
+	const resolvedExtensionPaths =
+		cliExtensionPaths !== undefined
+			? ["builtin:files", ...cliExtensionPaths.filter((p) => p !== "builtin:files")]
+			: [...POLAR_DEFAULT_EXTENSION_SPECIFIERS];
 	const resolvedSkillPaths = resolveCliPaths(cwd, parsed.skills);
 	const resolvedPromptTemplatePaths = resolveCliPaths(cwd, parsed.promptTemplates);
 	const resolvedThemePaths = resolveCliPaths(cwd, parsed.themes);
@@ -781,12 +787,12 @@ export async function main(args: string[], options?: MainOptions) {
 				additionalSkillPaths: resolvedSkillPaths,
 				additionalPromptTemplatePaths: resolvedPromptTemplatePaths,
 				additionalThemePaths: resolvedThemePaths,
-				noExtensions: parsed.noExtensions,
-				disabledBuiltinExtensions: parsed.noMcp ? ["mcp"] : undefined,
-				noSkills: parsed.noSkills,
-				noPromptTemplates: parsed.noPromptTemplates,
+				noExtensions: parsed.noExtensions ?? true,
+				disabledBuiltinExtensions: parsed.noMcp === false ? undefined : ["mcp"],
+				noSkills: parsed.noSkills ?? true,
+				noPromptTemplates: parsed.noPromptTemplates ?? true,
 				noThemes: parsed.noThemes,
-				noContextFiles: parsed.noContextFiles,
+				noContextFiles: parsed.noContextFiles ?? true,
 				systemPrompt: parsed.systemPrompt,
 				appendSystemPrompt: parsed.appendSystemPrompt,
 				extensionFactories,

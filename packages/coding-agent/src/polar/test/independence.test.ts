@@ -2,10 +2,14 @@ import { readdirSync, readFileSync } from "fs";
 import { dirname, join, relative, resolve } from "path";
 import { fileURLToPath } from "url";
 import { describe, expect, it } from "vitest";
+import { POLAR_DEFAULT_EXTENSION_SPECIFIERS, polarBuiltInExtensions } from "../../extensions/index.ts";
 
 const EXTENSIONS_ROOT = fileURLToPath(new URL("..", import.meta.url));
-const EXTENSIONS = ["files", "k8s", "exec"];
 const SHARED = "shared";
+const EXTENSIONS = readdirSync(EXTENSIONS_ROOT, { withFileTypes: true })
+	.filter((entry) => entry.isDirectory() && entry.name !== SHARED && entry.name !== "test")
+	.map((entry) => entry.name)
+	.sort();
 
 const STATIC_IMPORT = /^\s*(?:import|export)\s+(?:type\s+)?(?:[\w$*{},\s]+?\s+from\s+)?["']([^"']+)["']/gm;
 const DYNAMIC_IMPORT = /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g;
@@ -79,5 +83,12 @@ describe("independence", () => {
 
 		expect(sources.filter((file) => readModule(file).includes("getActiveTools"))).toEqual([]);
 		expect(sources.filter(hooksToolCalls)).toEqual(["files/index.ts"]);
+	});
+
+	it("every Polar extension directory is registered as a built-in extension", () => {
+		expect(EXTENSIONS).toEqual(["exec", "files", "k8s"]);
+		expect(polarBuiltInExtensions.map((ext) => ext.name).sort()).toEqual(EXTENSIONS);
+		expect(polarBuiltInExtensions.every((ext) => ext.builtin === true)).toBe(true);
+		expect([...POLAR_DEFAULT_EXTENSION_SPECIFIERS].sort()).toEqual(EXTENSIONS.map((name) => `builtin:${name}`));
 	});
 });
