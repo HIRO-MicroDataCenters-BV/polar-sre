@@ -1,6 +1,6 @@
 # Artifact Bus Contract (`shared/session`, `shared/store`, `files`)
 
-> **Context:** Part of [`extensions/ARCHITECTURE.md`](../ARCHITECTURE.md). Governs session directories, streaming artifact storage, quotas, manifest entries, and the built-in `read` gate.
+> **Context:** Part of [`src/polar/ARCHITECTURE.md`](../ARCHITECTURE.md). Governs session directories, streaming artifact storage, quotas, manifest entries, and the built-in `read` gate.
 
 ---
 

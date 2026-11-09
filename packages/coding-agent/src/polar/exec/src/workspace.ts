@@ -95,7 +95,7 @@ export async function checkReadiness(runtime: ExecRuntime): Promise<Readiness> {
 	const image = await containerCommand(runtime, ["image", "inspect", runtime.image]);
 	if (image.code !== 0) {
 		return off(
-			`container image inspect ${runtime.image} failed: ${commandFailure(image)}. Build the image as extensions/exec/ARCHITECTURE.md describes.`,
+			`container image inspect ${runtime.image} failed: ${commandFailure(image)}. Build the image as packages/coding-agent/src/polar/exec/ARCHITECTURE.md describes.`,
 		);
 	}
 	return { ready: true };

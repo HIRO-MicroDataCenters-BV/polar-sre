@@ -1,10 +1,10 @@
-# Exec Sandbox Architecture (`extensions/exec`)
+# Exec Sandbox Architecture (`packages/coding-agent/src/polar/exec`)
 
-> **Prerequisites:** Read [`../shared/ARTIFACT-BUS.md`](../shared/ARTIFACT-BUS.md) and [`../ARCHITECTURE.md`](../ARCHITECTURE.md) before modifying `extensions/exec`.
+> **Prerequisites:** Read [`../shared/ARTIFACT-BUS.md`](../shared/ARTIFACT-BUS.md) and [`../ARCHITECTURE.md`](../ARCHITECTURE.md) before modifying `packages/coding-agent/src/polar/exec`.
 
 ---
 
-## 1. Isolation Model
+## 1. Isolation Model & UI vs LLM Contract
 
 The `exec` extension runs Python 3.13 or Bash scripts inside an isolated Linux VM via the `container` CLI.
 
@@ -12,15 +12,16 @@ The `exec` extension runs Python 3.13 or Bash scripts inside an isolated Linux V
 - **Persistent Workspace (`/work`):** Mounts a per-session volume (`polar-work-<sessionId>`, `4 GiB`) read-write at `/work` (`HOME=/work`). Files in `/work` persist across calls within the session.
 - **Per-Call Limits:** Each call runs in a fresh container (`--network none`, `--read-only`, `--cap-drop ALL`, `--user 1000:1000`, `2 GiB` RAM, `4` CPUs, `nproc=256`, `512 MiB` tmpfs at `/tmp`, `300s` timeout).
 - **Sequential Execution:** `executionMode: "sequential"` runs one call at a time per session.
+- **UI vs LLM Naming Contract:** No footer status (`ctx.ui.setStatus`) is set. User-facing notifications (`ctx.ui.notify`) refer to the runtime as `sandbox` (`sandbox is off: ...`, `sandbox: ...`), whereas the tool name, `promptGuidelines`, and model-facing replies remain `exec`.
 
 ---
 
 ## 2. File Structure & Layers
 
-Each layer in `extensions/exec/src/` imports only from lower layers:
+Each layer in `packages/coding-agent/src/polar/exec/src/` imports only from lower layers:
 
 ```text
-extensions/exec/
+packages/coding-agent/src/polar/exec/
 ├── ARCHITECTURE.md                  # VM sandbox architecture and layer boundaries
 ├── index.ts                         # --exec-image flag, session_start/shutdown wiring, tool registration
 ├── image/
@@ -66,11 +67,11 @@ extensions/exec/
 
 ---
 
-## 3. Guest Image (`extensions/exec/image`)
+## 3. Guest Image (`packages/coding-agent/src/polar/exec/image`)
 
 Build command:
 ```bash
-(cd extensions/exec/image && container build --arch arm64 --tag polar-exec:0.1 --file Containerfile .)
+(cd packages/coding-agent/src/polar/exec/image && container build --arch arm64 --tag polar-exec:0.1 --file Containerfile .)
 ```
 
 - **Python 3.13 kit:** `duckdb`, `polars`, `pandas`, `numpy`, `orjson`, `ijson`, `pyyaml`, `jmespath`, `python-dateutil`, `ciso8601`, `regex`, `tabulate`, `drain3`.

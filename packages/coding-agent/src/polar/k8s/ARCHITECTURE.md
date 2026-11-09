@@ -1,6 +1,6 @@
-# Kubernetes Extension Architecture (`extensions/k8s`)
+# Kubernetes Extension Architecture (`packages/coding-agent/src/polar/k8s`)
 
-> **Prerequisites:** Read [`../shared/PRODUCER.md`](../shared/PRODUCER.md) before modifying `extensions/k8s`. Read [`../shared/ARTIFACT-BUS.md`](../shared/ARTIFACT-BUS.md) when working on `copyOut` or file storage.
+> **Prerequisites:** Read [`../shared/PRODUCER.md`](../shared/PRODUCER.md) before modifying `packages/coding-agent/src/polar/k8s`. Read [`../shared/ARTIFACT-BUS.md`](../shared/ARTIFACT-BUS.md) when working on `copyOut` or file storage.
 
 ---
 
@@ -8,14 +8,20 @@
 
 - `--k8s-kubeconfig`: kubeconfig file path or `path.delimiter`-separated path list (default: `$KUBECONFIG` or `~/.kube/config`).
 - `--k8s-context`: optional initial kubeconfig context name.
-- On `session_start` (checking `context` first, `kubeconfig` second):
-  - If `--k8s-context` is missing or empty, or if `--k8s-kubeconfig` does not resolve to a single file (empty or multiple files), does not acquire a session handle (`lock` is not created), registers no tools, sets status to `k8s: off (/kubeconfig)`, and notifies the operator with a warning to run `/kubeconfig`.
-  - If `--k8s-context` is set and `--k8s-kubeconfig` resolves to a single file, acquires a session handle, creates `K8sRuntime`, registers the `k8s_*` tools, and sets status to `k8s: <context>`.
+- On `session_start`:
+  - When `--k8s-context` is provided:
+    - If `--k8s-kubeconfig` resolves to a single file, acquires a session handle, creates `K8sRuntime`, registers the `k8s_*` tools, and sets footer status to `kubeconfig: <context>`.
+    - If `--k8s-kubeconfig` is empty (`kubeconfig: no kubeconfig file specified, run /kubeconfig to select`) or lists multiple files (`kubeconfig: --k8s-kubeconfig lists multiple files, run /kubeconfig to select`), acquires no session handle (`lock` is not created), registers no tools, sets footer status to `kubeconfig: off, run /kubeconfig`, and notifies the operator with that warning.
+  - When `--k8s-context` is not provided:
+    - Reads the saved `{ kubeconfigPath, context }` selection from `~/.polar/agent/k8s.json` (`join(getAgentDir(), "k8s.json")`).
+    - If no saved selection exists, acquires no session handle, registers no tools, sets footer status to `kubeconfig: off, run /kubeconfig`, and notifies with warning `kubeconfig: no context selected, run /kubeconfig to select`.
+    - If a saved selection exists, verifies via `discoverKubeContexts([saved.kubeconfigPath], ...)` that `saved.context` still exists in `saved.kubeconfigPath`. If the context is missing, deletes `k8s.json`, sets footer status to `kubeconfig: off, run /kubeconfig`, and notifies with warning `kubeconfig: saved context "<ctx>" was not found in <path>, run /kubeconfig to select`. If found, activates with the saved launch config and sets footer status to `kubeconfig: <context>`.
 - `/kubeconfig [query]` command:
   - Splits `--k8s-kubeconfig` via `splitKubeconfigPaths` and discovers contexts from each file with `kubectl --kubeconfig=<path> config view --output=json` (`discoverKubeContexts`, `5_000` ms timeout).
   - Selects an exact match when `query` uniquely matches `item.context`, or opens the interactive fuzzy TUI picker (`selectKubeContext`).
-  - **Cold activation:** if no runtime is active yet, acquires the session handle, creates `K8sRuntime`, and registers the `k8s_*` tools.
-  - **Live context switch:** if a runtime is already open, updates `runtime.launch` for subsequent tool calls while in-flight calls complete in their original context.
+  - **Cold activation:** if no runtime is active yet, acquires the session handle, creates `K8sRuntime`, registers the `k8s_*` tools, and sets footer status to `kubeconfig: <context>`.
+  - **Live context switch:** if a runtime is already open, updates `runtime.launch` for subsequent tool calls while in-flight calls complete in their original context, and updates footer status to `kubeconfig: <context>`.
+  - Persists `{ kubeconfigPath, context }` to `~/.polar/agent/k8s.json` (`getAgentDir()`) and notifies with info `kubeconfig: context set to "<context>" (<kubeconfigPath>)`.
 - On `session_shutdown`: marks the extension as shutting down, sends `SIGKILL` to active `kubectl` process groups (`-pid`), sets `runtime.state = "closing"`, and calls `releaseWhenIdle(runtime)`.
 
 ---
@@ -23,7 +29,7 @@
 ## 2. File Structure
 
 ```text
-extensions/k8s/
+packages/coding-agent/src/polar/k8s/
 ├── ARCHITECTURE.md                  # Domain contract and tool specifications
 ├── index.ts                         # Flags, /kubeconfig command, lifecycle, tool registration
 ├── src/

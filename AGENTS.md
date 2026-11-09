@@ -1,4 +1,37 @@
-# Development Rules
+# Polar Repository Architecture & Development Rules
+
+## Polar Overview
+
+This repository is the `polar-sre` monorepo (`bin: polar`, `piConfig: { name: "polar", configDir: ".polar" }`), forked from Pi `v1.1.0` (`earendil-works/pi`).
+
+### Polar Domain Code & Tests
+- All Polar extensions, shared infrastructure, and extension tests live in `packages/coding-agent/src/polar/` (`shared/`, `files/`, `k8s/`, `exec/`, `test/`).
+- Task routing and architectural invariants start at [`packages/coding-agent/src/polar/ARCHITECTURE.md`](packages/coding-agent/src/polar/ARCHITECTURE.md).
+
+### Core Integration Points
+Polar integrates into `packages/coding-agent` at:
+- `packages/coding-agent/src/extensions/index.ts` (`polarBuiltInExtensions`, `POLAR_DEFAULT_EXTENSION_SPECIFIERS`, `POLAR_EXCLUDED_BUILTIN_TOOLS`)
+- `packages/coding-agent/src/main.ts`
+- `packages/coding-agent/src/core/system-prompt.ts`
+- `packages/coding-agent/src/core/slash-commands.ts`
+- `packages/coding-agent/src/core/settings-manager.ts`
+- `packages/coding-agent/src/modes/interactive/interactive-mode.ts`
+
+### Verification, Testing & Build Commands
+- **Fast Polar extension tests:** `cd packages/coding-agent && npx vitest --run src/polar`
+- **Full lint, typecheck, and repository contracts:** `npm run check` (the pre-commit hook is disabled; always run `npm run check` explicitly before committing)
+- **Full isolated monorepo test suite:** `./test.sh` (do not run bare `npx vitest` across the repo without paths due to heavy e2e tests)
+- **Offline build of all packages and CLI bundle:** `npm run build:offline`
+- **Interactive root launchers:** `./fullpolar.sh` (all built-in Polar extensions) and `./polar.sh` (minimal `builtin:files` harness + any `-e` extensions)
+
+### Upstream Base (`earendil-works/pi`)
+- **Base version:** tag `v1.1.0` (`earendil-works/pi`), MIT license (`LICENSE` is preserved).
+- **Update policy:** pull from upstream only for security CVEs or concrete product requirements.
+- **Update procedure:** generate a diff between tags (`git diff <old-tag> <new-tag>`) in upstream and apply via `git apply --3way`.
+
+---
+
+# Monorepo Technical Rules
 
 ## Conversational Style
 
@@ -29,14 +62,12 @@
 
 ## Commands
 
-- After code changes (not docs): `npm run check` (full output, no tail). Fix all errors, warnings, and infos before committing. Does not run tests.
-- Never run `npm run build` or `npm test` unless requested by the user.
-- Never run the full vitest suite directly: it includes e2e tests that activate when endpoint/auth env vars are present. For all non-e2e tests, run `./test.sh` from the repo root. Otherwise run specific tests from the package root:
+- After code changes (not docs): run `npm run check` (full output, no tail) and fix all errors, warnings, and infos before committing.
+- Never run the full vitest suite directly without path arguments: it includes e2e tests that activate when endpoint/auth env vars are present. For all non-e2e tests across the monorepo, run `./test.sh` from the repo root. For Polar tests, run `cd packages/coding-agent && npx vitest --run src/polar`. Otherwise run specific tests from the package root:
   - Vitest: `node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run test/specific.test.ts`
   - `packages/tui` (`node:test`): `node --test test/specific.test.ts`
 - If you create or modify a test file, run it and iterate on test or implementation until it passes.
 - For `packages/coding-agent/test/suite/`, use `test/suite/harness.ts` + the faux provider. No real provider APIs, keys, or paid tokens.
-- When regressions tests for fixing a github issue, add a comment with the github issue number next to the test.
 - For ad-hoc scripts, `write` them to a temp file (e.g. `/tmp`), run, edit if needed, remove when done. Don't embed multi-line scripts in `bash` commands.
 - Never commit unless the user asks.
 
@@ -47,7 +78,6 @@
 - Hydrate/update locally with `npm install --ignore-scripts`; clean/CI-style with `npm ci --ignore-scripts`. Don't run lifecycle scripts unless the user asks.
 - If dep metadata changes, refresh `package-lock.json` with `npm install --package-lock-only --ignore-scripts`.
 - If `packages/coding-agent/install-lock/` needs regen, run `node scripts/generate-coding-agent-install-lock.mjs` (verify with `--check` or `npm run check`). New deps with lifecycle scripts require review and an explicit allowlist entry in that script; never add one silently.
-- Pre-commit blocks lockfile commits unless `PI_ALLOW_LOCKFILE_CHANGE=1`. Don't bypass unless the user wants the lockfile change committed.
 
 ## Git
 
@@ -71,54 +101,9 @@ If rebase conflicts occur:
 - If a conflict is in a file you did not modify, abort and ask the user.
 - Never force push.
 
-## Issues and PRs
+## Testing Interactive Mode with tmux
 
-See `CONTRIBUTING.md` for the contributor gate (auto-close workflows, `lgtm`/`lgtmi`, quality bar).
-
-When reviewing PRs:
-
-- Do not run `gh pr checkout`, `git switch`, or otherwise move the worktree to the PR branch unless the user explicitly asks.
-- Use `gh pr view`, `gh pr diff`, `gh api`, and local `git show`/`git diff` against fetched refs to inspect PR metadata, commits, and patches without changing branches.
-- If you need PR file contents, fetch/read them into temporary files or use `git show <ref>:<path>` without switching branches.
-
-When creating issues:
-
-- Add `pkg:*` labels for affected packages (`pkg:agent`, `pkg:ai`, `pkg:coding-agent`, `pkg:tui`); use all that apply.
-
-When posting issue/PR comments:
-
-- Write the comment to a temp file and post with `gh issue/pr comment --body-file` (never multi-line markdown via `--body`).
-- Keep comments concise, technical, in the user's tone.
-- End every AI-posted comment with the AI-generated disclaimer line specified by the originating prompt (e.g. `This comment is AI-generated by `/wr``).
-
-When closing issues via commit:
-
-- Include `fixes #<number>` or `closes #<number>` in the message so merging auto-closes the issue. For multiple issues, repeat the keyword per issue (`closes #1, closes #2`); a shared keyword (`closes #1, #2`) only closes the first.
-
-## Testing pi Interactive Mode with tmux
-
-For testing pi's interactive mode, load and follow [.pi/skills/interactive-testing.md](.pi/skills/interactive-testing.md).
-
-## Changelog
-
-Location: `packages/*/CHANGELOG.md` (one per package).
-
-Sections under `## [Unreleased]`: `### Breaking Changes` (API changes requiring migration), `### Added`, `### Changed`, `### Fixed`, `### Removed`.
-
-Rules:
-
-- All new entries go under `## [Unreleased]`. Read the full section first and append to existing subsections; never duplicate them.
-- Released version sections (e.g. `## [0.12.2]`) are immutable; never modify them.
-- Do not create changelog entries when working on a branch other than `main` or pull request
-
-Attribution:
-
-- Internal (from issues): `Fixed foo bar ([#123](https://github.com/earendil-works/pi/issues/123))`
-- External contributions: `Added feature X ([#456](https://github.com/earendil-works/pi/pull/456) by [@username](https://github.com/username))`
-
-## Releasing
-
-For release preparation, publishing, verification, or recovery, load and follow [.pi/skills/release.md](.pi/skills/release.md).
+For testing interactive mode, load and follow [.pi/skills/interactive-testing.md](.pi/skills/interactive-testing.md).
 
 ## User Override
 

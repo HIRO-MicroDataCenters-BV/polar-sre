@@ -1,6 +1,6 @@
 # Read-Only Producer Contract (`shared/` SDK & `<producer>/`)
 
-> **Context:** Part of [`extensions/ARCHITECTURE.md`](../ARCHITECTURE.md). Defines the structure and contracts for deterministic, read-only SRE producer extensions (`k8s`, `loki`, `grafana`, `prometheus`, ...).
+> **Context:** Part of [`src/polar/ARCHITECTURE.md`](../ARCHITECTURE.md). Defines the structure and contracts for deterministic, read-only SRE producer extensions (`k8s`, `loki`, `grafana`, `prometheus`, ...).
 
 A producer tool takes typed parameters, builds one fixed command from them, and streams the result. The model never passes shell pipelines, raw flag arrays, or free-form command strings.
 

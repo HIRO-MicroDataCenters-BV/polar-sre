@@ -97,7 +97,7 @@ describe("start", () => {
 		expect(await checkReadiness(fakeRuntime(state, handle, { IMAGE_MISSING: "1" }))).toEqual({
 			ready: false,
 			message:
-				"sandbox is off: container image inspect polar-exec:test failed: Error: image polar-exec:test not found. Build the image as extensions/exec/ARCHITECTURE.md describes.",
+				"sandbox is off: container image inspect polar-exec:test failed: Error: image polar-exec:test not found. Build the image as packages/coding-agent/src/polar/exec/ARCHITECTURE.md describes.",
 			leftovers: [],
 		});
 	});

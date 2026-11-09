@@ -12,6 +12,8 @@ Polar extensions provide a modular toolset for agentic SRE diagnostics. Producer
 | Modify session locking, quotas, `manifest.jsonl`, or the `files` extension | 1. [`shared/ARTIFACT-BUS.md`](shared/ARTIFACT-BUS.md) |
 | Modify the `exec` VM sandbox | 1. [`exec/ARCHITECTURE.md`](exec/ARCHITECTURE.md)<br>2. [`shared/ARTIFACT-BUS.md`](shared/ARTIFACT-BUS.md) |
 
+When creating any new extension directory `packages/coding-agent/src/polar/<name>/`, register it in `packages/coding-agent/src/extensions/index.ts` (`polarBuiltInExtensions`); it is then automatically included in `POLAR_DEFAULT_EXTENSION_SPECIFIERS` (`builtin:<name>`).
+
 ---
 
 ## 2. System Topology
@@ -24,7 +26,7 @@ Polar extensions provide a modular toolset for agentic SRE diagnostics. Producer
         │             │             │
         ▼             ▼             ▼
  ════════════════════════════════════════════════════════════════
-  SHARED: Producer SDK + Artifact Bus (extensions/shared/)
+  SHARED: Producer SDK + Artifact Bus (packages/coding-agent/src/polar/shared/)
   • Small text output (<= 50 KiB & <= 2000 lines) -> returned inline, .part deleted
   • Large text output                             -> published as .txt + manifest.jsonl
   • Artifact transfer (raw bytes)                 -> published as .bin + manifest.jsonl
@@ -57,12 +59,8 @@ Polar extensions provide a modular toolset for agentic SRE diagnostics. Producer
 ## 3. Canonical Directory Tree
 
 ```text
-extensions/
+packages/coding-agent/src/polar/
 ├── ARCHITECTURE.md                  # System topology, file tree, invariants
-├── package.json
-├── tsconfig.json
-├── vitest.config.ts
-├── biome.json
 │
 ├── shared/                          # Core layer & Producer SDK
 │   ├── ARTIFACT-BUS.md              # Session, store, manifest, and files gate contract
@@ -137,17 +135,19 @@ extensions/
 Enforced by `test/independence.test.ts` and `test/composition.test.ts`:
 
 1. **Import Graph**
-   - `files/`, `exec/`, and `<producer>/` import only from `../shared/*`, Node built-ins, and declared npm packages.
-   - `shared/` imports only from `./*`, Node built-ins, and declared npm packages.
+   - `files/`, `exec/`, and `<producer>/` import only from `../shared/*`, host types/utilities in `packages/coding-agent/src/` (`../../config.ts`, `../../core/*`, `../../modes/*`), Node built-ins, and declared npm packages.
+   - `shared/` imports only from `./*`, host types/utilities in `packages/coding-agent/src/` (`../../core/*`), Node built-ins, and declared npm packages.
    - Cross-extension imports are prohibited.
-2. **Extension Isolation**
+2. **Built-in Extension Registration**
+   - Every Polar extension directory under `packages/coding-agent/src/polar/<name>/` must be registered in `polarBuiltInExtensions` (`packages/coding-agent/src/extensions/index.ts`) with `builtin: true` and exposed in `POLAR_DEFAULT_EXTENSION_SPECIFIERS` as `builtin:<name>` (verified by `every Polar extension directory is registered as a built-in extension` in `test/independence.test.ts`).
+3. **Extension Isolation**
    - Extensions do not call `getActiveTools` or inspect which other extensions are loaded.
    - Tool names, descriptions, prompt snippets, prompt guidelines, parameter descriptions, status lines, notices, and replies of an extension do not reference tool names belonging to other extensions (`list_files`, `exec`, `k8s_*`, `loki_*`, etc.).
    - Producers reference saved files by their full path in the session directory and may mention Pi's built-in `read` tool. Only `exec` references `/data/<file>`.
-3. **Graceful Disablement**
-   - Missing or incomplete operator configuration at `session_start` notifies the operator, sets `<ext>: off` (or `<ext>: off (/<command>)`) in the UI status, acquires no session lock, and leaves that extension's tools unregistered while the session and other extensions continue normally.
+4. **Graceful Disablement**
+   - Missing or incomplete operator configuration at `session_start` notifies the operator, sets a footer status (for example, `kubeconfig: off, run /kubeconfig` for `k8s`, or sets no footer status at all, as in `exec`), acquires no session lock, and leaves that extension's tools unregistered while the session and other extensions continue normally.
    - Producer extensions may support deferred activation and live target switching during the session via an operator command.
-4. **Streaming Output**
+5. **Streaming Output**
    - Primary output streams directly into an `OpenFile.sink` managed by `shared/store.ts` rather than buffering full payloads in memory.
-5. **Storage Finalization Before Formatting**
+6. **Storage Finalization Before Formatting**
    - `OpenFile` publication (`finishOutputFile`) or deletion (`discardOutputFile`) completes in the storage finalization step before reply formatting. Formatting functions operate on plain data structures without filesystem I/O.
