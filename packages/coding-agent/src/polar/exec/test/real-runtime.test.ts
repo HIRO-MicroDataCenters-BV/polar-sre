@@ -6,7 +6,7 @@ import { setTimeout as sleep } from "timers/promises";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { acquireSession, type SessionHandle } from "../../shared/session.ts";
 import { readManifest } from "../../shared/store.ts";
-import { createRuntime } from "../index.ts";
+import { createRuntime, DEFAULT_IMAGE } from "../index.ts";
 import { containerCommand, parseContainers, parseListing } from "../src/cli.ts";
 import { buildReply } from "../src/reply.ts";
 import { admitCall } from "../src/runner.ts";
@@ -21,7 +21,7 @@ import {
 } from "../src/workspace.ts";
 
 const REAL = process.env.EXEC_REAL_RUNTIME === "1";
-const IMAGE = process.env.EXEC_IMAGE ?? "polar-exec:0.1";
+const IMAGE = process.env.EXEC_IMAGE ?? DEFAULT_IMAGE;
 
 const limits: ExecLimits = {
 	timeoutMs: 60_000,

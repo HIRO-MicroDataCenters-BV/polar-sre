@@ -9,10 +9,6 @@ import { CONFIG_DIR_NAME, getAgentDir, getBinDir } from "./config.ts";
 import { migrateKeybindingsConfig } from "./core/keybindings.ts";
 import { stripBom } from "./utils/text.ts";
 
-const MIGRATION_GUIDE_URL =
-	"https://github.com/earendil-works/pi/blob/main/packages/coding-agent/CHANGELOG.md#extensions-migration";
-const EXTENSIONS_DOC_URL = "https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md";
-
 /**
  * Migrate legacy oauth.json and settings.json apiKeys to auth.json.
  *
@@ -281,8 +277,6 @@ export async function showDeprecationWarnings(warnings: string[]): Promise<void>
 		console.log(chalk.yellow(`Warning: ${warning}`));
 	}
 	console.log(chalk.yellow(`\nMove your extensions to the extensions/ directory.`));
-	console.log(chalk.yellow(`Migration guide: ${MIGRATION_GUIDE_URL}`));
-	console.log(chalk.yellow(`Documentation: ${EXTENSIONS_DOC_URL}`));
 	console.log(chalk.dim(`\nPress any key to continue...`));
 
 	await new Promise<void>((resolve) => {

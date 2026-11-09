@@ -1,7 +1,7 @@
 # The guest environment of the exec tool: Debian 13 with Python 3.13, the Python kit from requirements.txt
 # and the CLI kit. Built for linux/arm64; the yq and duckdb downloads below are arm64 binaries.
 # Build (from this directory):
-#   container build --arch arm64 --tag polar-exec:0.1 --file Containerfile .
+#   container build --arch arm64 --tag polar-exec:0.2 --file Containerfile .
 # Versions of everything inside the image are listed in /README.md of the image.
 FROM python:3.13-slim@sha256:70729b46c69b4f1e97c4822c1af3df53a1476cf5ddc6c087c0c10bc3a5678c2f
 
@@ -29,11 +29,11 @@ COPY requirements.txt /tmp/requirements.txt
 RUN pip install --require-hashes --no-deps --requirement /tmp/requirements.txt \
 	&& rm /tmp/requirements.txt
 
-# The code runs as the unprivileged user pi. /data and /work are mount points; the runner mounts the
+# The code runs as the unprivileged user polar. /data and /work are mount points; the runner mounts the
 # session directory read-only at /data and the session volume at /work.
-RUN useradd --uid 1000 --user-group --home-dir /work --no-create-home --shell /bin/bash pi \
+RUN useradd --uid 1000 --user-group --home-dir /work --no-create-home --shell /bin/bash polar \
 	&& mkdir -p /data /work \
-	&& chown pi:pi /work
+	&& chown polar:polar /work
 
 RUN { \
 	echo "# polar-exec image"; \

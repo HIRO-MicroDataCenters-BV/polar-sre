@@ -26,7 +26,7 @@ const LIMITS: ExecLimits = {
 	shutdownBudgetMs: 10_000,
 };
 
-export const DEFAULT_IMAGE = "polar-exec:0.1";
+export const DEFAULT_IMAGE = "polar-exec:0.2";
 const PYTHON_KIT =
 	"duckdb, polars, pandas, numpy, orjson, ijson, pyyaml, jmespath, python-dateutil, ciso8601, regex, tabulate, drain3";
 const CLI_KIT = "bash, coreutils, gawk, ripgrep, jq, yq, duckdb, miller";

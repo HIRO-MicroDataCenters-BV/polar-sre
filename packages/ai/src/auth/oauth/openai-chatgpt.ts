@@ -243,7 +243,7 @@ async function loginOpenAIChatGPT(
 	const callback = await startCallbackServer(state).catch((error: unknown) => {
 		if (!(error instanceof Error && "code" in error && error.code === "EADDRINUSE")) throw error;
 		throw new Error(
-			`Port ${CALLBACK_PORT} is in use, probably by an unfinished login in another pi session or by the Codex CLI. Cancel that login and try again.`,
+			`Port ${CALLBACK_PORT} is in use, probably by an unfinished login in another polar session or by the Codex CLI. Cancel that login and try again.`,
 		);
 	});
 

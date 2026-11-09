@@ -550,8 +550,6 @@ export class InteractiveMode {
 		() => this.sessionManager.getSessionName(),
 	);
 
-	/** The `/bug` hint is shown at most once per session so error output stays readable. */
-	private bugReportHintShown = false;
 	private installChangeWarningShown = false;
 
 	// Extension UI state
@@ -1191,7 +1189,7 @@ export class InteractiveMode {
 		if (crash) {
 			const when = new Date(crash.timestamp).toLocaleString();
 			this.showWarning(
-				`${APP_NAME} crashed on ${when} (${crash.message}). Run /bug to report it; the crash details are attached automatically.`,
+				`${APP_NAME} crashed on ${when} (${crash.message}). Crash details are saved in ${path.join(getAgentDir(), "crashes.json")}.`,
 			);
 		}
 
@@ -1231,7 +1229,9 @@ export class InteractiveMode {
 	}
 
 	private async checkForPackageUpdates(): Promise<string[]> {
-		if (process.env.PI_OFFLINE) {
+		// Polar disables package commands, so the background package update check is off.
+		const packageUpdateCheckEnabled: boolean = false;
+		if (!packageUpdateCheckEnabled || process.env.PI_OFFLINE) {
 			return [];
 		}
 
@@ -1289,7 +1289,7 @@ export class InteractiveMode {
 		}
 
 		if (extendedKeysFormat === "xterm") {
-			return "tmux extended-keys-format is xterm. Pi works best with csi-u. Add `set -g extended-keys-format csi-u` to ~/.tmux.conf and restart tmux.";
+			return "tmux extended-keys-format is xterm. Polar works best with csi-u. Add `set -g extended-keys-format csi-u` to ~/.tmux.conf and restart tmux.";
 		}
 
 		return undefined;
@@ -2088,21 +2088,12 @@ export class InteractiveMode {
 	}
 
 	private crashReportInstructions(): string {
-		const resume = this.session.sessionFile ? `run \`${APP_NAME} -r\` to resume the session, then` : "start pi and";
-		return `To report this crash: ${resume} run /bug. The crash details are attached automatically.`;
+		const resume = this.session.sessionFile ? ` Run \`${APP_NAME} -r\` to resume the session.` : "";
+		return `Crash details are saved in ${path.join(getAgentDir(), "crashes.json")}.${resume}`;
 	}
 
 	private suggestBugReport(): void {
-		if (this.bugReportHintShown) return;
-		this.bugReportHintShown = true;
-		this.chatContainer.addChild(
-			new ThemedText(
-				() => theme.fg("muted", `If this looks like a ${APP_NAME} bug, /bug sends a report to the developers.`),
-				this.outputPad,
-				0,
-			),
-		);
-		this.ui.requestRender();
+		// Polar has no /bug command, so there is nothing to suggest.
 	}
 
 	private maybeSuggestBugReport(message: AssistantMessage): void {
@@ -3098,7 +3089,7 @@ export class InteractiveMode {
 			if (image) {
 				const tmpDir = os.tmpdir();
 				const ext = extensionForImageMimeType(image.mimeType) ?? "png";
-				const fileName = `pi-clipboard-${crypto.randomUUID()}.${ext}`;
+				const fileName = `polar-clipboard-${crypto.randomUUID()}.${ext}`;
 				const filePath = path.join(tmpDir, fileName);
 				fs.writeFileSync(filePath, Buffer.from(image.bytes));
 
@@ -3214,16 +3205,6 @@ export class InteractiveMode {
 			}
 			if (text === "/debug") {
 				this.handleDebugCommand();
-				this.editor.setText("");
-				return;
-			}
-			if (text === "/arminsayshi") {
-				this.handleArminSaysHi();
-				this.editor.setText("");
-				return;
-			}
-			if (text === "/dementedelves") {
-				this.handleDementedDelves();
 				this.editor.setText("");
 				return;
 			}
@@ -4112,7 +4093,7 @@ export class InteractiveMode {
 				() =>
 					theme.fg(
 						"warning",
-						`This project is not trusted. Project ${CONFIG_DIR_NAME} resources and packages are ignored. Use /trust to save a trust decision, then restart pi.`,
+						`This project is not trusted. Project ${CONFIG_DIR_NAME} resources and packages are ignored. Restart ${APP_NAME} to decide again, or use --approve.`,
 					),
 				1,
 				0,
@@ -5667,6 +5648,8 @@ export class InteractiveMode {
 	private getLoginProviderOptions(authType?: "oauth" | "api_key"): AuthSelectorProvider[] {
 		const options: AuthSelectorProvider[] = [];
 		for (const provider of this.session.modelRuntime.getProviders()) {
+			// Polar does not offer the Radius gateway of Pi.
+			if (provider.id === RADIUS_PROVIDER_ID) continue;
 			const authStatus = this.session.modelRuntime.getProviderAuthStatus(provider.id);
 			const status = authStatus.configured
 				? {
@@ -6853,6 +6836,7 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
+	// biome-ignore lint/correctness/noUnusedPrivateClassMembers: disabled in Polar
 	private handleArminSaysHi(): void {
 		if (playArmin3d(this.renderer)) return;
 		this.chatContainer.addChild(new Spacer(1));
@@ -6860,6 +6844,7 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
+	// biome-ignore lint/correctness/noUnusedPrivateClassMembers: disabled in Polar
 	private handleDementedDelves(): void {
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new EarendilAnnouncementComponent());

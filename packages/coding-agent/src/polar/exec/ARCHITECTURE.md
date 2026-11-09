@@ -25,7 +25,7 @@ packages/coding-agent/src/polar/exec/
 ├── ARCHITECTURE.md                  # VM sandbox architecture and layer boundaries
 ├── index.ts                         # --exec-image flag, session_start/shutdown wiring, tool registration
 ├── image/
-│   ├── Containerfile                # Guest image definition (default tag: polar-exec:0.1)
+│   ├── Containerfile                # Guest image definition (default tag: polar-exec:0.2)
 │   ├── requirements.in
 │   └── requirements.txt
 ├── src/
@@ -71,7 +71,7 @@ packages/coding-agent/src/polar/exec/
 
 Build command:
 ```bash
-(cd packages/coding-agent/src/polar/exec/image && container build --arch arm64 --tag polar-exec:0.1 --file Containerfile .)
+(cd packages/coding-agent/src/polar/exec/image && container build --arch arm64 --tag polar-exec:0.2 --file Containerfile .)
 ```
 
 - **Python 3.13 kit:** `duckdb`, `polars`, `pandas`, `numpy`, `orjson`, `ijson`, `pyyaml`, `jmespath`, `python-dateutil`, `ciso8601`, `regex`, `tabulate`, `drain3`.

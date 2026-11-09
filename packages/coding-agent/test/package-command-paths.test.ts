@@ -159,6 +159,7 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
 			}
 			return undefined as never;
 		}) as typeof process.exit);
+		vi.stubEnv("HOME", tempDir);
 		process.env[ENV_AGENT_DIR] = agentDir;
 		process.chdir(projectDir);
 	});
@@ -192,7 +193,7 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
 		const relativePkgDir = join(projectDir, "packages", "local-package");
 		mkdirSync(relativePkgDir, { recursive: true });
 
-		await main(["install", "./packages/local-package"]);
+		await runPackageCommandDirectly(["install", "./packages/local-package"]);
 
 		const settingsPath = join(agentDir, "settings.json");
 		const settings = JSON.parse(readFileSync(settingsPath, "utf-8")) as { packages?: string[] };
@@ -203,13 +204,13 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
 	});
 
 	it("should remove local packages using a path with a trailing slash", async () => {
-		await main(["install", `${packageDir}/`]);
+		await runPackageCommandDirectly(["install", `${packageDir}/`]);
 
 		const settingsPath = join(agentDir, "settings.json");
 		const installedSettings = JSON.parse(readFileSync(settingsPath, "utf-8")) as { packages?: string[] };
 		expect(installedSettings.packages?.length).toBe(1);
 
-		await main(["remove", `${packageDir}/`]);
+		await runPackageCommandDirectly(["remove", `${packageDir}/`]);
 
 		const removedSettings = JSON.parse(readFileSync(settingsPath, "utf-8")) as { packages?: string[] };
 		expect(removedSettings.packages ?? []).toHaveLength(0);
@@ -221,7 +222,7 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
 		try {
-			await expect(main(["list"])).resolves.toBeUndefined();
+			await expect(runPackageCommandDirectly(["list"])).resolves.toBeUndefined();
 
 			const stdout = logSpy.mock.calls.map(([message]) => String(message)).join("\n");
 			expect(stdout).toContain("No packages installed.");
@@ -238,7 +239,7 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
 		try {
-			await expect(main(["list"])).resolves.toBeUndefined();
+			await expect(runPackageCommandDirectly(["list"])).resolves.toBeUndefined();
 
 			const stdout = logSpy.mock.calls.map(([message]) => String(message)).join("\n");
 			expect(stdout).toContain("Project packages:");
@@ -257,7 +258,7 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
 		try {
-			await expect(main(["list", "--no-approve"])).resolves.toBeUndefined();
+			await expect(runPackageCommandDirectly(["list", "--no-approve"])).resolves.toBeUndefined();
 
 			const stdout = logSpy.mock.calls.map(([message]) => String(message)).join("\n");
 			expect(stdout).toContain("No packages installed.");
@@ -274,7 +275,7 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
 		try {
-			await expect(main(["list", "--approve"])).resolves.toBeUndefined();
+			await expect(runPackageCommandDirectly(["list", "--approve"])).resolves.toBeUndefined();
 
 			const stdout = logSpy.mock.calls.map(([message]) => String(message)).join("\n");
 			expect(stdout).toContain("Project packages:");
@@ -293,7 +294,7 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
 		try {
-			await expect(main(["list"])).resolves.toBeUndefined();
+			await expect(runPackageCommandDirectly(["list"])).resolves.toBeUndefined();
 
 			const stdout = logSpy.mock.calls.map(([message]) => String(message)).join("\n");
 			expect(stdout).toContain("Project packages:");
@@ -312,14 +313,14 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
 
 		try {
 			await expect(
-				main(["list"], {
+				handlePackageCommand(["list"], {
 					extensionFactories: [
 						(pi) => {
 							pi.on("project_trust", () => ({ trusted: "yes" }));
 						},
 					],
 				}),
-			).resolves.toBeUndefined();
+			).resolves.toBe(true);
 
 			const stdout = logSpy.mock.calls.map(([message]) => String(message)).join("\n");
 			expect(stdout).toContain("Project packages:");
@@ -349,7 +350,7 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
 
 		try {
 			await expect(
-				main(["update", "--extensions"], {
+				handlePackageCommand(["update", "--extensions"], {
 					extensionFactories: [
 						(pi) => {
 							pi.on("project_trust", () => {
@@ -359,7 +360,7 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
 						},
 					],
 				}),
-			).resolves.toBeUndefined();
+			).resolves.toBe(true);
 
 			expect(projectTrustCalled).toBe(false);
 			expect(existsSync(recordPath)).toBe(false);
@@ -385,7 +386,7 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
 		try {
-			await expect(main(["update", "--extensions"])).resolves.toBeUndefined();
+			await expect(runPackageCommandDirectly(["update", "--extensions"])).resolves.toBeUndefined();
 
 			expect(existsSync(recordPath)).toBe(true);
 			expect(process.exitCode).toBeUndefined();
@@ -402,7 +403,7 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
 		try {
-			await expect(main(["list"])).resolves.toBeUndefined();
+			await expect(runPackageCommandDirectly(["list"])).resolves.toBeUndefined();
 
 			const stdout = logSpy.mock.calls.map(([message]) => String(message)).join("\n");
 			expect(stdout).toContain("No packages installed.");
@@ -419,7 +420,7 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
 		try {
-			await expect(main(["install", "-l", "./local-package"])).resolves.toBeUndefined();
+			await expect(runPackageCommandDirectly(["install", "-l", "./local-package"])).resolves.toBeUndefined();
 
 			const stderr = errorSpy.mock.calls.map(([message]) => String(message)).join("\n");
 			expect(stderr).toContain("Project is not trusted. Use --approve to modify local package config.");
@@ -430,7 +431,7 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
 	});
 
 	it("allows local package install to initialize fresh project settings", async () => {
-		await main(["install", "-l", packageDir]);
+		await runPackageCommandDirectly(["install", "-l", packageDir]);
 
 		const settingsPath = join(projectDir, ".polar", "settings.json");
 		const settings = JSON.parse(readFileSync(settingsPath, "utf-8")) as { packages?: string[] };
@@ -445,7 +446,7 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
 		try {
-			await expect(main(["install", "--help"])).resolves.toBeUndefined();
+			await expect(runPackageCommandDirectly(["install", "--help"])).resolves.toBeUndefined();
 
 			const stdout = logSpy.mock.calls.map(([message]) => String(message)).join("\n");
 			expect(stdout).toContain("Usage:");
@@ -591,7 +592,7 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
 		try {
-			await expect(main(["install", "--unknown"])).resolves.toBeUndefined();
+			await expect(runPackageCommandDirectly(["install", "--unknown"])).resolves.toBeUndefined();
 
 			const stderr = errorSpy.mock.calls.map(([message]) => String(message)).join("\n");
 			expect(stderr).toContain('Unknown option --unknown for "install".');
@@ -606,7 +607,7 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
 		try {
-			await expect(main(["install"])).resolves.toBeUndefined();
+			await expect(runPackageCommandDirectly(["install"])).resolves.toBeUndefined();
 
 			const stderr = errorSpy.mock.calls.map(([message]) => String(message)).join("\n");
 			expect(stderr).toContain("Missing install source.");
@@ -1032,6 +1033,45 @@ if(args.includes("install")) process.exit(23);
 		}
 	});
 
+	it("rejects the update command at the CLI entry", async () => {
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		try {
+			await expect(main(["update", "--self"])).resolves.toBeUndefined();
+
+			expect(errorSpy.mock.calls.map(([message]) => String(message))).toEqual(["polar update is disabled."]);
+			expect(process.exitCode).toBe(1);
+		} finally {
+			errorSpy.mockRestore();
+		}
+	});
+
+	it("rejects the install command at the CLI entry", async () => {
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		try {
+			await expect(main(["install", "npm:fake-package"])).resolves.toBeUndefined();
+
+			expect(errorSpy.mock.calls.map(([message]) => String(message))).toEqual(["polar install is disabled."]);
+			expect(process.exitCode).toBe(1);
+		} finally {
+			errorSpy.mockRestore();
+		}
+	});
+
+	it("rejects the mcp command at the CLI entry", async () => {
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		try {
+			await expect(main(["mcp", "list"])).resolves.toBeUndefined();
+
+			expect(errorSpy.mock.calls.map(([message]) => String(message))).toEqual(["polar mcp is disabled."]);
+			expect(process.exitCode).toBe(1);
+		} finally {
+			errorSpy.mockRestore();
+		}
+	});
+
 	it("suggests the configured source when update input omits the npm prefix", async () => {
 		const settingsPath = join(agentDir, "settings.json");
 		writeFileSync(settingsPath, JSON.stringify({ packages: ["npm:pi-formatter"] }, null, 2));
@@ -1040,7 +1080,7 @@ if(args.includes("install")) process.exit(23);
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
 		try {
-			await expect(main(["update", "pi-formatter"])).resolves.toBeUndefined();
+			await expect(runPackageCommandDirectly(["update", "pi-formatter"])).resolves.toBeUndefined();
 
 			const stderr = errorSpy.mock.calls.map(([message]) => String(message)).join("\n");
 			const stdout = logSpy.mock.calls.map(([message]) => String(message)).join("\n");

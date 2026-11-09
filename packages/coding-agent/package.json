@@ -89,7 +89,7 @@
 		"vitest": "4.1.11"
 	},
 	"keywords": [
-		"coding-agent",
+		"sre",
 		"ai",
 		"llm",
 		"cli",
@@ -100,7 +100,7 @@
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/earendil-works/pi.git",
+		"url": "git+https://github.com/HIRO-MicroDataCenters-BV/polar-sre.git",
 		"directory": "packages/coding-agent"
 	},
 	"engines": {
