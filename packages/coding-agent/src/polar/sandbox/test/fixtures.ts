@@ -4,7 +4,7 @@ import { join } from "path";
 import { setTimeout as sleep } from "timers/promises";
 import { fileURLToPath } from "url";
 import { AppleContainerDriver } from "../src/driver.ts";
-import type { SandboxLimits, SandboxRuntime, SessionHandle } from "../src/types.ts";
+import type { RunningCall, SandboxDriverContext, SandboxLimits, SandboxRuntime, SessionHandle } from "../src/types.ts";
 
 export const FAKE_CONTAINER = fileURLToPath(new URL("./fake-container.mjs", import.meta.url));
 
@@ -92,23 +92,23 @@ export function fakeRuntime(
 	knobs: Record<string, string> = {},
 	limits: Partial<SandboxLimits> = {},
 ): SandboxRuntime {
-	const runtime: SandboxRuntime = {
+	const context: SandboxDriverContext = {
 		containerCommand: FAKE_CONTAINER,
 		image: "polar-sandbox:test",
 		limits: { ...testLimits, ...limits },
 		environment: fakeEnvironment(state, knobs),
 		handle,
 		state: "open",
-		inFlight: new Set(),
 		owned: new Set(),
 		children: new Map(),
 		cliStopped: false,
-		running: new Set(),
-		driver: undefined as unknown as AppleContainerDriver,
-		activeSandbox: {},
 	};
-	runtime.driver = new AppleContainerDriver(runtime);
-	return runtime;
+	return Object.assign(context, {
+		inFlight: new Set<string>(),
+		running: new Set<RunningCall>(),
+		driver: new AppleContainerDriver(context),
+		activeSandbox: {},
+	});
 }
 
 export function startingRuntime(

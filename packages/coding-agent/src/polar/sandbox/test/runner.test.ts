@@ -5,9 +5,16 @@ import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { acquireSession, type SessionHandle } from "../../shared/session.ts";
 import { discardOutputFile, readExcerpt } from "../../shared/store.ts";
-import { KEEPALIVE_COMMAND, SCRUB_SCRIPT } from "../src/driver.ts";
+import {
+	execArguments,
+	KEEPALIVE_COMMAND,
+	launcher,
+	SCRUB_SCRIPT,
+	sandboxArguments,
+	workVolumeName,
+} from "../src/driver.ts";
 import { buildReply } from "../src/reply.ts";
-import { admitCall, containerName, execArguments, launcher, sandboxArguments } from "../src/runner.ts";
+import { admitCall, containerName } from "../src/runner.ts";
 import type {
 	Inspection,
 	OutputLimit,
@@ -17,7 +24,7 @@ import type {
 	SandboxRuntime,
 	SessionPaths,
 } from "../src/types.ts";
-import { closeAdmission, workVolumeName } from "../src/workspace.ts";
+import { closeAdmission } from "../src/workspace.ts";
 import { type FakeState, fakeRuntime, fakeState, until } from "./fixtures.ts";
 
 const store = vi.hoisted(() => ({ onOpened: undefined as (() => void) | undefined }));
@@ -133,8 +140,8 @@ describe("SandboxCall", () => {
 		expect(calls[3]).toEqual(["exec", "--user", "1000:1000", name, "bash", "-c", SCRUB_SCRIPT]);
 	});
 
-	it("recreates the hot sandbox when scrubAfterCall fails or when the sandbox vanished between calls", async () => {
-		const runtime = fakeRuntime(state, handle, { SCRUB_FAIL: "1" });
+	it("recreates the hot sandbox when scrubAfterCall fails, times out, or when the sandbox vanished between calls", async () => {
+		const runtime = fakeRuntime(state, handle, { SCRUB_FAIL: "1" }, { commandTimeoutMs: 250 });
 		const first = await run("stdout:one\nexit:0", runtime);
 		expect(first).toMatchObject({ status: "ok", exitCode: 0, stdout: "one\n" });
 		const firstName = await nameOf(1);
@@ -143,18 +150,28 @@ describe("SandboxCall", () => {
 		expect(runtime.owned.size).toBe(0);
 
 		delete runtime.environment.FAKE_CONTAINER_SCRUB_FAIL;
-		const second = await run("stdout:two\nexit:0", runtime);
-		expect(second).toMatchObject({ status: "ok", exitCode: 0, stdout: "two\n" });
+		runtime.environment.FAKE_CONTAINER_SCRUB_HANG = "1";
+		const hungScrub = await run("stdout:two\nexit:0", runtime);
+		expect(hungScrub).toMatchObject({ status: "ok", exitCode: 0, stdout: "two\n" });
 		const secondName = await nameOf(2);
 		expect(secondName).not.toBe(firstName);
-		expect(runtime.activeSandbox.current?.name).toBe(secondName);
+		expect(runtime.activeSandbox.current).toBeUndefined();
+		expect(await state.containers()).toEqual([]);
+		expect(runtime.owned.size).toBe(0);
 
-		await rm(join(state.directory, "containers", `${secondName}.json`), { force: true });
+		delete runtime.environment.FAKE_CONTAINER_SCRUB_HANG;
 		const third = await run("stdout:three\nexit:0", runtime);
 		expect(third).toMatchObject({ status: "ok", exitCode: 0, stdout: "three\n" });
 		const thirdName = await nameOf(3);
 		expect(thirdName).not.toBe(secondName);
 		expect(runtime.activeSandbox.current?.name).toBe(thirdName);
+
+		await rm(join(state.directory, "containers", `${thirdName}.json`), { force: true });
+		const fourth = await run("stdout:four\nexit:0", runtime);
+		expect(fourth).toMatchObject({ status: "ok", exitCode: 0, stdout: "four\n" });
+		const fourthName = await nameOf(4);
+		expect(fourthName).not.toBe(thirdName);
+		expect(runtime.activeSandbox.current?.name).toBe(fourthName);
 	});
 
 	it("passes the operator limits, the mounts and the code to the runtime", async () => {
@@ -238,6 +255,17 @@ describe("SandboxCall", () => {
 		const name = await nameOf(1);
 		const calls = await state.calls();
 		expect(callIndex(calls, "inspect", name)).toBeGreaterThan(callIndex(calls, "exec", "--interactive"));
+		expect(runtime.activeSandbox.current?.name).toBe(name);
+
+		runtime.environment.FAKE_CONTAINER_EXEC_FAILS = "1";
+		const execFailed = await run("stdout:never", runtime);
+		expect(execFailed).toMatchObject({
+			status: "failed",
+			exitCode: 1,
+			stdout: "",
+			inspection: { state: "present" },
+		});
+		expect(execFailed.stderr.toString("utf8")).toBe("Error: exec failed\n");
 		expect(runtime.activeSandbox.current?.name).toBe(name);
 	});
 
@@ -416,9 +444,58 @@ describe("SandboxCall", () => {
 		expect(await sessionFiles()).toEqual([]);
 		expect(await state.containers()).toEqual([]);
 		expect(runtime.owned.size).toBe(0);
+
+		const hangingStart = fakeRuntime(state, handle, { RUN_HANG: "1" }, { commandTimeoutMs: 250 });
+		const timedOutStart = await run("stdout:never", hangingStart);
+		expect(timedOutStart).toMatchObject({
+			status: "runtime_failed",
+			exitCode: null,
+			runtimeMessage: "timed out",
+		});
+		expect(timedOutStart.output).toBeUndefined();
+		expect(await state.containers()).toEqual([]);
+		expect(hangingStart.owned.size).toBe(0);
+		expect(hangingStart.activeSandbox.current).toBeUndefined();
+
+		const failingLogs = fakeRuntime(state, handle, { LOGS_FAIL: "1" });
+		const logsFailed = await run("stdout:never", failingLogs);
+		expect(logsFailed).toMatchObject({
+			status: "runtime_failed",
+			exitCode: null,
+			runtimeMessage: "Error: logs failed",
+		});
+		expect(logsFailed.output).toBeUndefined();
+		expect(await state.containers()).toEqual([]);
+		expect(failingLogs.owned.size).toBe(0);
+		expect(failingLogs.activeSandbox.current).toBeUndefined();
 	});
 
-	it("keeps the program result and destroys the sandbox when the diagnosis fails", async () => {
+	it("keeps the program result and destroys the sandbox when the container stops mid-run or diagnosis fails", async () => {
+		const stoppedRuntime = fakeRuntime(state, handle);
+		const stoppedCall = admit("stdout:partial\nvanish", stoppedRuntime);
+		try {
+			const vanished = await stoppedCall.run();
+			expect(vanished).toMatchObject({
+				status: "failed",
+				exitCode: 137,
+				inspection: { state: "stopped" },
+			});
+			expect(stoppedRuntime.activeSandbox.current).toBeUndefined();
+			expect(await state.containers()).toEqual([]);
+			expect(stoppedRuntime.owned.size).toBe(0);
+			const reply = await buildReply(
+				vanished,
+				{ language: "python", code: "stdout:partial\nvanish" },
+				stoppedRuntime.limits,
+				session,
+			);
+			expect(reply.isError).toBe(true);
+			expect(reply.text).toContain("partial");
+			expect(reply.text).toContain("[The container stopped during the run; the output may be incomplete.]");
+		} finally {
+			await stoppedCall.dispose();
+		}
+
 		const diagnoses: [Record<string, string>, Partial<SandboxLimits>, Inspection][] = [
 			[{ INSPECT_EXIT: "2" }, {}, { state: "unknown", detail: "Error: inspect failed" }],
 			[{ INSPECT_GARBAGE: "1" }, {}, { state: "unknown", detail: "unreadable answer" }],
@@ -432,7 +509,7 @@ describe("SandboxCall", () => {
 			expect(result, form).toMatchObject({ status: "failed", exitCode: 3, stdout: "partial\n" });
 			expect(result.output, form).toBeDefined();
 			expect(result.inspection, form).toEqual(inspection);
-			const name = await nameOf(index + 1);
+			const name = await nameOf(index + 2);
 			const calls = await state.calls();
 			expect(callIndex(calls, "inspect", name), form).toBeGreaterThan(callIndex(calls, "run"));
 			expect(callIndex(calls, "delete", "--force", name), form).toBeGreaterThan(callIndex(calls, "inspect", name));

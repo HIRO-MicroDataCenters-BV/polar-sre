@@ -319,6 +319,9 @@ function cleanupNotice(result: ResultState): string | undefined {
 
 function inspectionNotice({ inspection }: ResultState): string | undefined {
 	if (inspection === undefined || inspection.state === "present") return undefined;
+	if (inspection.state === "stopped") {
+		return "[The container stopped during the run; the output may be incomplete.]";
+	}
 	if (inspection.state === "absent") {
 		return "[The container was not found after the run; whether the program started is not known.]";
 	}

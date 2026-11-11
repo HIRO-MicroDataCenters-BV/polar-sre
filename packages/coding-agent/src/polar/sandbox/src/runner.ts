@@ -7,8 +7,7 @@ import {
 	openOutputFile,
 	quotaMessage,
 } from "../../shared/store.ts";
-import { cleanupOwned, deadlineAfter, describeCleanupErrors, StreamCapture } from "./cli.ts";
-import { execArguments, launcher, sandboxArguments, TMP_PATH } from "./driver.ts";
+import { deadlineAfter, describeCleanupErrors, StreamCapture } from "./cli.ts";
 import type {
 	HotSandbox,
 	OutputLimit,
@@ -18,9 +17,7 @@ import type {
 	SandboxResult,
 	SandboxRuntime,
 } from "./types.ts";
-import { closeIfDrained } from "./workspace.ts";
-
-export { execArguments, launcher, sandboxArguments, TMP_PATH };
+import { cleanupOwned, closeIfDrained } from "./workspace.ts";
 
 type Stop =
 	| { reason: "timeout" | "cancelled" | "shutdown" }
@@ -107,26 +104,62 @@ export class SandboxCall {
 	}
 
 	private async executeInSandbox(file: OpenFile): Promise<SandboxResult> {
-		const existing = this.runtime.activeSandbox.current;
-		if (existing !== undefined) {
-			const spawned = await existing.spawnCall(this.request.language);
-			const stopped = this.checkpoint();
-			if (stopped !== undefined) {
+		for (let attempt = 0; attempt < 2; attempt += 1) {
+			const existing = this.runtime.activeSandbox.current;
+			const reused = existing !== undefined;
+			let hot: HotSandbox;
+			if (existing !== undefined) {
+				hot = existing;
+			} else {
+				const name = containerName(this.runtime.handle.paths.sessionId, file.name);
+				const started = await this.runtime.driver.startSandbox(
+					name,
+					this.runtime.handle.paths,
+					deadlineAfter(this.runtime),
+					this.signal,
+				);
+				const afterStart = this.checkpoint();
+				if (afterStart !== undefined) {
+					if ("started" in started) return this.abortSandbox(started.started, file, afterStart);
+					if (started.leftover !== undefined) afterStart.cleanupError = started.leftover;
+					await discardOutputFile(file);
+					return afterStart;
+				}
+				if ("failed" in started) {
+					await discardOutputFile(file);
+					const result = runtimeFailure(started.failed, this.startedAt);
+					if (started.leftover !== undefined) result.cleanupError = started.leftover;
+					return result;
+				}
+				hot = started.started;
+				this.runtime.activeSandbox.current = hot;
+			}
+
+			const spawned = await hot.spawnCall(this.request.language);
+			const afterSpawn = this.checkpoint();
+			if (afterSpawn !== undefined) {
 				if ("spawned" in spawned) {
 					spawned.spawned.kill();
 					await spawned.spawned.closed;
 				}
-				return this.abortSandbox(existing, file, stopped);
+				return this.abortSandbox(hot, file, afterSpawn);
 			}
 			if ("spawned" in spawned) {
-				return new SandboxRun(spawned.spawned, existing, this.runtime, file, this.signal, performance.now()).start(
+				return new SandboxRun(spawned.spawned, hot, this.runtime, file, this.signal, performance.now()).start(
 					this.request.code,
 				);
 			}
-			if (this.runtime.activeSandbox.current === existing) {
+
+			if (this.runtime.activeSandbox.current === hot) {
 				this.runtime.activeSandbox.current = undefined;
 			}
-			const cleanup = await existing.destroy(deadlineAfter(this.runtime));
+			const cleanup = await hot.destroy(deadlineAfter(this.runtime));
+			if (!reused) {
+				await discardOutputFile(file);
+				const result = runtimeFailure(spawned.gone, this.startedAt);
+				if (!cleanup.removed) result.cleanupError = cleanup.error;
+				return result;
+			}
 			const afterCleanup = this.checkpoint();
 			if (afterCleanup !== undefined) {
 				if (!cleanup.removed) afterCleanup.cleanupError = cleanup.error;
@@ -144,53 +177,7 @@ export class SandboxCall {
 				};
 			}
 		}
-
-		const name = containerName(this.runtime.handle.paths.sessionId, file.name);
-		const started = await this.runtime.driver.startSandbox(
-			name,
-			this.runtime.handle.paths,
-			deadlineAfter(this.runtime),
-			this.signal,
-		);
-		const afterStart = this.checkpoint();
-		if (afterStart !== undefined) {
-			if ("started" in started) return this.abortSandbox(started.started, file, afterStart);
-			if (started.leftover !== undefined) afterStart.cleanupError = started.leftover;
-			await discardOutputFile(file);
-			return afterStart;
-		}
-		if ("failed" in started) {
-			await discardOutputFile(file);
-			const result = runtimeFailure(started.failed, this.startedAt);
-			if (started.leftover !== undefined) result.cleanupError = started.leftover;
-			return result;
-		}
-
-		const hot = started.started;
-		this.runtime.activeSandbox.current = hot;
-		const spawned = await hot.spawnCall(this.request.language);
-		const afterSpawn = this.checkpoint();
-		if (afterSpawn !== undefined) {
-			if ("spawned" in spawned) {
-				spawned.spawned.kill();
-				await spawned.spawned.closed;
-			}
-			return this.abortSandbox(hot, file, afterSpawn);
-		}
-		if ("gone" in spawned) {
-			if (this.runtime.activeSandbox.current === hot) {
-				this.runtime.activeSandbox.current = undefined;
-			}
-			const cleanup = await hot.destroy(deadlineAfter(this.runtime));
-			await discardOutputFile(file);
-			const result = runtimeFailure(spawned.gone, this.startedAt);
-			if (!cleanup.removed) result.cleanupError = cleanup.error;
-			return result;
-		}
-
-		return new SandboxRun(spawned.spawned, hot, this.runtime, file, this.signal, performance.now()).start(
-			this.request.code,
-		);
+		throw new Error("unreachable");
 	}
 
 	private async abortSandbox(hot: HotSandbox, file: OpenFile, result: SandboxResult): Promise<SandboxResult> {

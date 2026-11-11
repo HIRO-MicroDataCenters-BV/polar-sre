@@ -24,20 +24,12 @@ import {
 	type Inspection,
 	type OwnedResource,
 	type SandboxDriver,
+	type SandboxDriverContext,
 	type SandboxLanguage,
-	type SandboxRuntime,
 	type SandboxStartOutcome,
 	type SessionPaths,
 	type SpawnCallOutcome,
 	type VolumeFailure,
-} from "./types.ts";
-
-export type {
-	HotSandbox,
-	SandboxDriver,
-	SandboxProcess,
-	SandboxStartOutcome,
-	SpawnCallOutcome,
 } from "./types.ts";
 
 type RunProcess = ChildProcessByStdio<Writable, Readable, Readable>;
@@ -51,14 +43,15 @@ export const KEEPALIVE_COMMAND = "echo; while read -r _; do :; done";
 
 export const SCRUB_SCRIPT = [
 	"kill -9 -1 2>/dev/null",
+	"ipcrm --all 2>/dev/null",
 	"chmod -R u+rwX /tmp /dev/shm /dev/mqueue 2>/dev/null",
 	"find /tmp /dev/shm /dev/mqueue -mindepth 1 -delete 2>/dev/null",
 	"for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 -1 2>/dev/null || break; sleep 0.02; done",
-	'! kill -0 -1 2>/dev/null && [ -z "$(find /tmp /dev/shm /dev/mqueue -mindepth 1 -print -quit 2>/dev/null)" ]',
+	'! kill -0 -1 2>/dev/null && [ -z "$(find /tmp /dev/shm /dev/mqueue -mindepth 1 -print -quit 2>/dev/null)" ] && [ -z "$(ipcs -m -q -s 2>/dev/null | grep "^0x")" ]',
 ].join("\n");
 
-const START_ENDED = "the session is shutting down";
-const LEFTOVERS_STAYED = "leftovers of sandbox stayed";
+export const START_ENDED = "the session is shutting down";
+export const LEFTOVERS_STAYED = "leftovers of sandbox stayed";
 const BUILD_TIMEOUT_MS = 600_000;
 const KEEPALIVE_STOP_GRACE_MS = 200;
 const COMMAND_STDERR_MAX_BYTES = 16 * 1024 * 1024;
@@ -108,7 +101,7 @@ function ownedInRoot(resources: ListedResource[], root: string): OwnedResource[]
 }
 
 export function sandboxArguments(
-	runtime: SandboxRuntime,
+	runtime: SandboxDriverContext,
 	name: string,
 	session: SessionPaths = runtime.handle.paths,
 ): string[] {
@@ -174,9 +167,9 @@ export function execArguments(name: string, language: SandboxLanguage): string[]
 
 export function inspectionOf(inspected: CommandOutcome, name: string): Inspection {
 	if (inspected.code === 0) {
-		const listed = parseContainers(inspected.stdout);
-		if (listed?.some((container) => container.name === name)) return { state: "present" };
-		return { state: "unknown", detail: "unreadable answer" };
+		const container = parseContainers(inspected.stdout)?.find((entry) => entry.name === name);
+		if (container?.state === undefined) return { state: "unknown", detail: "unreadable answer" };
+		return { state: container.state === "running" ? "present" : "stopped" };
 	}
 	if (firstLine(inspected.stderr) === `Error: container not found: ${name}`) return { state: "absent" };
 	return { state: "unknown", detail: commandFailure(inspected) };
@@ -188,7 +181,7 @@ function oomMatches(bootLog: string): string[] {
 
 export class AppleHotSandbox implements HotSandbox {
 	readonly name: string;
-	private readonly runtime: SandboxRuntime;
+	private readonly runtime: SandboxDriverContext;
 	private readonly keepalive: RunProcess;
 	private readonly keepaliveClosed: Promise<number | null>;
 	private keepaliveExited = false;
@@ -197,7 +190,12 @@ export class AppleHotSandbox implements HotSandbox {
 	private destroyed = false;
 	private killing: Promise<CommandOutcome> | undefined;
 
-	constructor(name: string, runtime: SandboxRuntime, keepalive: RunProcess, keepaliveClosed: Promise<number | null>) {
+	constructor(
+		name: string,
+		runtime: SandboxDriverContext,
+		keepalive: RunProcess,
+		keepaliveClosed: Promise<number | null>,
+	) {
 		this.name = name;
 		this.runtime = runtime;
 		this.keepalive = keepalive;
@@ -303,10 +301,9 @@ export class AppleHotSandbox implements HotSandbox {
 export class AppleContainerDriver implements SandboxDriver {
 	readonly name = "apple-container" as const;
 	readonly boundaryDescription = "apple-container (microVM)";
-	private readonly runtime: SandboxRuntime;
-	lastImageFailure = "";
+	private readonly runtime: SandboxDriverContext;
 
-	constructor(runtime: SandboxRuntime) {
+	constructor(runtime: SandboxDriverContext) {
 		this.runtime = runtime;
 	}
 
@@ -317,14 +314,10 @@ export class AppleContainerDriver implements SandboxDriver {
 		return { ready: true };
 	}
 
-	async inspectImage(image: string, deadlineAt: number): Promise<boolean> {
+	async inspectImage(image: string, deadlineAt: number): Promise<{ found: true } | { found: false; reason: string }> {
 		const inspected = await containerCommand(this.runtime, ["image", "inspect", image], remainingMs(deadlineAt));
-		if (inspected.code === 0) {
-			this.lastImageFailure = "";
-			return true;
-		}
-		this.lastImageFailure = commandFailure(inspected);
-		return false;
+		if (inspected.code === 0) return { found: true };
+		return { found: false, reason: `container image inspect ${image} failed: ${commandFailure(inspected)}` };
 	}
 
 	pullImage(image: string, signal?: AbortSignal): Promise<CommandOutcome> {
@@ -355,6 +348,10 @@ export class AppleContainerDriver implements SandboxDriver {
 
 	deleteSandbox(name: string, deadlineAt: number): Promise<CleanupOutcome> {
 		return cleanupContainer(this.runtime, name, deadlineAt);
+	}
+
+	manualDeleteCommand(names: string[]): string {
+		return `container delete --force ${names.join(" ")}`;
 	}
 
 	async listWorkVolumes(root: string, deadlineAt: number): Promise<OwnedResource[]> {

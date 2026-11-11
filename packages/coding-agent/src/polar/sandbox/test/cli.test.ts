@@ -5,13 +5,14 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { acquireSession, type SessionHandle } from "../../shared/session.ts";
 import {
 	cleanupContainer,
-	cleanupOwned,
 	commandFailure,
 	containerCommand,
 	deadlineAfter,
 	parseContainers,
 	parseVolumes,
 } from "../src/cli.ts";
+import { inspectionOf } from "../src/driver.ts";
+import { cleanupOwned } from "../src/workspace.ts";
 import { type FakeState, fakeRuntime, fakeState } from "./fixtures.ts";
 
 let root: string;
@@ -62,9 +63,38 @@ describe("cli", () => {
 		const runtime = fakeRuntime(state, handle);
 
 		const listed = await containerCommand(runtime, ["list", "--all", "--format", "json"]);
-		expect(parseContainers(listed.stdout)).toEqual([{ name: "polar-sandbox-current-1-aaaaaaaa", labels }]);
+		expect(parseContainers(listed.stdout)).toEqual([
+			{ name: "polar-sandbox-current-1-aaaaaaaa", labels, state: "stopped" },
+		]);
 		const inspected = await containerCommand(runtime, ["inspect", "polar-sandbox-current-1-aaaaaaaa"]);
-		expect(parseContainers(inspected.stdout)).toEqual([{ name: "polar-sandbox-current-1-aaaaaaaa", labels }]);
+		expect(parseContainers(inspected.stdout)).toEqual([
+			{ name: "polar-sandbox-current-1-aaaaaaaa", labels, state: "stopped" },
+		]);
+		expect(inspectionOf(inspected, "polar-sandbox-current-1-aaaaaaaa")).toEqual({ state: "stopped" });
+		expect(
+			inspectionOf(
+				{
+					code: 0,
+					stdout: JSON.stringify([
+						{ configuration: { id: "polar-sandbox-current-1-aaaaaaaa", labels }, status: "running" },
+					]),
+					stderr: "",
+					timedOut: false,
+				},
+				"polar-sandbox-current-1-aaaaaaaa",
+			),
+		).toEqual({ state: "present" });
+		expect(
+			inspectionOf(
+				{
+					code: 0,
+					stdout: JSON.stringify([{ configuration: { id: "polar-sandbox-current-1-aaaaaaaa", labels } }]),
+					stderr: "",
+					timedOut: false,
+				},
+				"polar-sandbox-current-1-aaaaaaaa",
+			),
+		).toEqual({ state: "unknown", detail: "unreadable answer" });
 		const volumes = await containerCommand(runtime, ["volume", "list", "--format", "json"]);
 		expect(parseVolumes(volumes.stdout)).toEqual([{ name: "polar-work-current", labels }]);
 

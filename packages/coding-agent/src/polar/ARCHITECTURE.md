@@ -117,9 +117,9 @@ packages/coding-agent/src/polar/
 │   │   ├── requirements.in
 │   │   └── requirements.txt
 │   ├── src/
-│   │   ├── types.ts
+│   │   ├── types.ts                 # Domain types and `SandboxDriver` / `HotSandbox` contracts
 │   │   ├── cli.ts                   # Layer 1: Stateless CLI execution, JSON parsing, container cleanup
-│   │   ├── driver.ts                # Layer 2: `SandboxDriver` / `HotSandbox` contract and `AppleContainerDriver`
+│   │   ├── driver.ts                # Layer 2: `AppleContainerDriver` and `AppleHotSandbox` implementation
 │   │   ├── workspace.ts             # Layer 3: Readiness check, orphan container/volume GC, /work volume setup
 │   │   ├── runner.ts                # Layer 4: Lazy hot VM lifecycle, `spawnCall` supervision, OOM delta check, scrub
 │   │   └── reply.ts                 # Layer 5: Sandbox reply formatting (with OOM, inspection, and cleanup notices)

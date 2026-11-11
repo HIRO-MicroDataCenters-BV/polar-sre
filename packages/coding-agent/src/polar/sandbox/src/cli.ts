@@ -1,5 +1,5 @@
 import { spawn } from "child_process";
-import type { CleanupError, CleanupOutcome, CommandOutcome, SandboxRuntime } from "./types.ts";
+import type { CleanupError, CleanupOutcome, CommandOutcome, SandboxDriverContext } from "./types.ts";
 
 export const CLI_STOPPED = "sandbox is stopping; no command starts";
 const COMMAND_OUTPUT_MAX_BYTES = 16 * 1024 * 1024;
@@ -9,10 +9,11 @@ const DIAGNOSTIC_MAX_LINES = 64;
 export interface ListedResource {
 	name: string;
 	labels: Record<string, unknown>;
+	state?: string;
 }
 
 export function containerCommand(
-	runtime: SandboxRuntime,
+	runtime: SandboxDriverContext,
 	args: string[],
 	timeoutMs = runtime.limits.commandTimeoutMs,
 	signal?: AbortSignal,
@@ -72,12 +73,16 @@ export function parseListing(text: string, key: "id" | "name"): ListedResource[]
 	if (!Array.isArray(parsed)) return undefined;
 	const resources: ListedResource[] = [];
 	for (const entry of parsed) {
-		const configuration = isObject(entry) ? entry.configuration : undefined;
+		if (!isObject(entry)) return undefined;
+		const configuration = entry.configuration;
 		if (!isObject(configuration)) return undefined;
 		const name = configuration[key];
 		const labels = configuration.labels === undefined ? {} : configuration.labels;
 		if (typeof name !== "string" || !isObject(labels)) return undefined;
-		resources.push({ name, labels });
+		const status = entry.status;
+		const rawState = typeof status === "string" ? status : isObject(status) ? status.state : undefined;
+		const state = typeof rawState === "string" && rawState !== "" ? rawState : undefined;
+		resources.push(state === undefined ? { name, labels } : { name, labels, state });
 	}
 	return resources;
 }
@@ -94,7 +99,7 @@ function isObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-export function deadlineAfter(runtime: SandboxRuntime): number {
+export function deadlineAfter(runtime: SandboxDriverContext): number {
 	return Date.now() + runtime.limits.commandTimeoutMs;
 }
 
@@ -128,7 +133,7 @@ export function boundDiagnostic(text: string): string {
 }
 
 export async function cleanupContainer(
-	runtime: SandboxRuntime,
+	runtime: SandboxDriverContext,
 	name: string,
 	deadlineAt: number,
 ): Promise<CleanupOutcome> {
@@ -153,20 +158,6 @@ export async function cleanupContainer(
 		message += "; no time left to list";
 	}
 	return { removed: false, error: { container: name, message } };
-}
-
-export async function cleanupOwned(
-	runtime: SandboxRuntime,
-	deadlineAt: number,
-	exclude?: string,
-): Promise<CleanupError[]> {
-	const errors: CleanupError[] = [];
-	for (const name of [...runtime.owned]) {
-		if (name === exclude) continue;
-		const outcome = await cleanupContainer(runtime, name, deadlineAt);
-		if (!outcome.removed) errors.push(outcome.error);
-	}
-	return errors;
 }
 
 export function describeCleanupErrors(errors: CleanupError[]): string {

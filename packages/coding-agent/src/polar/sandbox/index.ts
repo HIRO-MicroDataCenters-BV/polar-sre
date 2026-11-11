@@ -4,17 +4,19 @@ import { acquireSession, type SessionHandle } from "../shared/session.ts";
 import { describeBytes, READ_MAX_BYTES } from "../shared/store.ts";
 import { nulCharacterError } from "../shared/validation.ts";
 import { describeCleanupErrors } from "./src/cli.ts";
-import { AppleContainerDriver } from "./src/driver.ts";
+import { AppleContainerDriver, WORK_PATH } from "./src/driver.ts";
 import { buildReply } from "./src/reply.ts";
 import { admitCall, shutdownRefusal } from "./src/runner.ts";
 import {
 	DATA_PATH,
+	type RunningCall,
+	type SandboxDriverContext,
 	type SandboxLimits,
 	type SandboxRequest,
 	type SandboxRuntime,
 	type ToolReply,
 } from "./src/types.ts";
-import { shutdownRuntime, startRuntime, WORK_PATH } from "./src/workspace.ts";
+import { shutdownRuntime, startRuntime } from "./src/workspace.ts";
 
 const LIMITS: SandboxLimits = {
 	timeoutMs: 300_000,
@@ -66,23 +68,23 @@ export function describeRunCode(limits: SandboxLimits): string {
 }
 
 export function createRuntime(image: string, environment: NodeJS.ProcessEnv, handle: SessionHandle): SandboxRuntime {
-	const runtime: SandboxRuntime = {
+	const context: SandboxDriverContext = {
 		containerCommand: "container",
 		image,
 		limits: LIMITS,
 		environment: { ...environment },
 		handle,
 		state: "unready",
-		inFlight: new Set(),
 		owned: new Set(),
 		children: new Map(),
 		cliStopped: false,
-		running: new Set(),
-		driver: undefined as unknown as AppleContainerDriver,
-		activeSandbox: {},
 	};
-	runtime.driver = new AppleContainerDriver(runtime);
-	return runtime;
+	return Object.assign(context, {
+		inFlight: new Set<string>(),
+		running: new Set<RunningCall>(),
+		driver: new AppleContainerDriver(context),
+		activeSandbox: {},
+	});
 }
 
 function validate(params: RunCodeParams): string | undefined {

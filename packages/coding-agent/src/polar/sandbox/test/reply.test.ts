@@ -47,6 +47,7 @@ const STORE_LIMITS = { fileMaxBytes: 64 * 1024 * 1024, sessionMaxBytes: 256 * 10
 const LEFTOVER = { container: "polar-sandbox-current-1-abcdef01", message: "delete: timed out; list: unreadable" };
 const LEFTOVER_LINE =
 	"[The container polar-sandbox-current-1-abcdef01 could not be deleted: delete: timed out; list: unreadable. Do not rerun the program for this; tell the user.]";
+const STOPPED_LINE = "[The container stopped during the run; the output may be incomplete.]";
 const ABSENT_LINE = "[The container was not found after the run; whether the program started is not known.]";
 const UNINSPECTED_LINE = "[The container could not be inspected: timed out.]";
 const NO_STDERR = Buffer.alloc(0);
@@ -378,7 +379,7 @@ describe("buildReply", () => {
 	});
 
 	it("keeps exit code, leftover container, and uncertain diagnosis on separate lines and stays within limits", async () => {
-		const speaksOfStart = /\bprogram (?:ran|started)\b|\bcould not be inspected\b/;
+		const speaksOfStart = /\bprogram (?:ran|started)\b|\bcould not be inspected\b|\bstopped during the run\b/;
 		expect(speaksOfStart.test("[The program ran, but its container could not be deleted.]")).toBe(true);
 		expect(speaksOfStart.test(LEFTOVER_LINE)).toBe(false);
 		const statuses: [SandboxStatus, number][] = [
@@ -388,6 +389,7 @@ describe("buildReply", () => {
 		const inspections: [Inspection | undefined, string[]][] = [
 			[undefined, []],
 			[{ state: "present" }, []],
+			[{ state: "stopped" }, [STOPPED_LINE]],
 			[{ state: "absent" }, [ABSENT_LINE]],
 			[{ state: "unknown", detail: "timed out" }, [UNINSPECTED_LINE]],
 		];

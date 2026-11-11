@@ -226,9 +226,11 @@ async function execCommand(args) {
 			case "vanish": {
 				if (existsSync(containerPath(id))) {
 					const current = readJson(containerPath(id));
+					current.state = "stopped";
+					writeContainer(current);
 					signalPid(current.pid, "SIGKILL");
-					rmSync(containerPath(id), { force: true });
 				}
+				exitCode = 137;
 				break;
 			}
 			case "hang":

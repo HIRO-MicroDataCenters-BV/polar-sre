@@ -9,18 +9,11 @@ import { acquireSession, type SessionHandle } from "../../shared/session.ts";
 import { readManifest } from "../../shared/store.ts";
 import { createRuntime, DEFAULT_IMAGE } from "../index.ts";
 import { containerCommand, parseContainers, parseListing } from "../src/cli.ts";
-import { sandboxArguments } from "../src/driver.ts";
+import { SESSION_LABEL, sandboxArguments, sessionLabels, workVolumeName } from "../src/driver.ts";
 import { buildReply } from "../src/reply.ts";
 import { admitCall } from "../src/runner.ts";
 import type { SandboxLimits, SandboxRequest, SandboxRuntime, SessionPaths } from "../src/types.ts";
-import {
-	recoverLeftovers,
-	SESSION_LABEL,
-	sessionLabels,
-	shutdownRuntime,
-	startRuntime,
-	workVolumeName,
-} from "../src/workspace.ts";
+import { recoverLeftovers, shutdownRuntime, startRuntime } from "../src/workspace.ts";
 
 const REAL = process.env.SANDBOX_REAL_RUNTIME === "1";
 const IMAGE = process.env.POLAR_SANDBOX_IMAGE ?? DEFAULT_IMAGE;
@@ -184,11 +177,14 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 		expect(rg.reply).toEqual({ text: "28572\n", isError: false });
 	}, 60_000);
 
-	it("scrubs background processes, files, and 000 directories in /tmp, /dev/shm, and /dev/mqueue between calls in the same VM", async () => {
+	it("scrubs background processes, files, 000 directories in /tmp, /dev/shm, and /dev/mqueue, and SysV IPC between calls in the same VM", async () => {
 		const dirty = await call(
 			[
 				"cat /proc/sys/kernel/random/boot_id",
 				"sleep 300 </dev/null >/dev/null 2>&1 &",
+				"ipcmk -M 4096 >/dev/null",
+				"ipcmk -Q >/dev/null",
+				"ipcmk -S 1 >/dev/null",
 				"mkdir -p /tmp/locked/sub",
 				"echo secret > /tmp/locked/sub/file.txt",
 				"chmod 000 /tmp/locked/sub /tmp/locked",
@@ -206,14 +202,15 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 				"cat /proc/sys/kernel/random/boot_id",
 				"procs=$(for p in /proc/[0-9]*/comm; do cat \"$p\" 2>/dev/null; done | grep -c '^sleep$' || true)",
 				"files=$(find /tmp /dev/shm /dev/mqueue -mindepth 1 ! -path '/tmp/.polar' ! -path '/tmp/.polar/*' -print 2>/dev/null | wc -l | tr -d ' ')",
-				'echo "procs=$procs files=$files"',
+				"ipcs_count=$(ipcs -m -q -s | grep -c '^0x' || true)",
+				'echo "procs=$procs files=$files ipcs=$ipcs_count"',
 			].join("\n"),
 			"bash",
 		);
 		expect(check.result.status).toBe("ok");
 		const [bootId2, counts] = check.reply.text.trim().split("\n");
 		expect(bootId2).toBe(bootId1);
-		expect(counts).toBe("procs=0 files=0");
+		expect(counts).toBe("procs=0 files=0 ipcs=0");
 	}, 60_000);
 
 	it("keeps /work between calls, refuses writes to /data and has no network", async () => {
@@ -312,6 +309,10 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 	}, 90_000);
 
 	it("collapses the VM in <1 s when the parent process is killed with SIGKILL", async () => {
+		const hot = runtime.activeSandbox.current;
+		runtime.activeSandbox.current = undefined;
+		if (hot !== undefined) await hot.destroy(Date.now() + 30_000);
+
 		const name = `polar-sandbox-kill9-${session.sessionId}`;
 		const args = sandboxArguments(runtime, name);
 		const parent = spawn(
@@ -353,6 +354,35 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 			await containerCommand(runtime, ["delete", "--force", name]);
 		}
 	}, 60_000);
+
+	it("reports inspection stopped, destroys the VM, and recreates it on the next call when the VM is killed mid-call", async () => {
+		const pending = call("echo started; sleep 30", "bash");
+		for (;;) {
+			const parts = (await readdir(session.outputDirectory)).filter((name) => name.endsWith(".part"));
+			if (parts.length === 1 && (await stat(join(session.outputDirectory, parts[0]))).size > 0) break;
+			await sleep(50);
+		}
+		const name = runtime.activeSandbox.current?.name;
+		expect(name).toBeDefined();
+		const killed = await containerCommand(runtime, ["kill", name as string]);
+		expect(killed.code, killed.stderr).toBe(0);
+
+		const stopped = await pending;
+		expect(stopped.result.status).toBe("failed");
+		expect(stopped.result.exitCode).toBe(137);
+		expect(stopped.result.inspection).toEqual({ state: "stopped" });
+		expect(stopped.reply.isError).toBe(true);
+		expect(stopped.reply.text).toContain("started");
+		expect(stopped.reply.text).toContain("[The container stopped during the run; the output may be incomplete.]");
+		expect(runtime.activeSandbox.current).toBeUndefined();
+		expect(await containersOf(session.sessionId)).toEqual([]);
+
+		const next = await call("echo recreated", "bash");
+		expect(next.result.status).toBe("ok");
+		expect(next.reply).toEqual({ text: "recreated\n", isError: false });
+		expect(runtime.activeSandbox.current?.name).toBeDefined();
+		expect(runtime.activeSandbox.current?.name).not.toBe(name);
+	}, 90_000);
 
 	it("reports exit codes, tracebacks and the process limit", async () => {
 		const failed = await call("raise ValueError('boom')");

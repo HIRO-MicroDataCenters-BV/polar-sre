@@ -3,28 +3,29 @@ import { join } from "path";
 import { setTimeout as sleep } from "timers/promises";
 import type { SessionShutdownEvent } from "../../../core/extensions/types.ts";
 import { type SessionLiveness, sessionLiveness } from "../../shared/session.ts";
-import { cleanupOwned, deadlineAfter, describeCleanupErrors, remainingMs } from "./cli.ts";
-import {
-	type AppleContainerDriver,
-	artifactsRootOf,
-	GUEST_USER,
-	ROOT_LABEL,
-	SESSION_LABEL,
-	sessionLabels,
-	WORK_PATH,
-	workVolumeName,
-} from "./driver.ts";
+import { deadlineAfter, describeCleanupErrors, remainingMs } from "./cli.ts";
+import { artifactsRootOf, LEFTOVERS_STAYED, START_ENDED } from "./driver.ts";
 import type { ChildKind, CleanupError, OwnedResource, Readiness, SandboxRuntime, VolumeFailure } from "./types.ts";
-
-export { artifactsRootOf, GUEST_USER, ROOT_LABEL, SESSION_LABEL, sessionLabels, WORK_PATH, workVolumeName };
 
 export type Recovery = { clean: true } | { leftover: CleanupError[] } | { unknown: string };
 
 export type Warn = (message: string) => void;
 
-const START_ENDED = "the session is shutting down";
-const LEFTOVERS_STAYED = "leftovers of sandbox stayed";
 const TICKET_POLL_MS = 20;
+
+export async function cleanupOwned(
+	runtime: SandboxRuntime,
+	deadlineAt: number,
+	exclude?: string,
+): Promise<CleanupError[]> {
+	const errors: CleanupError[] = [];
+	for (const name of [...runtime.owned]) {
+		if (name === exclude) continue;
+		const outcome = await runtime.driver.deleteSandbox(name, deadlineAt);
+		if (!outcome.removed) errors.push(outcome.error);
+	}
+	return errors;
+}
 
 export function closeAdmission(runtime: SandboxRuntime): void {
 	if (runtime.state === "closing" || runtime.state === "closed") return;
@@ -38,8 +39,8 @@ export async function closeIfDrained(runtime: SandboxRuntime): Promise<void> {
 	await runtime.handle.release();
 }
 
-function off(reason: string, leftovers: CleanupError[] = []): Readiness {
-	const stayed = leftovers.length === 0 ? "" : `; ${leftoverNotice(leftovers)}`;
+function off(runtime: SandboxRuntime, reason: string, leftovers: CleanupError[] = []): Readiness {
+	const stayed = leftovers.length === 0 ? "" : `; ${leftoverNotice(runtime, leftovers)}`;
 	return { ready: false, message: `sandbox is off: ${reason}${stayed}`, leftovers };
 }
 
@@ -52,19 +53,19 @@ async function directoryMissing(root: string, sessionId: string): Promise<boolea
 	}
 }
 
-function leftoverNotice(errors: CleanupError[]): string {
-	const names = errors.map((error) => error.container).join(" ");
-	return `${describeCleanupErrors(errors)} could not be deleted; delete them with: container delete --force ${names}`;
+function leftoverNotice(runtime: SandboxRuntime, errors: CleanupError[]): string {
+	const names = errors.map((error) => error.container);
+	return `${describeCleanupErrors(errors)} could not be deleted; delete them with: ${runtime.driver.manualDeleteCommand(names)}`;
 }
 
 export async function checkReadiness(runtime: SandboxRuntime): Promise<Readiness> {
 	const status = await runtime.driver.checkRuntime(deadlineAfter(runtime));
-	if (!status.ready) return off(status.reason);
-	const hasImage = await runtime.driver.inspectImage(runtime.image, deadlineAfter(runtime));
-	if (!hasImage) {
-		const detail = (runtime.driver as AppleContainerDriver).lastImageFailure || "image not found";
+	if (!status.ready) return off(runtime, status.reason);
+	const image = await runtime.driver.inspectImage(runtime.image, deadlineAfter(runtime));
+	if (!image.found) {
 		return off(
-			`container image inspect ${runtime.image} failed: ${detail}. Build the image as packages/coding-agent/src/polar/sandbox/ARCHITECTURE.md describes.`,
+			runtime,
+			`${image.reason}. Build the image as packages/coding-agent/src/polar/sandbox/ARCHITECTURE.md describes.`,
 		);
 	}
 	return { ready: true };
@@ -84,13 +85,13 @@ export async function startRuntime(runtime: SandboxRuntime, warn: Warn): Promise
 async function performStart(runtime: SandboxRuntime, warn: Warn): Promise<Readiness> {
 	const readiness = await checkReadiness(runtime);
 	if (!readiness.ready) return readiness;
-	if (runtime.state !== "unready") return off(START_ENDED);
+	if (runtime.state !== "unready") return off(runtime, START_ENDED);
 	const recovery = await recoverLeftovers(runtime, warn);
-	if ("unknown" in recovery) return off(`runtime state could not be established: ${recovery.unknown}`);
-	if ("leftover" in recovery) return off(LEFTOVERS_STAYED, recovery.leftover);
+	if ("unknown" in recovery) return off(runtime, `runtime state could not be established: ${recovery.unknown}`);
+	if ("leftover" in recovery) return off(runtime, LEFTOVERS_STAYED, recovery.leftover);
 	const failure = await ensureWorkVolume(runtime);
 	if (failure === undefined) return { ready: true };
-	return off(failure.reason, failure.leftover === undefined ? [] : [failure.leftover]);
+	return off(runtime, failure.reason, failure.leftover === undefined ? [] : [failure.leftover]);
 }
 
 export async function recoverLeftovers(runtime: SandboxRuntime, warn: Warn): Promise<Recovery> {

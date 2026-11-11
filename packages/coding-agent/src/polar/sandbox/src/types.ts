@@ -49,18 +49,21 @@ export interface ActiveSandboxHolder {
 	current?: HotSandbox;
 }
 
-export interface SandboxRuntime {
+export interface SandboxDriverContext {
 	containerCommand: string;
 	image: string;
 	limits: SandboxLimits;
 	environment: NodeJS.ProcessEnv;
 	handle: SessionHandle;
 	state: RuntimeState;
-	starting?: Promise<Readiness>;
-	inFlight: Set<string>;
 	owned: Set<string>;
 	children: Map<ChildProcess, ChildKind>;
 	cliStopped: boolean;
+}
+
+export interface SandboxRuntime extends SandboxDriverContext {
+	starting?: Promise<Readiness>;
+	inFlight: Set<string>;
 	running: Set<RunningCall>;
 	driver: SandboxDriver;
 	activeSandbox: ActiveSandboxHolder;
@@ -83,7 +86,7 @@ export type SandboxStatus =
 	| "save_failed"
 	| "runtime_failed";
 
-export type InspectionState = "present" | "absent" | "unknown";
+export type InspectionState = "present" | "stopped" | "absent" | "unknown";
 
 export interface Inspection {
 	state: InspectionState;
@@ -147,12 +150,13 @@ export interface SandboxDriver {
 	readonly boundaryDescription: string;
 
 	checkRuntime(deadlineAt: number): Promise<{ ready: true } | { ready: false; reason: string }>;
-	inspectImage(image: string, deadlineAt: number): Promise<boolean>;
+	inspectImage(image: string, deadlineAt: number): Promise<{ found: true } | { found: false; reason: string }>;
 	pullImage(image: string, signal?: AbortSignal): Promise<CommandOutcome>;
 	buildImage(image: string, contextDir: string, signal?: AbortSignal): Promise<CommandOutcome>;
 
 	listSandboxes(root: string, deadlineAt: number): Promise<OwnedResource[]>;
 	deleteSandbox(name: string, deadlineAt: number): Promise<CleanupOutcome>;
+	manualDeleteCommand(names: string[]): string;
 
 	listWorkVolumes(root: string, deadlineAt: number): Promise<OwnedResource[]>;
 	ensureWorkVolume(session: SessionPaths, deadlineAt: number): Promise<VolumeFailure | undefined>;

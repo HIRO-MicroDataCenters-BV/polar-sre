@@ -13,10 +13,10 @@ The `sandbox` extension (`builtin:sandbox`) registers the `run_code` tool, execu
 - **Lazy Hot Sandbox VM:**
   - The sandbox VM is started lazily on the first `run_code` call in the session (`driver.startSandbox`), not at `session_start`.
   - The VM runs with `--network none`, `--read-only`, `--cap-drop ALL`, `--user 1000:1000`, `2 GiB` RAM, `4` CPUs, `nproc=256`, and a `512 MiB` tmpfs at `/tmp` (without `--init`).
-  - PID 1 inside the guest is `bash -c 'echo; while read -r _; do :; done'`. Built-in `read` spawns no child process, survives `kill -9 -1`, reaps zombies, and exits immediately (~0.1s) on `stdin` EOF if the host `polar` process exits or is killed with `SIGKILL`.
+  - PID 1 inside the guest is `bash -c 'echo; while read -r _; do :; done'`. Built-in `read` spawns no child process, survives `kill -9 -1`, reaps zombies, and exits immediately on `stdin` EOF if the host `polar` process exits or is killed with `SIGKILL`.
   - Each `run_code` invocation executes via `container exec --interactive --user 1000:1000 --workdir /work ... bash -c <launcher>` (`spawnCall`). The `300s` per-call timeout starts strictly when `spawnCall` spawns the script, excluding lazy VM boot time.
-  - After every completed call, `scrubAfterCall` runs an external `container exec` that kills any remaining processes of `uid 1000`, resets permissions (`chmod -R u+rwX`), deletes all entries under `/tmp`, `/dev/shm`, and `/dev/mqueue`, and verifies that no user processes or temporary files remain.
-  - On timeout, cancellation, output limit, OOM, missing container inspection, or `scrubAfterCall` returning `false`, the hot VM is destroyed (`hot.destroy`) and transparently recreated on the next call while preserving `/work`.
+  - After every completed call, `scrubAfterCall` runs an external `container exec` that kills any remaining processes of `uid 1000`, removes SysV IPC objects (`ipcrm --all`), resets permissions (`chmod -R u+rwX`), deletes all entries under `/tmp`, `/dev/shm`, and `/dev/mqueue`, and verifies that no user processes, temporary files, or SysV IPC objects remain.
+  - On timeout, cancellation, output limit, OOM, stopped/missing/unknown container inspection, or `scrubAfterCall` returning `false`, the hot VM is destroyed (`hot.destroy`) and transparently recreated on the next call while preserving `/work`.
 - **Sequential Execution:** `executionMode: "sequential"` runs one call at a time per session.
 - **UI vs LLM Naming Contract:** No footer status (`ctx.ui.setStatus`) is set. User-facing notifications (`ctx.ui.notify`) refer to the runtime as `sandbox` (`sandbox is off: ...`, `sandbox: ...`), whereas the tool name, `promptGuidelines`, and model-facing replies use `run_code` (`[run_code <status>]`, `run_code-<n>.txt`, `run_code-stderr-<n>.txt`).
 
@@ -51,23 +51,23 @@ packages/coding-agent/src/polar/sandbox/
 
 1. **`src/cli.ts` (Layer 1 — Stateless CLI & Diagnostic Primitives)**
    - Spawns short `container` commands with `commandTimeoutMs` (`30s`) and optional `AbortSignal`, tracking child processes in `runtime.children`.
-   - Parses JSON array outputs (`parseListing`, `parseContainers`, `parseVolumes`) and bounds diagnostic stderr (`boundDiagnostic`: `4 KiB` / `64` lines).
-   - Implements `cleanupContainer(runtime, name, deadlineAt)` and `cleanupOwned(runtime, deadlineAt, exclude)`: runs `container delete --force <name>`, and if non-zero, checks `container list --all --format json` before removing `name` from `runtime.owned`.
+   - Parses JSON array outputs (`parseListing`, `parseContainers`, `parseVolumes`, including container runtime state) and bounds diagnostic stderr (`boundDiagnostic`: `4 KiB` / `64` lines).
+   - Implements `cleanupContainer(runtime, name, deadlineAt)`: runs `container delete --force <name>`, and if non-zero, checks `container list --all --format json` before removing `name` from `runtime.owned`.
 
 2. **`src/driver.ts` (Layer 2 — `SandboxDriver` & `HotSandbox`)**
-   - `AppleContainerDriver`: implements runtime readiness (`checkRuntime`, `inspectImage`, `pullImage`, `buildImage`), orphan discovery and deletion (`listSandboxes`, `deleteSandbox`), `/work` volume lifecycle (`listWorkVolumes`, `ensureWorkVolume`, `deleteWorkVolume`), and lazy hot VM startup (`startSandbox`).
-   - `AppleHotSandbox`: manages the keepalive `container run -i` process, records the boot-log OOM baseline before spawning `container exec -i ... bash -c <launcher>` (`spawnCall`), computes OOM deltas (`checkOom`), inspects container presence (`inspect`), scrubs guest state after calls (`scrubAfterCall`), and tears down the VM (`destroy`).
+   - `AppleContainerDriver`: implements runtime readiness (`checkRuntime`, `inspectImage`, `pullImage`, `buildImage`), orphan discovery and deletion (`listSandboxes`, `deleteSandbox`, `manualDeleteCommand`), `/work` volume lifecycle (`listWorkVolumes`, `ensureWorkVolume`, `deleteWorkVolume`), and lazy hot VM startup (`startSandbox`).
+   - `AppleHotSandbox`: manages the keepalive `container run -i` process, records the boot-log OOM baseline before spawning `container exec -i ... bash -c <launcher>` (`spawnCall`), computes OOM deltas (`checkOom`), inspects container state (`inspect`: `present` when `running`, `stopped`, `absent`, or `unknown`), scrubs guest processes, files, and SysV IPC after calls (`scrubAfterCall`), and tears down the VM (`destroy`).
 
 3. **`src/workspace.ts` (Layer 3 — Session Workspace & Recovery)**
    - `startRuntime`: checks driver readiness and image availability, recovers leftover resources under the same `polar-root`, and prepares `/work`.
-   - `recoverLeftovers`: deletes containers belonging to the current session or to sessions whose `sessionLiveness` is `"ended"`. Deletes volumes when the owning session's directory is absent (`ENOENT`). Preserves resources of `"alive"` and `"unknown"` sessions.
+   - `recoverLeftovers` and `cleanupOwned`: `recoverLeftovers` deletes containers belonging to the current session or to sessions whose `sessionLiveness` is `"ended"`, deletes volumes when the owning session's directory is absent (`ENOENT`), and preserves resources of `"alive"` and `"unknown"` sessions. `cleanupOwned(runtime, deadlineAt, exclude)` deletes owned containers through `runtime.driver.deleteSandbox`.
    - `shutdownRuntime`: closes admission, waits up to `shutdownBudgetMs` (`10s`) for in-flight operations to drain, destroys the active `HotSandbox` and cleans up owned containers, kills remaining CLI processes on `quit`, and releases the session handle when drained.
 
 4. **`src/runner.ts` (Layer 4 — Call Admission & Hot Sandbox Supervision)**
    - `admitCall`: admits a call when `runtime.state === "open"` and records `toolCallId` in `runtime.inFlight`.
    - `SandboxCall`: cleans up leftover owned containers from prior calls (excluding the active warm `HotSandbox`), opens `<outputDirectory>/run_code-<n>.part` via `openOutputFile`, reuses `runtime.activeSandbox.current` (or recreates it once if `spawnCall` reports `{ gone }`, or lazily starts it on the first call), and starts `SandboxRun`.
    - `SandboxRun`: writes the script to `stdin` of the guest launcher (`bash -c 'd="${TMPDIR:-/tmp}/.polar"; mkdir -p "$d" && cat > "$d/program.<ext>" && exec <interpreter> "$d/program.<ext>" </dev/null'`), streams `stdout` into `OpenFile.sink` with backpressure, captures `stderr` up to `1 MiB`, and stops the call on timeout, abort, output limit, or shutdown.
-   - On completion: checks OOM delta on exit `137`, inspects container presence on non-zero exit, runs `scrubAfterCall` when the VM remains healthy, and destroys the VM whenever stopped, OOM-killed, missing/unknown on inspection, or when `scrubAfterCall` returns `false`.
+   - On completion: checks OOM delta on exit `137`, inspects container state on non-zero exit, runs `scrubAfterCall` when the VM remains healthy, and destroys the VM whenever stopped, OOM-killed, not `present` on inspection (`stopped`, `absent`, or `unknown`), or when `scrubAfterCall` returns `false`.
 
 5. **`src/reply.ts` (Layer 5 — Sandbox Reply Builder)**
    - Finalizes `result.output` (`discardOutputFile` if a plain `ok` or if the full output fits the reply room; `finishOutputFile` otherwise) and saves oversized `stderr` via `saveBytes` as `run_code-stderr-<n>.txt`.
