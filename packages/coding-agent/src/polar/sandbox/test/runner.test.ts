@@ -1,5 +1,5 @@
 import { spawnSync } from "child_process";
-import { mkdtemp, readdir, rm } from "fs/promises";
+import { mkdtemp, readdir, rm, stat } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -141,7 +141,7 @@ describe("SandboxCall", () => {
 	});
 
 	it("recreates the hot sandbox when scrubAfterCall fails, times out, or when the sandbox vanished between calls", async () => {
-		const runtime = fakeRuntime(state, handle, { SCRUB_FAIL: "1" }, { commandTimeoutMs: 250 });
+		const runtime = fakeRuntime(state, handle, { SCRUB_FAIL: "1" }, { commandTimeoutMs: 2000 });
 		const first = await run("stdout:one\nexit:0", runtime);
 		expect(first).toMatchObject({ status: "ok", exitCode: 0, stdout: "one\n" });
 		const firstName = await nameOf(1);
@@ -331,8 +331,13 @@ describe("SandboxCall", () => {
 	it("stops the sandbox on cancel, or never starts it", async () => {
 		const runtime = fakeRuntime(state, handle);
 		const controller = new AbortController();
-		setTimeout(() => controller.abort(), 200);
-		const cancelled = await run("stdout:partial\nhang", runtime, "python", controller.signal);
+		const pending = run("stdout:partial\nhang", runtime, "python", controller.signal);
+		await until(async () => {
+			const [part] = (await sessionFiles()).filter((name) => name.endsWith(".part"));
+			return part !== undefined && (await stat(join(session.outputDirectory, part))).size > 0;
+		});
+		controller.abort();
+		const cancelled = await pending;
 		expect(cancelled).toMatchObject({ status: "cancelled", stdout: "partial\n" });
 		expect(await state.calls()).toContainEqual(["kill", await nameOf(1)]);
 		expect(await state.containers()).toEqual([]);
@@ -445,7 +450,7 @@ describe("SandboxCall", () => {
 		expect(await state.containers()).toEqual([]);
 		expect(runtime.owned.size).toBe(0);
 
-		const hangingStart = fakeRuntime(state, handle, { RUN_HANG: "1" }, { commandTimeoutMs: 250 });
+		const hangingStart = fakeRuntime(state, handle, { RUN_HANG: "1" }, { commandTimeoutMs: 2000 });
 		const timedOutStart = await run("stdout:never", hangingStart);
 		expect(timedOutStart).toMatchObject({
 			status: "runtime_failed",
