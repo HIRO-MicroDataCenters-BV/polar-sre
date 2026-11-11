@@ -4,7 +4,7 @@ This repository is the `polar-sre` monorepo (`bin: polar`, `piConfig: { name: "p
 
 | Scope | Mandatory Reading Gate |
 |---|---|
-| Polar extensions & tests (`packages/coding-agent/src/polar/**`: `shared/`, `files/`, `k8s/`, `exec/`, `test/`) | Read [`packages/coding-agent/src/polar/ARCHITECTURE.md`](packages/coding-agent/src/polar/ARCHITECTURE.md) for task routing and architectural invariants. |
+| Polar extensions & tests (`packages/coding-agent/src/polar/**`: `shared/`, `files/`, `k8s/`, `sandbox/`, `test/`) | Read [`packages/coding-agent/src/polar/ARCHITECTURE.md`](packages/coding-agent/src/polar/ARCHITECTURE.md) for task routing and architectural invariants. |
 | Any file outside `packages/coding-agent/src/polar/` (`packages/**`, `package.json`, `scripts/**`, upstream sync) | **Mandatory gate:** read [`./CORE.md`](./CORE.md) in full before reading or editing any file outside `packages/coding-agent/src/polar/`. |
 
 ## Commands

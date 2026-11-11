@@ -5,15 +5,16 @@ import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { acquireSession, type SessionHandle } from "../../shared/session.ts";
 import { discardOutputFile, readExcerpt } from "../../shared/store.ts";
+import { KEEPALIVE_COMMAND, SCRUB_SCRIPT } from "../src/driver.ts";
 import { buildReply } from "../src/reply.ts";
-import { admitCall, containerName, launcher, runArguments } from "../src/runner.ts";
+import { admitCall, containerName, execArguments, launcher, sandboxArguments } from "../src/runner.ts";
 import type {
-	ExecLanguage,
-	ExecLimits,
-	ExecResult,
-	ExecRuntime,
 	Inspection,
 	OutputLimit,
+	SandboxLanguage,
+	SandboxLimits,
+	SandboxResult,
+	SandboxRuntime,
 	SessionPaths,
 } from "../src/types.ts";
 import { closeAdmission, workVolumeName } from "../src/workspace.ts";
@@ -32,7 +33,7 @@ vi.mock(import("../../shared/store.ts"), async (importOriginal) => {
 	};
 });
 
-const SHUTTING_DOWN = "exec is shutting down; no program starts.";
+const SHUTTING_DOWN = "run_code is shutting down; no program starts.";
 
 let root: string;
 let handle: SessionHandle;
@@ -41,7 +42,7 @@ let state: FakeState;
 let callNumber = 0;
 
 beforeEach(async () => {
-	root = await mkdtemp(join(tmpdir(), "exec-container-"));
+	root = await mkdtemp(join(tmpdir(), "sandbox-runner-"));
 	handle = await acquireSession("current", root, root);
 	session = handle.paths;
 	state = await fakeState();
@@ -54,14 +55,14 @@ afterEach(async () => {
 	await rm(state.directory, { recursive: true, force: true });
 });
 
-function admit(code: string, runtime: ExecRuntime, language: ExecLanguage = "python", signal?: AbortSignal) {
+function admit(code: string, runtime: SandboxRuntime, language: SandboxLanguage = "python", signal?: AbortSignal) {
 	callNumber += 1;
 	const call = admitCall(runtime, { language, code }, signal, `call-${callNumber}`);
 	if (call === undefined) throw new Error("the call was not admitted");
 	return call;
 }
 
-async function run(code: string, runtime: ExecRuntime, language: ExecLanguage = "python", signal?: AbortSignal) {
+async function run(code: string, runtime: SandboxRuntime, language: SandboxLanguage = "python", signal?: AbortSignal) {
 	const call = admit(code, runtime, language, signal);
 	try {
 		const result = await call.run();
@@ -71,7 +72,7 @@ async function run(code: string, runtime: ExecRuntime, language: ExecLanguage = 
 	}
 }
 
-async function takeOutput(result: ExecResult): Promise<string> {
+async function takeOutput(result: SandboxResult): Promise<string> {
 	if (result.output === undefined) return "";
 	const { text } = await readExcerpt(result.output, "head", 4 * 1024 * 1024);
 	await discardOutputFile(result.output);
@@ -87,50 +88,80 @@ function callIndex(calls: string[][], ...prefix: string[]): number {
 }
 
 async function runCalls(): Promise<string[][]> {
-	return (await state.calls()).filter((call) => call[0] === "run");
+	return (await state.calls()).filter((call) => call[0] === "run" && call.includes("--interactive"));
 }
 
 async function nameOf(number: number): Promise<string> {
-	const runs = (await runCalls()).filter((call) => call.includes("--interactive"));
+	const runs = await runCalls();
 	const name = runs
 		.map((call) => call[call.indexOf("--name") + 1])
-		.find((id) => id.startsWith(`polar-exec-current-${number}-`));
+		.find((id) => id.startsWith(`polar-sandbox-current-${number}-`));
 	if (name === undefined) throw new Error(`no run with output number ${number}`);
 	return name;
 }
 
-const NAME_PATTERN = /^polar-exec-current-1-[0-9a-f]{8}$/;
+const NAME_PATTERN = /^polar-sandbox-current-1-[0-9a-f]{8}$/;
 
-describe("ExecCall", () => {
-	it("runs the code and hands over its streams", async () => {
+describe("SandboxCall", () => {
+	it("lazily starts a hot sandbox on the first call, scrubs after it, and reuses it on the next call", async () => {
 		const runtime = fakeRuntime(state, handle);
-		const result = await run("stdout:hello\nstderr:warn\nexit:0", runtime);
+		const first = await run("stdout:hello\nstderr:warn\nexit:0", runtime);
 
-		expect(result).toMatchObject({ status: "ok", exitCode: 0, stdout: "hello\n" });
-		expect(result.stderr.equals(Buffer.from("warn\n"))).toBe(true);
-		expect(result.runtimeMessage).toBeUndefined();
-		expect(result.limit).toBeUndefined();
-		expect(result.oomEvidence).toBeUndefined();
-		expect(result.cleanupError).toBeUndefined();
-		expect(result.inspection).toBeUndefined();
+		expect(first).toMatchObject({ status: "ok", exitCode: 0, stdout: "hello\n" });
+		expect(first.stderr.equals(Buffer.from("warn\n"))).toBe(true);
+		expect(first.runtimeMessage).toBeUndefined();
+		expect(first.limit).toBeUndefined();
+		expect(first.oomEvidence).toBeUndefined();
+		expect(first.cleanupError).toBeUndefined();
+		expect(first.inspection).toBeUndefined();
 		const name = await nameOf(1);
 		expect(name).toMatch(NAME_PATTERN);
-		expect(await state.containers()).toEqual([]);
-		const calls = await state.calls();
-		expect(calls.map((call) => call[0])).toEqual(["run", "delete"]);
-		expect(calls[1]).toEqual(["delete", "--force", name]);
-		expect(runtime.owned.size).toBe(0);
+		expect(runtime.activeSandbox.current?.name).toBe(name);
+		expect(await state.containers()).toEqual([name]);
+		expect(runtime.owned).toEqual(new Set([name]));
 		expect(await sessionFiles()).toEqual([]);
 		expect(runtime.inFlight.size).toBe(0);
-		expect(runtime.children.size).toBe(0);
 		expect(runtime.running.size).toBe(0);
+
+		const second = await run("stdout:again\nexit:0", runtime);
+		expect(second).toMatchObject({ status: "ok", exitCode: 0, stdout: "again\n" });
+		expect(await runCalls()).toHaveLength(1);
+		expect(runtime.activeSandbox.current?.name).toBe(name);
+
+		const calls = await state.calls();
+		expect(calls.map((call) => call[0])).toEqual(["run", "logs", "exec", "exec", "logs", "exec", "exec"]);
+		expect(calls[3]).toEqual(["exec", "--user", "1000:1000", name, "bash", "-c", SCRUB_SCRIPT]);
+	});
+
+	it("recreates the hot sandbox when scrubAfterCall fails or when the sandbox vanished between calls", async () => {
+		const runtime = fakeRuntime(state, handle, { SCRUB_FAIL: "1" });
+		const first = await run("stdout:one\nexit:0", runtime);
+		expect(first).toMatchObject({ status: "ok", exitCode: 0, stdout: "one\n" });
+		const firstName = await nameOf(1);
+		expect(runtime.activeSandbox.current).toBeUndefined();
+		expect(await state.containers()).toEqual([]);
+		expect(runtime.owned.size).toBe(0);
+
+		delete runtime.environment.FAKE_CONTAINER_SCRUB_FAIL;
+		const second = await run("stdout:two\nexit:0", runtime);
+		expect(second).toMatchObject({ status: "ok", exitCode: 0, stdout: "two\n" });
+		const secondName = await nameOf(2);
+		expect(secondName).not.toBe(firstName);
+		expect(runtime.activeSandbox.current?.name).toBe(secondName);
+
+		await rm(join(state.directory, "containers", `${secondName}.json`), { force: true });
+		const third = await run("stdout:three\nexit:0", runtime);
+		expect(third).toMatchObject({ status: "ok", exitCode: 0, stdout: "three\n" });
+		const thirdName = await nameOf(3);
+		expect(thirdName).not.toBe(secondName);
+		expect(runtime.activeSandbox.current?.name).toBe(thirdName);
 	});
 
 	it("passes the operator limits, the mounts and the code to the runtime", async () => {
 		const runtime = fakeRuntime(state, handle);
 		const code = `echo_argv\n${"# padding\n".repeat(100)}`;
 		const result = await run(code, runtime);
-		const echo = JSON.parse(result.stdout) as { argv: string[]; codeLength: number };
+		const echo = JSON.parse(result.stdout) as { argv: string[]; runArgv: string[]; codeLength: number };
 
 		expect(echo.codeLength).toBe(code.length);
 		const name = await nameOf(1);
@@ -153,23 +184,24 @@ describe("ExecCall", () => {
 			["--label", `polar-root=${root}`],
 		];
 		for (const [flag, value] of expectedPairs) {
-			const positions = echo.argv.flatMap((word, index) => (word === flag ? [index] : []));
+			const positions = echo.runArgv.flatMap((word, index) => (word === flag ? [index] : []));
 			expect(
-				positions.map((index) => echo.argv[index + 1]),
+				positions.map((index) => echo.runArgv[index + 1]),
 				flag,
 			).toContain(value);
 		}
-		expect(echo.argv).toContain("--init");
-		expect(echo.argv).toContain("--read-only");
-		expect(echo.argv).toContain("--interactive");
-		expect(echo.argv.slice(-4)).toEqual(["polar-exec:test", "sh", "-c", launcher("python")]);
-		expect(echo.argv[0]).toBe("run");
-		expect(runArguments(runtime, name, "python")).toEqual(echo.argv);
+		expect(echo.runArgv).not.toContain("--init");
+		expect(echo.runArgv).toContain("--read-only");
+		expect(echo.runArgv).toContain("--interactive");
+		expect(echo.runArgv.slice(-4)).toEqual(["polar-sandbox:test", "bash", "-c", KEEPALIVE_COMMAND]);
+		expect(echo.runArgv[0]).toBe("run");
+		expect(sandboxArguments(runtime, name)).toEqual(echo.runArgv);
+		expect(echo.argv).toEqual(execArguments(name, "python"));
 
 		const bash = await run("echo_argv", runtime, "bash");
-		expect((JSON.parse(bash.stdout) as { argv: string[] }).argv.slice(-3)).toEqual(["sh", "-c", launcher("bash")]);
-		expect(containerName("current", "exec-7")).toMatch(/^polar-exec-current-7-[0-9a-f]{8}$/);
-		expect(containerName("current", "exec-7")).not.toBe(containerName("current", "exec-7"));
+		expect((JSON.parse(bash.stdout) as { argv: string[] }).argv).toEqual(execArguments(name, "bash"));
+		expect(containerName("current", "run_code-7")).toMatch(/^polar-sandbox-current-7-[0-9a-f]{8}$/);
+		expect(containerName("current", "run_code-7")).not.toBe(containerName("current", "run_code-7"));
 		expect(workVolumeName("current")).toBe("polar-work-current");
 	});
 
@@ -177,9 +209,9 @@ describe("ExecCall", () => {
 		expect(launcher("python")).toContain("/tmp}/.polar");
 		expect(launcher("bash")).toContain("/tmp}/.polar");
 		expect(launcher("python")).not.toContain("/.pi");
-		const programs = await mkdtemp(join(tmpdir(), "exec-launcher-"));
-		const sh = (language: ExecLanguage, code: string) =>
-			spawnSync("sh", ["-c", launcher(language)], {
+		const programs = await mkdtemp(join(tmpdir(), "sandbox-launcher-"));
+		const sh = (language: SandboxLanguage, code: string) =>
+			spawnSync("bash", ["-c", launcher(language)], {
 				input: code,
 				encoding: "utf8",
 				env: { ...process.env, TMPDIR: programs },
@@ -196,37 +228,47 @@ describe("ExecCall", () => {
 		}
 	});
 
-	it("reports an exit code the code chose as failed", async () => {
-		const result = await run("stdout:partial\nstderr:boom\nexit:3", fakeRuntime(state, handle));
+	it("reports an exit code the code chose as failed and keeps a healthy sandbox warm", async () => {
+		const runtime = fakeRuntime(state, handle);
+		const result = await run("stdout:partial\nstderr:boom\nexit:3", runtime);
 
 		expect(result).toMatchObject({ status: "failed", exitCode: 3, stdout: "partial\n" });
 		expect(result.stderr.toString("utf8")).toBe("boom\n");
 		expect(result.inspection).toEqual({ state: "present" });
 		const name = await nameOf(1);
 		const calls = await state.calls();
-		expect(callIndex(calls, "inspect", name)).toBeGreaterThan(callIndex(calls, "run"));
-		expect(callIndex(calls, "inspect", name)).toBeLessThan(callIndex(calls, "delete", "--force", name));
+		expect(callIndex(calls, "inspect", name)).toBeGreaterThan(callIndex(calls, "exec", "--interactive"));
+		expect(runtime.activeSandbox.current?.name).toBe(name);
 	});
 
-	it("names an out-of-memory kill only with the kernel line", async () => {
-		const oom = await run("stdout:before\noom", fakeRuntime(state, handle));
+	it("names an out-of-memory kill by delta and does not mark the next call as OOM", async () => {
+		const runtime = fakeRuntime(state, handle);
+		const survived = await run("stdout:caught\noom_survived\nexit:0", runtime);
+		expect(survived).toMatchObject({ status: "ok", exitCode: 0, stdout: "caught\n" });
+		const firstName = await nameOf(1);
+
+		const notOom = await run("exit137", runtime);
+		expect(notOom).toMatchObject({ status: "failed", exitCode: 137 });
+		expect(notOom.oomEvidence).toBeUndefined();
+		expect(notOom.inspection).toEqual({ state: "present" });
+		expect(runtime.activeSandbox.current?.name).toBe(firstName);
+
+		const oom = await run("stdout:before\noom", runtime);
 		expect(oom).toMatchObject({ status: "out_of_memory", exitCode: 137, stdout: "before\n" });
 		expect(oom.oomEvidence).toBe(
 			"Memory cgroup out of memory: Killed process 129 (python3) total-vm:3158408kB, anon-rss:1046208kB",
 		);
 		expect(oom.inspection).toBeUndefined();
-		const name = await nameOf(1);
-		const calls = await state.calls();
-		expect(callIndex(calls, "logs", "--boot", name)).toBeLessThan(callIndex(calls, "delete", "--force", name));
-		expect(callIndex(calls, "inspect", name)).toBe(-1);
+		expect(runtime.activeSandbox.current).toBeUndefined();
+		expect(await state.containers()).toEqual([]);
 
-		const unknown = await run("exit137", fakeRuntime(state, handle));
-		expect(unknown).toMatchObject({ status: "failed", exitCode: 137 });
-		expect(unknown.oomEvidence).toBeUndefined();
-		expect(unknown.inspection).toEqual({ state: "present" });
+		const afterOom = await run("exit137", runtime);
+		expect(afterOom).toMatchObject({ status: "failed", exitCode: 137 });
+		expect(afterOom.oomEvidence).toBeUndefined();
+		expect(afterOom.inspection).toEqual({ state: "present" });
 	});
 
-	it("stops the container at the timeout and keeps the output so far", async () => {
+	it("stops and destroys the sandbox at the timeout and keeps the output so far", async () => {
 		const runtime = fakeRuntime(state, handle, {}, { timeoutMs: 300 });
 		const result = await run("stdout:partial\nhang", runtime);
 
@@ -238,6 +280,7 @@ describe("ExecCall", () => {
 		expect(calls.at(-1)).toEqual(["delete", "--force", name]);
 		expect(await state.containers()).toEqual([]);
 		expect(runtime.owned.size).toBe(0);
+		expect(runtime.activeSandbox.current).toBeUndefined();
 	});
 
 	it("keeps a late kill of one call away from the next call", async () => {
@@ -253,11 +296,11 @@ describe("ExecCall", () => {
 		const names = (await runCalls()).map((call) => call[call.indexOf("--name") + 1]);
 		expect(names).toHaveLength(2);
 		expect(names[0]).not.toBe(names[1]);
-		expect(names[0]).toMatch(/^polar-exec-current-1-/);
-		expect(names[1]).toMatch(/^polar-exec-current-2-/);
+		expect(names[0]).toMatch(/^polar-sandbox-current-1-/);
+		expect(names[1]).toMatch(/^polar-sandbox-current-2-/);
 	});
 
-	it("stops the container on cancel, or never starts it", async () => {
+	it("stops the sandbox on cancel, or never starts it", async () => {
 		const runtime = fakeRuntime(state, handle);
 		const controller = new AbortController();
 		setTimeout(() => controller.abort(), 200);
@@ -275,15 +318,17 @@ describe("ExecCall", () => {
 		expect(await sessionFiles()).toEqual([]);
 	});
 
-	it("stops the container at the output limit", async () => {
+	it("stops and destroys the sandbox at the output limit", async () => {
 		const runtime = fakeRuntime(state, handle, {}, { fileMaxBytes: 1024 });
 		const stopped = await run("stdout_bytes:4096\nhang", runtime);
 		expect(stopped).toMatchObject({ status: "output_limit", limit: "stdout" });
 		expect(stopped.stdout.length).toBeLessThanOrEqual(1024);
 		expect(await state.calls()).toContainEqual(["kill", await nameOf(1)]);
+		expect(await state.containers()).toEqual([]);
 
 		const late = await run("stdout_bytes:4096\nexit:0", runtime);
 		expect(late).toMatchObject({ status: "output_limit", limit: "stdout" });
+		expect(await state.containers()).toEqual([]);
 
 		const quota = await run("stdout_bytes:4096\nhang", fakeRuntime(state, handle, {}, { sessionMaxBytes: 2048 }));
 		expect(quota).toMatchObject({ status: "output_limit", limit: "session" });
@@ -296,7 +341,7 @@ describe("ExecCall", () => {
 		expect(await state.containers()).toEqual([]);
 
 		const flood = "e".repeat(256);
-		const orders: [string, Partial<ExecLimits>, string, OutputLimit][] = [
+		const orders: [string, Partial<SandboxLimits>, string, OutputLimit][] = [
 			[
 				"stdout then stderr",
 				{ fileMaxBytes: 1024, stderrMaxBytes: 128 },
@@ -317,14 +362,14 @@ describe("ExecCall", () => {
 			],
 		];
 		for (const [order, limits, code, limit] of orders) {
-			const runtime = fakeRuntime(state, handle, { KILL_DELAY_MS: "600" }, { ...limits, killGraceMs: 1000 });
-			const result = await run(code, runtime);
+			const used = fakeRuntime(state, handle, { KILL_DELAY_MS: "600" }, { ...limits, killGraceMs: 1000 });
+			const result = await run(code, used);
 			expect(result, order).toMatchObject({ status: "output_limit", limit });
 			expect(await state.containers(), order).toEqual([]);
 		}
 	});
 
-	it("kills the run command when the container outlives the kill", async () => {
+	it("kills the exec and keepalive commands when the container outlives the kill", async () => {
 		const runtime = fakeRuntime(state, handle, { RUN_IGNORES_KILL: "1" }, { timeoutMs: 300, killGraceMs: 200 });
 		const result = await run("hang", runtime);
 
@@ -334,8 +379,9 @@ describe("ExecCall", () => {
 		expect(runtime.owned.size).toBe(0);
 	});
 
-	it("reports a runtime that cannot run the code", async () => {
-		const missing = { ...fakeRuntime(state, handle), containerCommand: "/nonexistent/bin/container" };
+	it("reports a runtime that cannot start the sandbox", async () => {
+		const missing = fakeRuntime(state, handle);
+		missing.containerCommand = "/nonexistent/bin/container";
 		const noCli = await run("stdout:never", missing);
 		expect(noCli.status).toBe("runtime_failed");
 		expect(noCli.runtimeMessage).toContain("ENOENT");
@@ -348,11 +394,12 @@ describe("ExecCall", () => {
 		const call = admit("stdout:never", runtime);
 		try {
 			const failing = await call.run();
-			expect(failing).toMatchObject({ status: "failed", exitCode: 1 });
-			expect(failing.stderr.toString("utf8")).toContain("Error: failed to create container");
-			expect(failing.runtimeMessage).toBeUndefined();
-			expect(failing.inspection).toEqual({ state: "absent" });
-			expect(failing.output?.bytesWritten()).toBe(0);
+			expect(failing).toMatchObject({
+				status: "runtime_failed",
+				exitCode: null,
+				runtimeMessage: "Error: failed to create container: image not found",
+			});
+			expect(failing.output).toBeUndefined();
 			const reply = await buildReply(
 				failing,
 				{ language: "python", code: "stdout:never" },
@@ -360,7 +407,7 @@ describe("ExecCall", () => {
 				runtime.handle.paths,
 			);
 			expect(reply).toEqual({
-				text: "[exec failed: exit 1] python: stdout:never\n\n[stderr]\nError: failed to create container: image not found\n[/stderr]\n\n[The container was not found after the run; whether the program started is not known.]",
+				text: "[run_code runtime_failed] python: stdout:never\n\nError: failed to create container: image not found\n\nThe container runtime failed to run the code. Tell the user.",
 				isError: true,
 			});
 		} finally {
@@ -371,8 +418,8 @@ describe("ExecCall", () => {
 		expect(runtime.owned.size).toBe(0);
 	});
 
-	it("keeps the program result when the diagnosis fails", async () => {
-		const diagnoses: [Record<string, string>, Partial<ExecLimits>, Inspection][] = [
+	it("keeps the program result and destroys the sandbox when the diagnosis fails", async () => {
+		const diagnoses: [Record<string, string>, Partial<SandboxLimits>, Inspection][] = [
 			[{ INSPECT_EXIT: "2" }, {}, { state: "unknown", detail: "Error: inspect failed" }],
 			[{ INSPECT_GARBAGE: "1" }, {}, { state: "unknown", detail: "unreadable answer" }],
 			[{ INSPECT_HANG: "1" }, { commandTimeoutMs: 2000 }, { state: "unknown", detail: "timed out" }],
@@ -390,6 +437,7 @@ describe("ExecCall", () => {
 			expect(callIndex(calls, "inspect", name), form).toBeGreaterThan(callIndex(calls, "run"));
 			expect(callIndex(calls, "delete", "--force", name), form).toBeGreaterThan(callIndex(calls, "inspect", name));
 			expect(runtime.owned.size, form).toBe(0);
+			expect(runtime.activeSandbox.current, form).toBeUndefined();
 		}
 		const killed = await run("stdout:partial\nexit137", fakeRuntime(state, handle, { INSPECT_EXIT: "2" }));
 		expect(killed).toMatchObject({
@@ -416,8 +464,8 @@ describe("admission", () => {
 
 	it("closes admission at every await point", async () => {
 		const deleting = fakeRuntime(state, await ownHandle(), { DELETE_DELAY_MS: "400" });
-		await state.addContainer("polar-exec-current-9-99999999", { "polar-session": "current", "polar-root": root });
-		deleting.owned.add("polar-exec-current-9-99999999");
+		await state.addContainer("polar-sandbox-current-9-99999999", { "polar-session": "current", "polar-root": root });
+		deleting.owned.add("polar-sandbox-current-9-99999999");
 		const first = admit("stdout:never", deleting);
 		const firstRun = first.run();
 		await until(async () => (await state.calls()).some((call) => call[0] === "delete"));
@@ -465,7 +513,7 @@ describe("admission", () => {
 
 describe("cleanup", () => {
 	it("keeps the program result and the ownership when the container cannot be deleted", async () => {
-		const runtime = fakeRuntime(state, handle, { DELETE_FAIL: "1" }, { commandTimeoutMs: 2000 });
+		const runtime = fakeRuntime(state, handle, { SCRUB_FAIL: "1", DELETE_FAIL: "1" }, { commandTimeoutMs: 2000 });
 		const result = await run("stdout:done\nexit:0", runtime);
 		const name = await nameOf(1);
 
@@ -484,15 +532,17 @@ describe("cleanup", () => {
 		);
 		expect(await runCalls()).toHaveLength(1);
 		delete runtime.environment.FAKE_CONTAINER_DELETE_FAIL;
+		delete runtime.environment.FAKE_CONTAINER_SCRUB_FAIL;
 		const next = await run("stdout:again", runtime);
 		expect(next).toMatchObject({ status: "ok", stdout: "again\n" });
 		expect(next.cleanupError).toBeUndefined();
-		expect(await state.containers()).toEqual([]);
-		expect(runtime.owned.size).toBe(0);
+		const secondName = await nameOf(2);
+		expect(await state.containers()).toEqual([secondName]);
+		expect(runtime.owned).toEqual(new Set([secondName]));
 	});
 
 	it("keeps the status and the file when the cleanup fails", async () => {
-		const runtime = fakeRuntime(state, handle, { DELETE_FAIL: "1" });
+		const runtime = fakeRuntime(state, handle, { SCRUB_FAIL: "1", DELETE_FAIL: "1" });
 		const ok = await run("stdout:done\nexit:0", runtime);
 		const firstName = await nameOf(1);
 		expect(ok).toMatchObject({ status: "ok", exitCode: 0, stdout: "done\n" });
@@ -506,7 +556,10 @@ describe("cleanup", () => {
 		);
 		expect(reply.text).toContain(`[The container ${firstName} could not be deleted:`);
 
-		const failed = await run("stdout:partial\nexit:3", fakeRuntime(state, handle, { DELETE_FAIL: "1" }));
+		const failed = await run(
+			"stdout:partial\nexit:3",
+			fakeRuntime(state, handle, { SCRUB_FAIL: "1", DELETE_FAIL: "1" }),
+		);
 		expect(failed).toMatchObject({ status: "failed", exitCode: 3, stdout: "partial\n" });
 		expect(failed.output).toBeDefined();
 		expect(failed.cleanupError?.message).toBe("delete: Error: runtime temporarily unavailable; still listed");

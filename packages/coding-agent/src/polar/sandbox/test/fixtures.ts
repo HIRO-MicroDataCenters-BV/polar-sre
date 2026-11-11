@@ -3,11 +3,12 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { setTimeout as sleep } from "timers/promises";
 import { fileURLToPath } from "url";
-import type { ExecLimits, ExecRuntime, SessionHandle } from "../src/types.ts";
+import { AppleContainerDriver } from "../src/driver.ts";
+import type { SandboxLimits, SandboxRuntime, SessionHandle } from "../src/types.ts";
 
 export const FAKE_CONTAINER = fileURLToPath(new URL("./fake-container.mjs", import.meta.url));
 
-export const testLimits: ExecLimits = {
+export const testLimits: SandboxLimits = {
 	timeoutMs: 10_000,
 	memoryBytes: 2 * 1024 * 1024 * 1024,
 	cpus: 2,
@@ -69,7 +70,7 @@ export async function fakeState(): Promise<FakeState> {
 			return listJson<VolumeRecord>("volumes");
 		},
 		addContainer(id, labels) {
-			return writeRecord("containers", id, { id, labels, state: "stopped", pid: null, bootLog: [] });
+			return writeRecord("containers", id, { id, labels, state: "stopped", pid: null, execPid: null, bootLog: [] });
 		},
 		addVolume(name, labels) {
 			return writeRecord("volumes", name, { name, labels, size: "4M" });
@@ -89,11 +90,11 @@ export function fakeRuntime(
 	state: FakeState,
 	handle: SessionHandle,
 	knobs: Record<string, string> = {},
-	limits: Partial<ExecLimits> = {},
-): ExecRuntime {
-	return {
+	limits: Partial<SandboxLimits> = {},
+): SandboxRuntime {
+	const runtime: SandboxRuntime = {
 		containerCommand: FAKE_CONTAINER,
-		image: "polar-exec:test",
+		image: "polar-sandbox:test",
 		limits: { ...testLimits, ...limits },
 		environment: fakeEnvironment(state, knobs),
 		handle,
@@ -103,16 +104,22 @@ export function fakeRuntime(
 		children: new Map(),
 		cliStopped: false,
 		running: new Set(),
+		driver: undefined as unknown as AppleContainerDriver,
+		activeSandbox: {},
 	};
+	runtime.driver = new AppleContainerDriver(runtime);
+	return runtime;
 }
 
 export function startingRuntime(
 	state: FakeState,
 	handle: SessionHandle,
 	knobs: Record<string, string> = {},
-	limits: Partial<ExecLimits> = {},
-): ExecRuntime {
-	return { ...fakeRuntime(state, handle, knobs, limits), state: "unready" };
+	limits: Partial<SandboxLimits> = {},
+): SandboxRuntime {
+	const runtime = fakeRuntime(state, handle, knobs, limits);
+	runtime.state = "unready";
+	return runtime;
 }
 
 export async function until(condition: () => boolean | Promise<boolean>, timeoutMs = 5000): Promise<void> {

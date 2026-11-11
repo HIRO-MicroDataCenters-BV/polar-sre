@@ -10,12 +10,12 @@ import { describeBytes, discardOutputFile, openOutputFile, READ_MAX_BYTES, readM
 import { commandFailure } from "../src/cli.ts";
 import { buildReply, commandLine, finalizeOutput, formatReply } from "../src/reply.ts";
 import type {
-	ExecLimits,
-	ExecRequest,
-	ExecResult,
-	ExecStatus,
 	Inspection,
 	OutputLimit,
+	SandboxLimits,
+	SandboxRequest,
+	SandboxResult,
+	SandboxStatus,
 	SessionPaths,
 } from "../src/types.ts";
 import { testLimits } from "./fixtures.ts";
@@ -40,13 +40,13 @@ vi.mock(import("../../shared/store.ts"), async (importOriginal) => {
 	};
 });
 
-const request: ExecRequest = { language: "python", code: "\n  print(1)\nprint(2)\n" };
+const request: SandboxRequest = { language: "python", code: "\n  print(1)\nprint(2)\n" };
 const STATUS_PREFIX = "python: print(1)";
-const limits: ExecLimits = { ...testLimits, replyMaxLines: 40, replyMaxBytes: 4096 };
+const limits: SandboxLimits = { ...testLimits, replyMaxLines: 40, replyMaxBytes: 4096 };
 const STORE_LIMITS = { fileMaxBytes: 64 * 1024 * 1024, sessionMaxBytes: 256 * 1024 * 1024 };
-const LEFTOVER = { container: "polar-exec-current-1-abcdef01", message: "delete: timed out; list: unreadable" };
+const LEFTOVER = { container: "polar-sandbox-current-1-abcdef01", message: "delete: timed out; list: unreadable" };
 const LEFTOVER_LINE =
-	"[The container polar-exec-current-1-abcdef01 could not be deleted: delete: timed out; list: unreadable. Do not rerun the program for this; tell the user.]";
+	"[The container polar-sandbox-current-1-abcdef01 could not be deleted: delete: timed out; list: unreadable. Do not rerun the program for this; tell the user.]";
 const ABSENT_LINE = "[The container was not found after the run; whether the program started is not known.]";
 const UNINSPECTED_LINE = "[The container could not be inspected: timed out.]";
 const NO_STDERR = Buffer.alloc(0);
@@ -56,7 +56,7 @@ let handle: SessionHandle;
 let session: SessionPaths;
 
 beforeEach(async () => {
-	root = await mkdtemp(join(tmpdir(), "exec-reply-"));
+	root = await mkdtemp(join(tmpdir(), "sandbox-reply-"));
 	handle = await acquireSession("current", root, root);
 	session = handle.paths;
 	store.failOpenOf = undefined;
@@ -72,18 +72,18 @@ function bytes(text: string): Buffer {
 	return Buffer.from(text, "utf8");
 }
 
-async function result(fields: Partial<ExecResult>, stdout = ""): Promise<ExecResult> {
-	const opened = await openOutputFile(session, "exec", STORE_LIMITS);
+async function result(fields: Partial<SandboxResult>, stdout = ""): Promise<SandboxResult> {
+	const opened = await openOutputFile(session, "run_code", STORE_LIMITS);
 	if (!("opened" in opened)) throw new Error("the session quota refused the test file");
 	await pipeline(Readable.from([Buffer.from(stdout)]), opened.opened.sink);
 	return { status: "ok", exitCode: 0, output: opened.opened, stderr: NO_STDERR, elapsedMs: 300, ...fields };
 }
 
-function bare(fields: Partial<ExecResult>): ExecResult {
+function bare(fields: Partial<SandboxResult>): SandboxResult {
 	return { status: "ok", exitCode: 0, stderr: NO_STDERR, elapsedMs: 300, ...fields };
 }
 
-function build(taken: ExecResult, used: ExecLimits = limits) {
+function build(taken: SandboxResult, used: SandboxLimits = limits) {
 	return buildReply(taken, request, used, session);
 }
 
@@ -112,7 +112,7 @@ function exists(path: string): Promise<boolean> {
 	);
 }
 
-const READ_WAY = (file: string) => `read it with "read" tool, or process it with "exec" tool from /data/${file}.`;
+const READ_WAY = (file: string) => `read it with "read" tool, or process it with "run_code" tool from /data/${file}.`;
 
 describe("buildReply", () => {
 	it("returns raw stdout and deletes .part on plain ok, names an empty stdout, and keeps the stderr tail", async () => {
@@ -122,7 +122,7 @@ describe("buildReply", () => {
 		expect(await readManifest(session)).toEqual([]);
 
 		const empty = await build(await result({}));
-		expect(empty).toEqual({ text: `[exec ok] ${STATUS_PREFIX}\n\n[stdout is empty]`, isError: false });
+		expect(empty).toEqual({ text: `[run_code ok] ${STATUS_PREFIX}\n\n[stdout is empty]`, isError: false });
 
 		const stderr = errLines(100).trimEnd();
 		const noisy = await build(await result({ stderr: bytes(stderr) }, "fine\n"));
@@ -133,7 +133,7 @@ describe("buildReply", () => {
 	});
 
 	it("publishes the file with the outcome by how the run ended or deletes it, naming the absolute path", async () => {
-		const statuses: ExecStatus[] = ["ok", "failed", "timeout", "cancelled", "output_limit", "out_of_memory"];
+		const statuses: SandboxStatus[] = ["ok", "failed", "timeout", "cancelled", "output_limit", "out_of_memory"];
 		const outputs: [string, string][] = [
 			["fits", rows(3)],
 			["does not fit", rows(500)],
@@ -167,7 +167,7 @@ describe("buildReply", () => {
 						expect(manifest, form).toHaveLength(published);
 						expect(manifest.at(-1), form).toMatchObject({
 							file,
-							tool: "exec",
+							tool: "run_code",
 							command: STATUS_PREFIX,
 							status: complete ? "complete" : "truncated",
 						});
@@ -188,14 +188,14 @@ describe("buildReply", () => {
 
 	it("points a file over 16 MiB to /data only and up to 16 MiB to read and /data", async () => {
 		const small = await build(await result({}, rows(500)));
-		expect(small.text).toContain(`Saved as ${pathOf("exec-1.txt")} (`);
-		expect(small.text).toContain(READ_WAY("exec-1.txt"));
+		expect(small.text).toContain(`Saved as ${pathOf("run_code-1.txt")} (`);
+		expect(small.text).toContain(READ_WAY("run_code-1.txt"));
 
 		const line = `${"x".repeat(1023)}\n`;
 		const big = line.repeat(READ_MAX_BYTES / 1024 + 1);
 		const large = await build(await result({}, big));
-		expect(large.text).toContain(`Saved as ${pathOf("exec-2.txt")} (`);
-		expect(large.text).toContain('process it with "exec" tool from /data/exec-2.txt.');
+		expect(large.text).toContain(`Saved as ${pathOf("run_code-2.txt")} (`);
+		expect(large.text).toContain('process it with "run_code" tool from /data/run_code-2.txt.');
 		expect(large.text).not.toContain('read it with "read" tool');
 	});
 
@@ -211,21 +211,21 @@ describe("buildReply", () => {
 
 		const longFirstLine = await build(await result({}, `${"y".repeat(5000)}\n`));
 		expect(longFirstLine.text).toMatch(/\[Line 1 is longer than the \S+ limit; nothing shown\. Saved as /);
-		expect(longFirstLine.text).toContain(`Saved as ${pathOf("exec-1.txt")} (`);
-		expect(longFirstLine.text).toContain('process it with "exec" tool from /data/exec-1.txt.]');
+		expect(longFirstLine.text).toContain(`Saved as ${pathOf("run_code-1.txt")} (`);
+		expect(longFirstLine.text).toContain('process it with "run_code" tool from /data/run_code-1.txt.]');
 
 		for (const exitCode of [137, 3]) {
 			const failedExit = await build(await result({ status: "failed", exitCode, inspection: { state: "present" } }));
 			expect(failedExit, String(exitCode)).toEqual({
-				text: `[exec failed: exit ${exitCode}] ${STATUS_PREFIX}`,
+				text: `[run_code failed: exit ${exitCode}] ${STATUS_PREFIX}`,
 				isError: true,
 			});
 			expect(failedExit.text).not.toMatch(/killed|cause/);
 		}
 
-		const cases: [Partial<ExecResult>, string[]][] = [
-			[{ status: "timeout", exitCode: 137 }, ["[exec timeout]", "exec did not finish in 10 s."]],
-			[{ status: "cancelled", exitCode: 137 }, ["[exec cancelled]", "Cancelled."]],
+		const cases: [Partial<SandboxResult>, string[]][] = [
+			[{ status: "timeout", exitCode: 137 }, ["[run_code timeout]", "run_code did not finish in 10 s."]],
+			[{ status: "cancelled", exitCode: 137 }, ["[run_code cancelled]", "Cancelled."]],
 			[
 				{
 					status: "out_of_memory",
@@ -233,11 +233,11 @@ describe("buildReply", () => {
 					oomEvidence: "Memory cgroup out of memory: Killed process 129 (python3)",
 				},
 				[
-					"[exec out_of_memory]",
+					"[run_code out_of_memory]",
 					`The ${describeBytes(limits.memoryBytes)} memory limit was reached and the process was killed. Kernel: Memory cgroup out of memory: Killed process 129 (python3)`,
 				],
 			],
-			[{ status: "failed", exitCode: 137 }, ["[exec failed: exit 137]"]],
+			[{ status: "failed", exitCode: 137 }, ["[run_code failed: exit 137]"]],
 		];
 		for (const [fields, expected] of cases) {
 			const reply = await build(await result(fields, "partial\n"));
@@ -258,7 +258,7 @@ describe("buildReply", () => {
 		for (const [limit, line] of limitCases) {
 			const reply = await build(await result({ status: "output_limit", exitCode: 137, limit }, "partial\n"));
 			expect(reply, limit).toEqual({
-				text: `[exec output_limit] ${STATUS_PREFIX}\n\npartial\n\n${line}`,
+				text: `[run_code output_limit] ${STATUS_PREFIX}\n\npartial\n\n${line}`,
 				isError: true,
 			});
 		}
@@ -275,7 +275,7 @@ describe("buildReply", () => {
 			bare({ status: "runtime_failed", exitCode: null, runtimeMessage: "spawn container ENOENT" }),
 		);
 		expect(runtimeFailed.text).toBe(
-			`[exec runtime_failed] ${STATUS_PREFIX}\n\nspawn container ENOENT\n\nThe container runtime failed to run the code. Tell the user.`,
+			`[run_code runtime_failed] ${STATUS_PREFIX}\n\nspawn container ENOENT\n\nThe container runtime failed to run the code. Tell the user.`,
 		);
 	});
 
@@ -289,24 +289,24 @@ describe("buildReply", () => {
 		for (const [stderr, section] of shortCases) {
 			const reply = await build(await result({ stderr: bytes(stderr) }, "fine\n"));
 			expect(reply, JSON.stringify(stderr)).toEqual({
-				text: `[exec ok] ${STATUS_PREFIX}\n\nfine\n\n${section}`,
+				text: `[run_code ok] ${STATUS_PREFIX}\n\nfine\n\n${section}`,
 				isError: false,
 			});
 		}
 		const failedShort = await build(await result({ status: "failed", exitCode: 1, stderr: bytes("boom\n") }));
-		expect(failedShort.text).toBe(`[exec failed: exit 1] ${STATUS_PREFIX}\n\n[stderr]\nboom\n[/stderr]`);
+		expect(failedShort.text).toBe(`[run_code failed: exit 1] ${STATUS_PREFIX}\n\n[stderr]\nboom\n[/stderr]`);
 		expect(await savedFiles()).toEqual([]);
 		expect(await readManifest(session)).toEqual([]);
 
 		const stderr = errLines(60);
 		const ok = await build(await result({ stderr: bytes(stderr) }, "fine\n"));
 		const [entry] = await readManifest(session);
-		expect(entry).toMatchObject({ tool: "exec", command: STATUS_PREFIX, status: "complete" });
-		expect(entry.file).toMatch(/^exec-stderr-\d+\.txt$/);
+		expect(entry).toMatchObject({ tool: "run_code", command: STATUS_PREFIX, status: "complete" });
+		expect(entry.file).toMatch(/^run_code-stderr-\d+\.txt$/);
 		expect(await readFile(pathOf(entry.file), "utf8")).toBe(stderr);
 		const tail = errLines(60).split("\n").slice(47, 60).join("\n");
 		expect(ok).toEqual({
-			text: `[exec ok] ${STATUS_PREFIX}\n\nfine\n\n[stderr]\n${tail}\n[/stderr]\n[stderr: last 13 of 60 lines shown. Saved as ${pathOf(entry.file)} (${formatSize(entry.size)}); ${READ_WAY(entry.file)}]`,
+			text: `[run_code ok] ${STATUS_PREFIX}\n\nfine\n\n[stderr]\n${tail}\n[/stderr]\n[stderr: last 13 of 60 lines shown. Saved as ${pathOf(entry.file)} (${formatSize(entry.size)}); ${READ_WAY(entry.file)}]`,
 			isError: false,
 		});
 		expect(await savedFiles()).toEqual([entry.file]);
@@ -316,9 +316,9 @@ describe("buildReply", () => {
 		);
 		const [, truncated] = await readManifest(session);
 		expect(truncated).toMatchObject({ status: "truncated", command: STATUS_PREFIX });
-		expect(truncated.file).toMatch(/^exec-stderr-\d+\.truncated\.txt$/);
+		expect(truncated.file).toMatch(/^run_code-stderr-\d+\.truncated\.txt$/);
 		expect(stopped.text).toContain(`Saved as ${pathOf(truncated.file)} (`);
-		expect(stopped.text).toContain("exec did not finish in 10 s.");
+		expect(stopped.text).toContain("run_code did not finish in 10 s.");
 
 		const longLine = `${"x".repeat(3000)}\n`;
 		const partial = await build(await result({ stderr: bytes(longLine) }, "fine\n"));
@@ -333,18 +333,18 @@ describe("buildReply", () => {
 		const partialFile = (await savedFiles())[0];
 		if (partialFile !== undefined) await rm(pathOf(partialFile));
 
-		store.failOpenOf = "exec-stderr";
-		const forms: [ExecStatus, number][] = [
+		store.failOpenOf = "run_code-stderr";
+		const forms: [SandboxStatus, number][] = [
 			["ok", 0],
 			["failed", 3],
 		];
 		for (const [status, exitCode] of forms) {
 			const reply = await build(await result({ status, exitCode, stderr: bytes(stderr) }, "VISIBLE_STDOUT\n"));
 			expect(reply.isError, status).toBe(status !== "ok");
-			expect(reply.text, status).toMatch(status === "ok" ? /^\[exec ok\] / : /^\[exec failed: exit 3\] /);
+			expect(reply.text, status).toMatch(status === "ok" ? /^\[run_code ok\] / : /^\[run_code failed: exit 3\] /);
 			expect(reply.text, status).toContain("\n\nVISIBLE_STDOUT\n\n[stderr]\n");
 			expect(reply.text, status).toContain(
-				"err 60\n[/stderr]\n[stderr: last 13 of 60 lines shown. The rest could not be saved: ENOSPC: no space left on device, open 'exec-stderr-2.part'.]",
+				"err 60\n[/stderr]\n[stderr: last 13 of 60 lines shown. The rest could not be saved: ENOSPC: no space left on device, open 'run_code-stderr-2.part'.]",
 			);
 		}
 		store.failOpenOf = undefined;
@@ -367,7 +367,7 @@ describe("buildReply", () => {
 	});
 
 	it("propagates a publication error and leaves the .part file to the call", async () => {
-		store.failPublicationOf = "exec-stderr";
+		store.failPublicationOf = "run_code-stderr";
 		const taken = await result({ stderr: bytes(errLines(60)) }, "fine\n");
 		const partFile = pathOf(`${taken.output?.name}.part`);
 		await expect(build(taken)).rejects.toThrow("the publication failed");
@@ -381,7 +381,7 @@ describe("buildReply", () => {
 		const speaksOfStart = /\bprogram (?:ran|started)\b|\bcould not be inspected\b/;
 		expect(speaksOfStart.test("[The program ran, but its container could not be deleted.]")).toBe(true);
 		expect(speaksOfStart.test(LEFTOVER_LINE)).toBe(false);
-		const statuses: [ExecStatus, number][] = [
+		const statuses: [SandboxStatus, number][] = [
 			["ok", 0],
 			["failed", 3],
 		];
@@ -408,7 +408,9 @@ describe("buildReply", () => {
 					if (status === "ok" && cleanupError === undefined) {
 						expect(reply.text, form).toBe(rows(3));
 					} else {
-						expect(lines[0], form).toBe(`[exec ${status === "ok" ? "ok" : "failed: exit 3"}] ${STATUS_PREFIX}`);
+						expect(lines[0], form).toBe(
+							`[run_code ${status === "ok" ? "ok" : "failed: exit 3"}] ${STATUS_PREFIX}`,
+						);
 					}
 				}
 			}
@@ -435,7 +437,7 @@ describe("buildReply", () => {
 			const form = stdout === "" ? "empty stdout" : "stdout";
 			expect(reply.text.split("\n").length, form).toBeLessThanOrEqual(testLimits.replyMaxLines);
 			expect(Buffer.byteLength(reply.text), form).toBeLessThanOrEqual(testLimits.replyMaxBytes);
-			expect(reply.text, form).toMatch(/^\[exec failed: exit 1\] /);
+			expect(reply.text, form).toMatch(/^\[run_code failed: exit 1\] /);
 			expect(reply.text, form).toContain("[stderr]\nORIGINAL_ERROR\n[/stderr]");
 			expect(reply.text, form).toContain(" more bytes not shown]; still listed. Do not rerun the program");
 			if (stdout !== "") expect(reply.text, form).toContain("\n\nVISIBLE_STDOUT\n\n");

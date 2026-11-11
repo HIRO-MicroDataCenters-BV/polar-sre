@@ -1,7 +1,7 @@
 import { spawn } from "child_process";
-import type { CleanupError, CleanupOutcome, CommandOutcome, ExecRuntime } from "./types.ts";
+import type { CleanupError, CleanupOutcome, CommandOutcome, SandboxRuntime } from "./types.ts";
 
-const CLI_STOPPED = "exec is stopping; no command starts";
+export const CLI_STOPPED = "sandbox is stopping; no command starts";
 const COMMAND_OUTPUT_MAX_BYTES = 16 * 1024 * 1024;
 const DIAGNOSTIC_MAX_BYTES = 4 * 1024;
 const DIAGNOSTIC_MAX_LINES = 64;
@@ -12,11 +12,13 @@ export interface ListedResource {
 }
 
 export function containerCommand(
-	runtime: ExecRuntime,
+	runtime: SandboxRuntime,
 	args: string[],
 	timeoutMs = runtime.limits.commandTimeoutMs,
+	signal?: AbortSignal,
 ): Promise<CommandOutcome> {
 	if (runtime.cliStopped) return Promise.resolve({ code: null, stdout: "", stderr: CLI_STOPPED, timedOut: false });
+	if (signal?.aborted) return Promise.resolve({ code: null, stdout: "", stderr: "cancelled", timedOut: false });
 	return new Promise((resolve) => {
 		const child = spawn(runtime.containerCommand, args, {
 			env: runtime.environment,
@@ -27,6 +29,10 @@ export function containerCommand(
 		const stderr = new StreamCapture(COMMAND_OUTPUT_MAX_BYTES);
 		let timedOut = false;
 		let settled = false;
+		const onAbort = () => {
+			child.kill("SIGKILL");
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
 		const timer = setTimeout(
 			() => {
 				timedOut = true;
@@ -38,6 +44,7 @@ export function containerCommand(
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
 			resolve({
 				code,
 				stdout: stdout.text(),
@@ -87,7 +94,7 @@ function isObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-export function deadlineAfter(runtime: ExecRuntime): number {
+export function deadlineAfter(runtime: SandboxRuntime): number {
 	return Date.now() + runtime.limits.commandTimeoutMs;
 }
 
@@ -121,7 +128,7 @@ export function boundDiagnostic(text: string): string {
 }
 
 export async function cleanupContainer(
-	runtime: ExecRuntime,
+	runtime: SandboxRuntime,
 	name: string,
 	deadlineAt: number,
 ): Promise<CleanupOutcome> {
@@ -148,9 +155,14 @@ export async function cleanupContainer(
 	return { removed: false, error: { container: name, message } };
 }
 
-export async function cleanupOwned(runtime: ExecRuntime, deadlineAt: number): Promise<CleanupError[]> {
+export async function cleanupOwned(
+	runtime: SandboxRuntime,
+	deadlineAt: number,
+	exclude?: string,
+): Promise<CleanupError[]> {
 	const errors: CleanupError[] = [];
 	for (const name of [...runtime.owned]) {
+		if (name === exclude) continue;
 		const outcome = await cleanupContainer(runtime, name, deadlineAt);
 		if (!outcome.removed) errors.push(outcome.error);
 	}
@@ -161,7 +173,7 @@ export function describeCleanupErrors(errors: CleanupError[]): string {
 	return errors.map((error) => `${error.container} (${error.message})`).join(", ");
 }
 
-class StreamCapture {
+export class StreamCapture {
 	private readonly maxBytes: number;
 	private readonly chunks: Buffer[] = [];
 	private retainedBytes = 0;

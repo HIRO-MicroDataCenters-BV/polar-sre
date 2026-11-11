@@ -10,7 +10,7 @@ import type {
 	ExtensionToolContext,
 	ToolDefinition,
 } from "../../../core/extensions/types.ts";
-import execExtension, { DEFAULT_IMAGE } from "../index.ts";
+import sandboxExtension, { DEFAULT_IMAGE } from "../index.ts";
 import { FAKE_CONTAINER, type FakeState, fakeState, until } from "./fixtures.ts";
 
 const fault = vi.hoisted(() => ({ failReplyOnce: false }));
@@ -33,7 +33,7 @@ type Method = (...args: never[]) => unknown;
 type ShutdownReason = "quit" | "reload" | "new" | "resume" | "fork";
 
 const SESSION_ID = randomUUID();
-const RULE = 'exec: a session file over the 16 MiB read limit is processed with "exec" tool from /data/<file>.';
+const RULE = 'run_code: a session file over the 16 MiB read limit is processed with "run_code" tool from /data/<file>.';
 const ENV_KEYS = ["PATH", "POLAR_ARTIFACTS_DIR", "FAKE_CONTAINER_STATE"];
 
 let root: string;
@@ -45,7 +45,7 @@ let shutdowns: (() => Promise<unknown>)[] = [];
 beforeEach(async () => {
 	savedEnv = ENV_KEYS.map((key) => [key, process.env[key]]);
 	fault.failReplyOnce = false;
-	root = await mkdtemp(join(tmpdir(), "exec-extension-"));
+	root = await mkdtemp(join(tmpdir(), "sandbox-extension-"));
 	bin = join(root, "bin");
 	await mkdir(bin, { recursive: true });
 	state = await fakeState();
@@ -119,7 +119,7 @@ function loadExtension(flagValues: Record<string, string> = {}) {
 			return (...args: never[]) => target[name]?.(...args);
 		},
 	});
-	execExtension(pi as unknown as ExtensionAPI);
+	sandboxExtension(pi as unknown as ExtensionAPI);
 	const fire = async (eventName: string, event: object) => handlers.get(eventName)?.(event, ctx);
 	const extension = {
 		ctx,
@@ -131,7 +131,7 @@ function loadExtension(flagValues: Record<string, string> = {}) {
 		shutdown: (reason: ShutdownReason = "quit") => fire("session_shutdown", { type: "session_shutdown", reason }),
 		execute: (callId: string, params: Record<string, unknown>) => {
 			const [tool] = tools;
-			if (tool === undefined) throw new Error("exec is not registered");
+			if (tool === undefined) throw new Error("run_code is not registered");
 			return tool.execute(callId, params, undefined, undefined, ctx as unknown as ExtensionToolContext);
 		},
 	};
@@ -150,16 +150,16 @@ function exists(path: string): Promise<boolean> {
 	);
 }
 
-async function runCalls(): Promise<string[][]> {
-	return (await state.calls()).filter((call) => call[0] === "run" && call.includes("--interactive"));
+async function execCalls(): Promise<string[][]> {
+	return (await state.calls()).filter((call) => call[0] === "exec" && call.includes("--interactive"));
 }
 
 function text(result: { content: unknown[] }): string {
 	return (result.content[0] as { text: string }).text;
 }
 
-describe("exec extension", () => {
-	it("offers exec only from a clean state", async () => {
+describe("sandbox extension", () => {
+	it("offers run_code only from a clean state", async () => {
 		const labels = { "polar-session": SESSION_ID, "polar-root": root };
 		const refusals: [string, Record<string, string>, string][] = [
 			["readiness", { STATUS_EXIT: "1" }, "sandbox is off: container system status failed: exit 1"],
@@ -171,17 +171,17 @@ describe("exec extension", () => {
 			[
 				"leftover",
 				{ DELETE_FAIL: "1" },
-				`sandbox is off: leftovers of sandbox stayed; polar-exec-${SESSION_ID}-1-aaaaaaaa (delete: Error: runtime temporarily unavailable; still listed) could not be deleted; delete them with: container delete --force polar-exec-${SESSION_ID}-1-aaaaaaaa`,
+				`sandbox is off: leftovers of sandbox stayed; polar-sandbox-${SESSION_ID}-1-aaaaaaaa (delete: Error: runtime temporarily unavailable; still listed) could not be deleted; delete them with: container delete --force polar-sandbox-${SESSION_ID}-1-aaaaaaaa`,
 			],
 		];
-		await state.addContainer(`polar-exec-${SESSION_ID}-1-aaaaaaaa`, labels);
+		await state.addContainer(`polar-sandbox-${SESSION_ID}-1-aaaaaaaa`, labels);
 		for (const [refusal, knobs, message] of refusals) {
 			await setKnobs(knobs);
 			const off = loadExtension();
 			await off.startSession();
 			expect(off.tools, refusal).toEqual([]);
 			expect(off.notices, refusal).toEqual([[message, "warning"]]);
-			expect(off.footer.get("exec"), refusal).toBeUndefined();
+			expect(off.footer.get("sandbox"), refusal).toBeUndefined();
 			await off.shutdown();
 			expect(await exists(lockPath()), refusal).toBe(false);
 		}
@@ -196,7 +196,7 @@ describe("exec extension", () => {
 				"warning",
 			],
 		]);
-		expect(foreign.footer.get("exec")).toBeUndefined();
+		expect(foreign.footer.get("sandbox")).toBeUndefined();
 		expect(await state.containers()).toEqual([]);
 		await foreign.shutdown();
 		expect(await exists(lockPath())).toBe(false);
@@ -204,22 +204,22 @@ describe("exec extension", () => {
 
 		const ready = loadExtension();
 		await ready.startSession();
-		expect(ready.tools.map((tool) => tool.name)).toEqual(["exec"]);
+		expect(ready.tools.map((tool) => tool.name)).toEqual(["run_code"]);
 		expect(ready.tools[0].executionMode).toBe("sequential");
-		expect(ready.footer.get("exec")).toBeUndefined();
+		expect(ready.footer.get("sandbox")).toBeUndefined();
 		expect(ready.notices).toEqual([]);
 		expect(await state.volumes()).toEqual([{ name: `polar-work-${SESSION_ID}`, labels, size: "4096M" }]);
 		expect(await readFile(lockPath(), "utf8")).toBe(`${process.pid}\n`);
 	});
 
 	it("describes the tool from the operator limits and the image flag", async () => {
-		const image = "registry.example/polar-exec@sha256:abc";
-		const pi = loadExtension({ "exec-image": image });
+		const image = "registry.example/polar-sandbox@sha256:abc";
+		const pi = loadExtension({ "sandbox-image": image });
 		await pi.startSession();
 		const [tool] = pi.tools;
 
-		expect(pi.flagDefaults.get("exec-image")).toBe(DEFAULT_IMAGE);
-		expect(pi.footer.get("exec")).toBeUndefined();
+		expect(pi.flagDefaults.get("sandbox-image")).toBe(DEFAULT_IMAGE);
+		expect(pi.footer.get("sandbox")).toBeUndefined();
 		expect(await state.calls()).toContainEqual(["image", "inspect", image]);
 		expect(tool.description).toContain(" Session output files are available read-only at /data/<file>. ");
 		for (const phrase of [
@@ -237,6 +237,7 @@ describe("exec extension", () => {
 			"2000 lines",
 			"50 KiB",
 			'"read" tool',
+			'"run_code" tool',
 			"[stderr] and [/stderr]",
 			"over 1 MiB of stderr",
 		]) {
@@ -266,7 +267,7 @@ describe("exec extension", () => {
 		expect(nul.content).toEqual([
 			{ type: "text", text: 'Invalid parameter "code": NUL characters are not allowed.' },
 		]);
-		expect(await runCalls()).toEqual([]);
+		expect(await execCalls()).toEqual([]);
 		await pi.shutdown();
 		expect(await exists(lockPath())).toBe(false);
 	});
@@ -274,12 +275,12 @@ describe("exec extension", () => {
 	it("tells the operator about a leftover container and keeps the program result", async () => {
 		const pi = loadExtension();
 		await pi.startSession();
-		await setKnobs({ DELETE_FAIL: "1" });
+		await setKnobs({ SCRUB_FAIL: "1", DELETE_FAIL: "1" });
 
 		const result = await pi.execute("call-1", { language: "bash", code: "stdout:done" });
 
-		const [run] = await runCalls();
-		const name = run[run.indexOf("--name") + 1];
+		const [exec] = await execCalls();
+		const name = exec[exec.indexOf("bash") - 1];
 		expect(result.isError).toBe(false);
 		expect(text(result)).toContain("done");
 		expect(text(result)).toContain(
@@ -305,13 +306,13 @@ describe("exec extension", () => {
 			content: [
 				{
 					type: "text",
-					text: "[exec runtime_failed] bash: echo hi\n\nexec is shutting down; no program starts.\n\nThe container runtime failed to run the code. Tell the user.",
+					text: "[run_code runtime_failed] bash: echo hi\n\nrun_code is shutting down; no program starts.\n\nThe container runtime failed to run the code. Tell the user.",
 				},
 			],
 			details: undefined,
 			isError: true,
 		});
-		expect(await runCalls()).toEqual([]);
+		expect(await execCalls()).toEqual([]);
 		expect(await exists(lockPath())).toBe(false);
 	});
 
@@ -320,16 +321,16 @@ describe("exec extension", () => {
 		await pi.startSession();
 		await setKnobs({ RUN_IGNORES_KILL: "1", DELETE_FAIL: "1" });
 		const call = pi.execute("call-1", { language: "bash", code: "hang" });
-		await until(async () => (await runCalls()).length === 1);
-		const [run] = await runCalls();
-		const name = run[run.indexOf("--name") + 1];
+		await until(async () => (await execCalls()).length === 1);
+		const [exec] = await execCalls();
+		const name = exec[exec.indexOf("bash") - 1];
 
 		const shutdown = pi.shutdown("reload");
 		await new Promise((resolve) => setTimeout(resolve, 300));
 		expect(await exists(lockPath())).toBe(true);
 
 		const result = await call;
-		expect(text(result)).toMatch(/^\[exec cancelled\] bash: hang\n/);
+		expect(text(result)).toMatch(/^\[run_code cancelled\] bash: hang\n/);
 		expect(result.isError).toBe(true);
 		expect(await exists(lockPath())).toBe(false);
 		await shutdown;
@@ -355,9 +356,9 @@ describe("exec extension", () => {
 
 		const files = await readdir(join(root, SESSION_ID));
 		expect(files.filter((name) => name.endsWith(".part"))).toEqual([]);
-		expect(files.filter((name) => name.startsWith("exec-"))).toEqual([]);
-		expect(await state.containers()).toEqual([]);
+		expect(files.filter((name) => name.startsWith("run_code-"))).toEqual([]);
 		await pi.shutdown();
+		expect(await state.containers()).toEqual([]);
 		expect(await exists(lockPath())).toBe(false);
 	});
 });

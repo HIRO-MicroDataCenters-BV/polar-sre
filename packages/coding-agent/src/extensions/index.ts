@@ -1,7 +1,7 @@
 import type { ExtensionFactory, InlineExtension } from "../core/extensions/types.ts";
-import execExtension from "../polar/exec/index.ts";
 import filesExtension from "../polar/files/index.ts";
 import k8sExtension from "../polar/k8s/index.ts";
+import sandboxExtension from "../polar/sandbox/index.ts";
 import codemodeExtension from "./codemode/index.ts";
 import llamaExtension from "./llama/index.ts";
 import mcpExtension from "./mcp/index.ts";
@@ -10,7 +10,7 @@ import toolSearchExtension from "./tool-search/index.ts";
 export const polarBuiltInExtensions: ReadonlyArray<{ name: string; factory: ExtensionFactory; builtin: true }> = [
 	{ name: "files", factory: filesExtension, builtin: true },
 	{ name: "k8s", factory: k8sExtension, builtin: true },
-	{ name: "exec", factory: execExtension, builtin: true },
+	{ name: "sandbox", factory: sandboxExtension, builtin: true },
 ];
 
 export const POLAR_DEFAULT_EXTENSION_SPECIFIERS: readonly string[] = polarBuiltInExtensions.map(

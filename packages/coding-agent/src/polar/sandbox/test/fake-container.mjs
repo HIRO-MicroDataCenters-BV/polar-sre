@@ -78,24 +78,93 @@ function readStdin() {
 	});
 }
 
+function signalPid(pid, signal) {
+	if (typeof pid !== "number" || pid <= 0) return;
+	try {
+		process.kill(pid, signal);
+	} catch {}
+}
+
+function signalRecorded(record, signal) {
+	signalPid(record.execPid, signal);
+	signalPid(record.pid, signal);
+}
+
 const OOM_LINE =
 	"[    0.694] Memory cgroup out of memory: Killed process 129 (python3) total-vm:3158408kB, anon-rss:1046208kB";
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 async function run(args) {
+	if (knob("RUN_HANG") === "1") await sleep(60_000);
 	if (knob("RUN_FAILS") === "1") fail("failed to create container: image not found");
 	const { options, command } = parseRun(args);
 	const id = options["--name"];
 	if (!options.switches.has("--interactive") && !options.switches.has("-i")) {
 		if (id !== undefined && !options.switches.has("--rm")) {
-			writeContainer({ id, labels: options.labels, state: "stopped", pid: null, bootLog: [], command });
+			writeContainer({
+				id,
+				labels: options.labels,
+				state: "stopped",
+				pid: null,
+				execPid: null,
+				bootLog: [],
+				command,
+				runArgv: argv,
+			});
 		}
 		process.exit(Number(knob("CHOWN_EXIT", 0)));
 	}
-	const record = { id, labels: options.labels, state: "running", pid: process.pid, bootLog: [], command };
+	const record = {
+		id,
+		labels: options.labels,
+		state: "running",
+		pid: process.pid,
+		execPid: null,
+		bootLog: [],
+		command,
+		runArgv: argv,
+	};
 	writeContainer(record);
+	const timer = setInterval(() => {
+		if (!existsSync(stateRoot)) process.exit(0);
+	}, 50);
 	process.on("SIGTERM", () => {
-		record.state = "stopped";
-		if (existsSync(containerPath(id))) writeContainer(record);
+		clearInterval(timer);
+		if (existsSync(containerPath(id))) {
+			const current = readJson(containerPath(id));
+			current.state = "stopped";
+			writeContainer(current);
+		}
+		process.exit(137);
+	});
+	process.stdin.on("data", () => {});
+	process.stdin.on("end", () => {
+		clearInterval(timer);
+		if (existsSync(containerPath(id))) {
+			const current = readJson(containerPath(id));
+			current.state = "stopped";
+			writeContainer(current);
+		}
+		process.exit(0);
+	});
+	process.stdout.write("\n");
+}
+
+async function execCommand(args) {
+	const { options, image: id } = parseRun(args);
+	if (!existsSync(containerPath(id))) fail(`container not found: ${id}`);
+	const initial = readJson(containerPath(id));
+	if (initial.state !== "running") fail(`container ${id} is not running`);
+	if (!options.switches.has("--interactive") && !options.switches.has("-i")) {
+		if (knob("SCRUB_HANG") === "1") await sleep(60_000);
+		if (knob("SCRUB_FAIL") === "1") process.exit(1);
+		process.exit(0);
+	}
+	if (knob("EXEC_FAILS") === "1") fail("exec failed");
+	initial.execPid = process.pid;
+	writeContainer(initial);
+	process.on("SIGTERM", () => {
 		process.exit(137);
 	});
 	const code = await readStdin();
@@ -127,16 +196,41 @@ async function run(args) {
 			case "sleep_ms":
 				await sleep(Number(value));
 				break;
-			case "echo_argv":
-				process.stdout.write(`${JSON.stringify({ argv, codeLength: code.length })}\n`);
+			case "echo_argv": {
+				const current = existsSync(containerPath(id)) ? readJson(containerPath(id)) : initial;
+				process.stdout.write(
+					`${JSON.stringify({ argv, runArgv: current.runArgv, codeLength: code.length })}\n`,
+				);
 				break;
-			case "oom":
-				record.bootLog.push(OOM_LINE);
+			}
+			case "oom": {
+				if (existsSync(containerPath(id))) {
+					const current = readJson(containerPath(id));
+					current.bootLog.push(OOM_LINE);
+					writeContainer(current);
+				}
 				exitCode = 137;
 				break;
+			}
+			case "oom_survived": {
+				if (existsSync(containerPath(id))) {
+					const current = readJson(containerPath(id));
+					current.bootLog.push(OOM_LINE);
+					writeContainer(current);
+				}
+				break;
+			}
 			case "exit137":
 				exitCode = 137;
 				break;
+			case "vanish": {
+				if (existsSync(containerPath(id))) {
+					const current = readJson(containerPath(id));
+					signalPid(current.pid, "SIGKILL");
+					rmSync(containerPath(id), { force: true });
+				}
+				break;
+			}
 			case "hang":
 				hang = true;
 				break;
@@ -149,20 +243,14 @@ async function run(args) {
 		return;
 	}
 	setTimeout(() => {
-		record.state = "stopped";
-		if (existsSync(containerPath(id))) writeContainer(record);
+		if (existsSync(containerPath(id))) {
+			const current = readJson(containerPath(id));
+			current.execPid = null;
+			writeContainer(current);
+		}
 		process.exit(exitCode);
 	}, delayMs);
 }
-
-function signalRecorded(record, signal) {
-	if (typeof record.pid !== "number" || record.pid <= 0) return;
-	try {
-		process.kill(record.pid, signal);
-	} catch {}
-}
-
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function main() {
 	const [command, ...args] = argv;
@@ -176,6 +264,8 @@ async function main() {
 			break;
 		case "run":
 			return run(args);
+		case "exec":
+			return execCommand(args);
 		case "kill": {
 			const id = args.at(-1);
 			await sleep(Number(knob("KILL_DELAY_MS", 0)));
@@ -232,6 +322,7 @@ async function main() {
 		}
 		case "logs": {
 			const id = args.at(-1);
+			if (knob("LOGS_FAIL") === "1") fail("logs failed");
 			if (!existsSync(containerPath(id))) fail(`container ${id} not found`);
 			process.stdout.write(`${["boot...", ...readJson(containerPath(id)).bootLog].join("\n")}\n`);
 			break;

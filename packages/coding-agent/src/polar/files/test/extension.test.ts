@@ -173,7 +173,7 @@ describe("files extension", () => {
 		const described = { descriptions: { read: "read does things. Reads files up to 16 MiB." } };
 		expect(describeRead(loadout(["read", "list_files"]))).toEqual(described);
 		expect(describeRead(loadout(["list_files"]))).toBeUndefined();
-		for (const others of [["exec"], ["k8s_get"], ["k8s_get", "exec"]]) {
+		for (const others of [["run_code"], ["k8s_get"], ["k8s_get", "run_code"]]) {
 			expect(describeRead(loadout(["read", "list_files", ...others]))).toEqual(described);
 		}
 	});

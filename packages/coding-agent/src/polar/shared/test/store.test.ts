@@ -125,24 +125,24 @@ describe("openOutputFile", () => {
 
 	it("reserves the number before the first await", async () => {
 		const hold = holdNextCreation();
-		const pendingB = openOutputFile(session, "exec", LIMITS);
+		const pendingB = openOutputFile(session, "run_code", LIMITS);
 		await hold.reached;
-		const fileA = opened(await openOutputFile(session, "exec", LIMITS));
+		const fileA = opened(await openOutputFile(session, "run_code", LIMITS));
 		await stream(fileA, "output of A\n");
-		const savedA = await finishOutputFile(fileA, "complete", { tool: "exec", command: "python: a()" });
+		const savedA = await finishOutputFile(fileA, "complete", { tool: "run_code", command: "python: a()" });
 		hold.release();
 		const fileB = opened(await pendingB);
 		await stream(fileB, "output of B\n");
-		const savedB = await finishOutputFile(fileB, "complete", { tool: "exec", command: "python: b()" });
+		const savedB = await finishOutputFile(fileB, "complete", { tool: "run_code", command: "python: b()" });
 
-		expect([fileB.name, fileA.name]).toEqual(["exec-1", "exec-2"]);
-		expect(savedA).toMatchObject({ saved: { file: "exec-2.txt" } });
-		expect(savedB).toMatchObject({ saved: { file: "exec-1.txt" } });
-		expect(await readFile(join(session.outputDirectory, "exec-2.txt"), "utf8")).toBe("output of A\n");
-		expect(await readFile(join(session.outputDirectory, "exec-1.txt"), "utf8")).toBe("output of B\n");
+		expect([fileB.name, fileA.name]).toEqual(["run_code-1", "run_code-2"]);
+		expect(savedA).toMatchObject({ saved: { file: "run_code-2.txt" } });
+		expect(savedB).toMatchObject({ saved: { file: "run_code-1.txt" } });
+		expect(await readFile(join(session.outputDirectory, "run_code-2.txt"), "utf8")).toBe("output of A\n");
+		expect(await readFile(join(session.outputDirectory, "run_code-1.txt"), "utf8")).toBe("output of B\n");
 		expect((await readManifest(session)).map((entry) => [entry.file, entry.command])).toEqual([
-			["exec-2.txt", "python: a()"],
-			["exec-1.txt", "python: b()"],
+			["run_code-2.txt", "python: a()"],
+			["run_code-1.txt", "python: b()"],
 		]);
 		expect(await manifestLines()).toHaveLength(2);
 
@@ -405,17 +405,17 @@ describe("discardOutputFile", () => {
 
 	it("does not reuse the number of a discarded file within a context", async () => {
 		const kept = await save("kept\n");
-		const dropped = opened(await openOutputFile(session, "exec", LIMITS));
+		const dropped = opened(await openOutputFile(session, "run_code", LIMITS));
 		await discardOutputFile(dropped);
-		const next = opened(await openOutputFile(session, "exec", LIMITS));
-		expect([kept.file, dropped.name, next.name]).toEqual(["k8s_logs-1.txt", "exec-2", "exec-3"]);
+		const next = opened(await openOutputFile(session, "run_code", LIMITS));
+		expect([kept.file, dropped.name, next.name]).toEqual(["k8s_logs-1.txt", "run_code-2", "run_code-3"]);
 		await discardOutputFile(next);
 		expect(await names()).toEqual(["k8s_logs-1.txt", "manifest.jsonl"]);
 
 		await handle.release();
 		handle = await acquireSession("s", "/w", root);
 		session = handle.paths;
-		expect(opened(await openOutputFile(session, "exec", LIMITS)).name).toBe("exec-2");
+		expect(opened(await openOutputFile(session, "run_code", LIMITS)).name).toBe("run_code-2");
 	});
 });
 
@@ -528,7 +528,7 @@ describe("session context", () => {
 	it("continues numbering from the highest published number at creation", async () => {
 		await handle.release();
 		await writeFile(join(session.outputDirectory, "k8s_get-3.txt"), "pods\n");
-		await writeFile(join(session.outputDirectory, "exec-7.truncated.txt"), "rows\n");
+		await writeFile(join(session.outputDirectory, "run_code-7.truncated.txt"), "rows\n");
 		handle = await acquireSession("s", "/w", root);
 		session = handle.paths;
 
@@ -577,11 +577,11 @@ describe("session context", () => {
 			const limits = { fileMaxBytes: 1024, sessionMaxBytes: 26 };
 			const fileA = opened(await storeA.openOutputFile(paths, "k8s_get", limits));
 			await stream(fileA, "123456");
-			expect(await storeB.openOutputFile(paths, "exec", limits)).toEqual({
+			expect(await storeB.openOutputFile(paths, "run_code", limits)).toEqual({
 				refused: { usedBytes: 26, sessionMaxBytes: 26 },
 			});
 			expect(await storeA.finishOutputFile(fileA, "complete", RECORD)).toHaveProperty("saved");
-			expect(await storeB.openOutputFile(paths, "exec", limits)).toEqual({
+			expect(await storeB.openOutputFile(paths, "run_code", limits)).toEqual({
 				refused: { usedBytes: 26, sessionMaxBytes: 26 },
 			});
 		} finally {

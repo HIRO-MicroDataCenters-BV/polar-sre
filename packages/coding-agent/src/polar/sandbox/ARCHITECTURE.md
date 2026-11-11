@@ -1,0 +1,88 @@
+# Sandbox Architecture (`packages/coding-agent/src/polar/sandbox`)
+
+> **Prerequisites:** Read [`../shared/ARTIFACT-BUS.md`](../shared/ARTIFACT-BUS.md) and [`../ARCHITECTURE.md`](../ARCHITECTURE.md) before modifying `packages/coding-agent/src/polar/sandbox`.
+
+---
+
+## 1. Isolation Model & Hot VM Lifecycle
+
+The `sandbox` extension (`builtin:sandbox`) registers the `run_code` tool, executing Python 3.13 or Bash scripts inside an isolated Linux VM behind the `SandboxDriver` interface (`AppleContainerDriver` on macOS via the `container` CLI).
+
+- **Artifact Bus Mount (`/data`):** Mounts `session.outputDirectory` read-only at `/data` inside the guest.
+- **Persistent Workspace (`/work`):** Mounts a per-session volume (`polar-work-<sessionId>`, `4 GiB`) read-write at `/work` (`HOME=/work`). Files in `/work` persist across calls and across VM recreations within the session.
+- **Lazy Hot Sandbox VM:**
+  - The sandbox VM is started lazily on the first `run_code` call in the session (`driver.startSandbox`), not at `session_start`.
+  - The VM runs with `--network none`, `--read-only`, `--cap-drop ALL`, `--user 1000:1000`, `2 GiB` RAM, `4` CPUs, `nproc=256`, and a `512 MiB` tmpfs at `/tmp` (without `--init`).
+  - PID 1 inside the guest is `bash -c 'echo; while read -r _; do :; done'`. Built-in `read` spawns no child process, survives `kill -9 -1`, reaps zombies, and exits immediately (~0.1s) on `stdin` EOF if the host `polar` process exits or is killed with `SIGKILL`.
+  - Each `run_code` invocation executes via `container exec --interactive --user 1000:1000 --workdir /work ... bash -c <launcher>` (`spawnCall`). The `300s` per-call timeout starts strictly when `spawnCall` spawns the script, excluding lazy VM boot time.
+  - After every completed call, `scrubAfterCall` runs an external `container exec` that kills any remaining processes of `uid 1000`, resets permissions (`chmod -R u+rwX`), deletes all entries under `/tmp`, `/dev/shm`, and `/dev/mqueue`, and verifies that no user processes or temporary files remain.
+  - On timeout, cancellation, output limit, OOM, missing container inspection, or `scrubAfterCall` returning `false`, the hot VM is destroyed (`hot.destroy`) and transparently recreated on the next call while preserving `/work`.
+- **Sequential Execution:** `executionMode: "sequential"` runs one call at a time per session.
+- **UI vs LLM Naming Contract:** No footer status (`ctx.ui.setStatus`) is set. User-facing notifications (`ctx.ui.notify`) refer to the runtime as `sandbox` (`sandbox is off: ...`, `sandbox: ...`), whereas the tool name, `promptGuidelines`, and model-facing replies use `run_code` (`[run_code <status>]`, `run_code-<n>.txt`, `run_code-stderr-<n>.txt`).
+
+---
+
+## 2. File Structure & Layers
+
+Each layer in `packages/coding-agent/src/polar/sandbox/src/` imports only from lower layers:
+
+```text
+packages/coding-agent/src/polar/sandbox/
+├── ARCHITECTURE.md                  # VM sandbox architecture and layer boundaries
+├── index.ts                         # --sandbox-image flag, session_start/shutdown wiring, tool registration
+├── image/
+│   ├── Containerfile                # Guest image definition (default tag: polar-sandbox:0.1)
+│   ├── requirements.in
+│   └── requirements.txt
+├── src/
+│   ├── types.ts                     # Domain data structures, state types, SandboxDriver & HotSandbox contracts
+│   ├── cli.ts                       # Layer 1: Stateless CLI execution, JSON parsing, container cleanup
+│   ├── driver.ts                    # Layer 2: AppleContainerDriver and AppleHotSandbox implementation
+│   ├── workspace.ts                 # Layer 3: Readiness check, orphan container/volume GC, /work volume setup
+│   ├── runner.ts                    # Layer 4: Admission, lazy HotSandbox lifecycle, call supervision, OOM & scrub
+│   └── reply.ts                     # Layer 5: Reply budget calculation, stdout/stderr store finalization, formatting
+└── test/
+    ├── fake-container.mjs           # Stateful stand-in for the `container` CLI in tests
+    ├── fixtures.ts
+    └── *.test.ts
+```
+
+### Layer Responsibilities
+
+1. **`src/cli.ts` (Layer 1 — Stateless CLI & Diagnostic Primitives)**
+   - Spawns short `container` commands with `commandTimeoutMs` (`30s`) and optional `AbortSignal`, tracking child processes in `runtime.children`.
+   - Parses JSON array outputs (`parseListing`, `parseContainers`, `parseVolumes`) and bounds diagnostic stderr (`boundDiagnostic`: `4 KiB` / `64` lines).
+   - Implements `cleanupContainer(runtime, name, deadlineAt)` and `cleanupOwned(runtime, deadlineAt, exclude)`: runs `container delete --force <name>`, and if non-zero, checks `container list --all --format json` before removing `name` from `runtime.owned`.
+
+2. **`src/driver.ts` (Layer 2 — `SandboxDriver` & `HotSandbox`)**
+   - `AppleContainerDriver`: implements runtime readiness (`checkRuntime`, `inspectImage`, `pullImage`, `buildImage`), orphan discovery and deletion (`listSandboxes`, `deleteSandbox`), `/work` volume lifecycle (`listWorkVolumes`, `ensureWorkVolume`, `deleteWorkVolume`), and lazy hot VM startup (`startSandbox`).
+   - `AppleHotSandbox`: manages the keepalive `container run -i` process, records the boot-log OOM baseline before spawning `container exec -i ... bash -c <launcher>` (`spawnCall`), computes OOM deltas (`checkOom`), inspects container presence (`inspect`), scrubs guest state after calls (`scrubAfterCall`), and tears down the VM (`destroy`).
+
+3. **`src/workspace.ts` (Layer 3 — Session Workspace & Recovery)**
+   - `startRuntime`: checks driver readiness and image availability, recovers leftover resources under the same `polar-root`, and prepares `/work`.
+   - `recoverLeftovers`: deletes containers belonging to the current session or to sessions whose `sessionLiveness` is `"ended"`. Deletes volumes when the owning session's directory is absent (`ENOENT`). Preserves resources of `"alive"` and `"unknown"` sessions.
+   - `shutdownRuntime`: closes admission, waits up to `shutdownBudgetMs` (`10s`) for in-flight operations to drain, destroys the active `HotSandbox` and cleans up owned containers, kills remaining CLI processes on `quit`, and releases the session handle when drained.
+
+4. **`src/runner.ts` (Layer 4 — Call Admission & Hot Sandbox Supervision)**
+   - `admitCall`: admits a call when `runtime.state === "open"` and records `toolCallId` in `runtime.inFlight`.
+   - `SandboxCall`: cleans up leftover owned containers from prior calls (excluding the active warm `HotSandbox`), opens `<outputDirectory>/run_code-<n>.part` via `openOutputFile`, reuses `runtime.activeSandbox.current` (or recreates it once if `spawnCall` reports `{ gone }`, or lazily starts it on the first call), and starts `SandboxRun`.
+   - `SandboxRun`: writes the script to `stdin` of the guest launcher (`bash -c 'd="${TMPDIR:-/tmp}/.polar"; mkdir -p "$d" && cat > "$d/program.<ext>" && exec <interpreter> "$d/program.<ext>" </dev/null'`), streams `stdout` into `OpenFile.sink` with backpressure, captures `stderr` up to `1 MiB`, and stops the call on timeout, abort, output limit, or shutdown.
+   - On completion: checks OOM delta on exit `137`, inspects container presence on non-zero exit, runs `scrubAfterCall` when the VM remains healthy, and destroys the VM whenever stopped, OOM-killed, missing/unknown on inspection, or when `scrubAfterCall` returns `false`.
+
+5. **`src/reply.ts` (Layer 5 — Sandbox Reply Builder)**
+   - Finalizes `result.output` (`discardOutputFile` if a plain `ok` or if the full output fits the reply room; `finishOutputFile` otherwise) and saves oversized `stderr` via `saveBytes` as `run_code-stderr-<n>.txt`.
+   - Formats the reply with status line `[run_code <status>] <language>: <first-line>`, `stdout` head excerpt, `[stderr]...[/stderr]` tail excerpt, and notices (`outputLimitNotice`, `cleanupNotice`, `inspectionNotice`, `statusMessage`).
+   - Saved file notices point to `"read" tool` (when `<= 16 MiB`) and `"run_code" tool from /data/<file>`.
+
+---
+
+## 3. Guest Image (`packages/coding-agent/src/polar/sandbox/image`)
+
+Build command:
+```bash
+(cd packages/coding-agent/src/polar/sandbox/image && container build --arch arm64 --tag polar-sandbox:0.1 --file Containerfile .)
+```
+
+- **Python 3.13 kit:** `duckdb`, `polars`, `pandas`, `numpy`, `orjson`, `ijson`, `pyyaml`, `jmespath`, `python-dateutil`, `ciso8601`, `regex`, `tabulate`, `drain3`.
+- **CLI kit:** `bash`, `coreutils`, `gawk`, `ripgrep`, `jq`, `yq`, `duckdb`, `miller`.
+- Runs as user `1000:1000` (`polar`) under kernel `RLIMIT_NPROC` (`256`).

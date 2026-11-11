@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { acquireSession, type SessionHandle } from "../../shared/session.ts";
 import { containerCommand } from "../src/cli.ts";
 import { admitCall } from "../src/runner.ts";
-import type { ExecRuntime, SessionPaths } from "../src/types.ts";
+import type { SandboxRuntime, SessionPaths } from "../src/types.ts";
 import {
 	checkReadiness,
 	closeAdmission,
@@ -25,7 +25,7 @@ let notices: string[];
 const warn = (message: string) => notices.push(message);
 
 beforeEach(async () => {
-	root = await mkdtemp(join(tmpdir(), "exec-workspace-"));
+	root = await mkdtemp(join(tmpdir(), "sandbox-workspace-"));
 	handle = await acquireSession("current", root, artifactsRoot());
 	session = handle.paths;
 	state = await fakeState();
@@ -76,18 +76,18 @@ async function sessionFiles(): Promise<string[]> {
 	return (await readdir(session.outputDirectory).catch(() => [])).filter((name) => name !== "lock").sort();
 }
 
-function startCall(runtime: ExecRuntime, code: string) {
+function startCall(runtime: SandboxRuntime, code: string) {
 	const call = admitCall(runtime, { language: "bash", code }, undefined, "call-1");
 	if (call === undefined) throw new Error("the call was not admitted");
 	return call.run().finally(() => call.dispose());
 }
 
-function runChildren(runtime: ExecRuntime) {
+function runChildren(runtime: SandboxRuntime) {
 	return [...runtime.children].filter(([, kind]) => kind === "run").map(([child]) => child);
 }
 
 describe("start", () => {
-	it("offers exec only with a running runtime and the image", async () => {
+	it("offers run_code only with a running runtime and the image", async () => {
 		expect(await checkReadiness(fakeRuntime(state, handle))).toEqual({ ready: true });
 		expect(await checkReadiness(fakeRuntime(state, handle, { STATUS_EXIT: "1" }))).toEqual({
 			ready: false,
@@ -97,13 +97,13 @@ describe("start", () => {
 		expect(await checkReadiness(fakeRuntime(state, handle, { IMAGE_MISSING: "1" }))).toEqual({
 			ready: false,
 			message:
-				"sandbox is off: container image inspect polar-exec:test failed: Error: image polar-exec:test not found. Build the image as packages/coding-agent/src/polar/exec/ARCHITECTURE.md describes.",
+				"sandbox is off: container image inspect polar-sandbox:test failed: Error: image polar-sandbox:test not found. Build the image as packages/coding-agent/src/polar/sandbox/ARCHITECTURE.md describes.",
 			leftovers: [],
 		});
 	});
 
 	it("treats an unknown listing as not established", async () => {
-		await state.addContainer("polar-exec-current-3-aaaaaaaa", ownLabels("current"));
+		await state.addContainer("polar-sandbox-current-3-aaaaaaaa", ownLabels("current"));
 		const forms: [string, string, string][] = [
 			["LIST_FAIL", "1", "Error: list failed"],
 			["LIST_GARBAGE", "1", "unreadable listing"],
@@ -122,7 +122,7 @@ describe("start", () => {
 			expect(runtime.owned.size).toBe(0);
 		}
 		expect(await callsOf("delete", "run", "volume")).toEqual([]);
-		expect(await state.containers()).toEqual(["polar-exec-current-3-aaaaaaaa"]);
+		expect(await state.containers()).toEqual(["polar-sandbox-current-3-aaaaaaaa"]);
 		expect(notices).toEqual([]);
 	});
 
@@ -136,14 +136,14 @@ describe("start", () => {
 		await chmod(join(locked, "lock"), 0o000);
 		await mkdir(join(otherRoot, "elsewhere"), { recursive: true });
 
-		await state.addContainer("polar-exec-current-3-aaaaaaaa", ownLabels("current"));
-		await state.addContainer("polar-exec-live-1-bbbbbbbb", ownLabels("live"));
-		await state.addContainer("polar-exec-ended-1-cccccccc", ownLabels("ended"));
-		await state.addContainer("polar-exec-gone-1-dddddddd", ownLabels("gone"));
-		await state.addContainer("polar-exec-locked-1-eeeeeeee", ownLabels("locked"));
+		await state.addContainer("polar-sandbox-current-3-aaaaaaaa", ownLabels("current"));
+		await state.addContainer("polar-sandbox-live-1-bbbbbbbb", ownLabels("live"));
+		await state.addContainer("polar-sandbox-ended-1-cccccccc", ownLabels("ended"));
+		await state.addContainer("polar-sandbox-gone-1-dddddddd", ownLabels("gone"));
+		await state.addContainer("polar-sandbox-locked-1-eeeeeeee", ownLabels("locked"));
 		await state.addContainer("polar-prep-locked-eeeeeeee", ownLabels("locked"));
-		await state.addContainer("polar-exec-elsewhere-1-ffffffff", ownLabels("elsewhere", otherRoot));
-		await state.addContainer("polar-exec-foreign-1-11111111", ownLabels("foreign", otherRoot));
+		await state.addContainer("polar-sandbox-elsewhere-1-ffffffff", ownLabels("elsewhere", otherRoot));
+		await state.addContainer("polar-sandbox-foreign-1-11111111", ownLabels("foreign", otherRoot));
 		await state.addContainer("unlabeled", {});
 		await state.addContainer("rootless", { "polar-session": "rootless" });
 		await state.addVolume("polar-work-current", ownLabels("current"));
@@ -160,11 +160,11 @@ describe("start", () => {
 		expect(await recoverLeftovers(runtime, warn)).toEqual({ clean: true });
 
 		expect(await state.containers()).toEqual([
-			"polar-exec-elsewhere-1-ffffffff",
-			"polar-exec-foreign-1-11111111",
-			"polar-exec-live-1-bbbbbbbb",
-			"polar-exec-locked-1-eeeeeeee",
 			"polar-prep-locked-eeeeeeee",
+			"polar-sandbox-elsewhere-1-ffffffff",
+			"polar-sandbox-foreign-1-11111111",
+			"polar-sandbox-live-1-bbbbbbbb",
+			"polar-sandbox-locked-1-eeeeeeee",
 			"rootless",
 			"unlabeled",
 		]);
@@ -182,9 +182,9 @@ describe("start", () => {
 			"sandbox: the lock of session locked could not be read; its containers and volume are kept",
 		]);
 		expect((await callsOf("delete")).map((call) => call.at(-1)).sort()).toEqual([
-			"polar-exec-current-3-aaaaaaaa",
-			"polar-exec-ended-1-cccccccc",
-			"polar-exec-gone-1-dddddddd",
+			"polar-sandbox-current-3-aaaaaaaa",
+			"polar-sandbox-ended-1-cccccccc",
+			"polar-sandbox-gone-1-dddddddd",
 		]);
 		expect((await volumeCalls("delete")).map((call) => call.at(-1)).sort()).toEqual([
 			"polar-work-busy",
@@ -231,7 +231,7 @@ describe("start", () => {
 			"polar-work-current",
 		]);
 		const [prep] = await callsOf("run");
-		expect(prep.slice(-4)).toEqual(["polar-exec:test", "chown", "1000:1000", "/work"]);
+		expect(prep.slice(-4)).toEqual(["polar-sandbox:test", "chown", "1000:1000", "/work"]);
 		expect(prep[prep.indexOf("--user") + 1]).toBe("0:0");
 		expect(prep).toContain("polar-work-current:/work");
 		expect(prep).not.toContain("--rm");
@@ -289,21 +289,21 @@ describe("start", () => {
 	});
 
 	it("keeps a leftover owned and offers no tool when it cannot be deleted at start", async () => {
-		await state.addContainer("polar-exec-current-2-ffffffff", ownLabels("current"));
+		await state.addContainer("polar-sandbox-current-2-ffffffff", ownLabels("current"));
 		const runtime = startingRuntime(state, handle, { DELETE_FAIL: "1" });
 
 		expect(await startRuntime(runtime, warn)).toEqual({
 			ready: false,
 			message:
-				"sandbox is off: leftovers of sandbox stayed; polar-exec-current-2-ffffffff (delete: Error: runtime temporarily unavailable; still listed) could not be deleted; delete them with: container delete --force polar-exec-current-2-ffffffff",
+				"sandbox is off: leftovers of sandbox stayed; polar-sandbox-current-2-ffffffff (delete: Error: runtime temporarily unavailable; still listed) could not be deleted; delete them with: container delete --force polar-sandbox-current-2-ffffffff",
 			leftovers: [
 				{
-					container: "polar-exec-current-2-ffffffff",
+					container: "polar-sandbox-current-2-ffffffff",
 					message: "delete: Error: runtime temporarily unavailable; still listed",
 				},
 			],
 		});
-		expect(runtime.owned).toEqual(new Set(["polar-exec-current-2-ffffffff"]));
+		expect(runtime.owned).toEqual(new Set(["polar-sandbox-current-2-ffffffff"]));
 		expect(runtime.state).toBe("unready");
 		expect(await volumeCalls("inspect")).toEqual([]);
 	});
@@ -356,7 +356,8 @@ describe("shutdown", () => {
 		);
 		const finished = startCall(runtime, "stdout:partial\nhang");
 		await until(() => runtime.running.size === 1);
-		const [runCommand] = runChildren(runtime);
+		const children = runChildren(runtime);
+		expect(children.length).toBeGreaterThanOrEqual(1);
 
 		const started = performance.now();
 		await shutdownRuntime(runtime, "reload", warn);
@@ -365,25 +366,41 @@ describe("shutdown", () => {
 		expect(elapsed).toBeGreaterThanOrEqual(280);
 		expect(elapsed).toBeLessThan(1500);
 		expect(notices).toEqual(["sandbox: 1 program(s) still stopping"]);
-		expect(runCommand.killed).toBe(true);
+		for (const child of children) expect(child.killed).toBe(true);
 		expect(runtime.state).toBe("closing");
 		expect(runtime.inFlight).toEqual(new Set(["call-1"]));
 		expect(await exists(lockOf(session))).toBe(true);
 
 		const result = await finished;
 		expect(result.status).toBe("cancelled");
-		expect(runCommand.signalCode).toBe("SIGKILL");
+		for (const child of children) expect(child.signalCode).toBe("SIGKILL");
 		expect(await state.containers()).toEqual([]);
 		expect(await sessionFiles()).toEqual([]);
 		expect(runtime.state).toBe("closed");
 		expect(await exists(lockOf(session))).toBe(false);
 	});
 
+	it("destroys a warm hot sandbox at shutdown", async () => {
+		const runtime = fakeRuntime(state, handle);
+		const result = await startCall(runtime, "stdout:done");
+		expect(result.status).toBe("ok");
+		expect(runtime.activeSandbox.current).toBeDefined();
+		expect(await state.containers()).toHaveLength(1);
+
+		await shutdownRuntime(runtime, "reload", warn);
+
+		expect(runtime.activeSandbox.current).toBeUndefined();
+		expect(runtime.owned.size).toBe(0);
+		expect(await state.containers()).toEqual([]);
+		expect(runtime.state).toBe("closed");
+		expect(notices).toEqual([]);
+	});
+
 	it("does not hold the handle for an external leftover", async () => {
 		const runtime = fakeRuntime(
 			state,
 			handle,
-			{ DELETE_HANG: "1" },
+			{ SCRUB_FAIL: "1", DELETE_HANG: "1" },
 			{ commandTimeoutMs: 300, shutdownBudgetMs: 800 },
 		);
 		const result = await startCall(runtime, "stdout:done");
@@ -410,10 +427,10 @@ describe("shutdown", () => {
 		);
 		const finished = startCall(runtime, "hang");
 		await until(() => runtime.running.size === 1);
-		const hanging = containerCommand(runtime, ["delete", "--force", "polar-exec-current-9-99999999"]);
+		const hanging = containerCommand(runtime, ["delete", "--force", "polar-sandbox-current-9-99999999"]);
 		await until(async () => (await callsOf("delete")).length === 1);
 		const before = [...runtime.children];
-		expect(before.map(([, kind]) => kind).sort()).toEqual(["run", "service"]);
+		expect(new Set(before.map(([, kind]) => kind))).toEqual(new Set(["run", "service"]));
 
 		const started = performance.now();
 		await shutdownRuntime(runtime, "quit", warn);
@@ -427,14 +444,14 @@ describe("shutdown", () => {
 		expect(await containerCommand(runtime, ["system", "status"])).toEqual({
 			code: null,
 			stdout: "",
-			stderr: "exec is stopping; no command starts",
+			stderr: "sandbox is stopping; no command starts",
 			timedOut: false,
 		});
 		expect(await state.calls()).toHaveLength(recorded);
 		const result = await finished;
 		expect(result.status).toBe("cancelled");
 		expect(result.cleanupError?.message).toBe(
-			"delete: exec is stopping; no command starts; list: exec is stopping; no command starts",
+			"delete: sandbox is stopping; no command starts; list: sandbox is stopping; no command starts",
 		);
 		expect(runtime.state).toBe("closed");
 	});
@@ -458,7 +475,7 @@ describe("shutdown", () => {
 	});
 
 	it("returns at the budget during a hanging start and releases the handle when the start ends", async () => {
-		await state.addContainer("polar-exec-current-1-aaaaaaaa", ownLabels("current"));
+		await state.addContainer("polar-sandbox-current-1-aaaaaaaa", ownLabels("current"));
 		const runtime = startingRuntime(state, handle, { DELETE_DELAY_MS: "700" }, { shutdownBudgetMs: 200 });
 		const starting = startRuntime(runtime, warn);
 		await until(async () => (await callsOf("delete")).length === 1);

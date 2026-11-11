@@ -14,13 +14,13 @@ import {
 } from "../../shared/store.ts";
 import {
 	DATA_PATH,
-	type ExecLimits,
-	type ExecRequest,
-	type ExecResult,
-	type ExecStatus,
-	type FinalizedExecOutput,
+	type FinalizedSandboxOutput,
 	type FinalizedStderr,
 	type FinalizedStdout,
+	type SandboxLimits,
+	type SandboxRequest,
+	type SandboxResult,
+	type SandboxStatus,
 	type SessionPaths,
 	type ToolReply,
 } from "./types.ts";
@@ -31,9 +31,9 @@ const RESERVED_BYTES = 2 * 1024;
 const WINDOW_MARGIN_BYTES = 16 * 1024;
 const STDERR_OPEN = "[stderr]";
 const STDERR_CLOSE = "[/stderr]";
-const STDERR_FILE_TOOL = "exec-stderr";
+const STDERR_FILE_TOOL = "run_code-stderr";
 
-type ResultState = Omit<FinalizedExecOutput, "stdout" | "stderr">;
+type ResultState = Omit<FinalizedSandboxOutput, "stdout" | "stderr">;
 
 interface Limits {
 	maxLines: number;
@@ -54,7 +54,7 @@ interface StderrSection extends Size {
 	section: string;
 }
 
-export function commandLine(request: ExecRequest): string {
+export function commandLine(request: SandboxRequest): string {
 	const line = request.code.split("\n").find((candidate) => candidate.trim() !== "") ?? "";
 	const trimmed = line.trim();
 	const shown = trimmed.length > COMMAND_MAX_CHARS ? `${trimmed.slice(0, COMMAND_MAX_CHARS - 1)}…` : trimmed;
@@ -62,11 +62,11 @@ export function commandLine(request: ExecRequest): string {
 }
 
 export async function finalizeOutput(
-	result: ExecResult,
-	request: ExecRequest,
-	limits: ExecLimits,
+	result: SandboxResult,
+	request: SandboxRequest,
+	limits: SandboxLimits,
 	session: SessionPaths,
-): Promise<FinalizedExecOutput> {
+): Promise<FinalizedSandboxOutput> {
 	const policy = { maxLines: limits.replyMaxLines, maxBytes: limits.replyMaxBytes };
 	const statusLine = renderStatusLine(result, request);
 	const fixed = fixedNotices(result, limits);
@@ -80,7 +80,11 @@ export async function finalizeOutput(
 	return { ...state, stdout, stderr };
 }
 
-export function formatReply(finalized: FinalizedExecOutput, request: ExecRequest, limits: ExecLimits): ToolReply {
+export function formatReply(
+	finalized: FinalizedSandboxOutput,
+	request: SandboxRequest,
+	limits: SandboxLimits,
+): ToolReply {
 	const policy = { maxLines: limits.replyMaxLines, maxBytes: limits.replyMaxBytes };
 	const statusLine = renderStatusLine(finalized, request);
 	const fixed = fixedNotices(finalized, limits);
@@ -110,9 +114,9 @@ export function formatReply(finalized: FinalizedExecOutput, request: ExecRequest
 }
 
 export async function buildReply(
-	result: ExecResult,
-	request: ExecRequest,
-	limits: ExecLimits,
+	result: SandboxResult,
+	request: SandboxRequest,
+	limits: SandboxLimits,
 	session: SessionPaths,
 ): Promise<ToolReply> {
 	const finalized = await finalizeOutput(result, request, limits, session);
@@ -120,8 +124,8 @@ export async function buildReply(
 }
 
 async function takeStdout(
-	result: ExecResult,
-	request: ExecRequest,
+	result: SandboxResult,
+	request: SandboxRequest,
 	stderrEmpty: boolean,
 	policy: Limits,
 	room: Limits,
@@ -137,7 +141,7 @@ async function takeStdout(
 			await discardOutputFile(file);
 			return { whole: head.text, head };
 		}
-		const record = { tool: "exec", command: commandLine(request) };
+		const record = { tool: "run_code", command: commandLine(request) };
 		ended = true;
 		const kept = await finishOutputFile(file, fileOutcome(result.status), record);
 		return { whole: head.cut ? undefined : head.text, head, kept };
@@ -148,9 +152,9 @@ async function takeStdout(
 }
 
 async function takeStderr(
-	result: ExecResult,
-	request: ExecRequest,
-	limits: ExecLimits,
+	result: SandboxResult,
+	request: SandboxRequest,
+	limits: SandboxLimits,
 	session: SessionPaths,
 	budget: Limits,
 ): Promise<FinalizedStderr> {
@@ -159,7 +163,7 @@ async function takeStderr(
 	const whole = `${STDERR_OPEN}\n${text}${STDERR_CLOSE}`;
 	if (fits(whole, budget)) return { text };
 	const { fileMaxBytes, sessionMaxBytes } = limits;
-	const record = { tool: "exec", command: commandLine(request) };
+	const record = { tool: "run_code", command: commandLine(request) };
 	const kept = await saveBytes(
 		session,
 		STDERR_FILE_TOOL,
@@ -198,7 +202,7 @@ function unsaved(kept: Exclude<SaveOutcome, { saved: SavedFile }>): string {
 	return "refused" in kept ? quotaMessage(kept.refused) : kept.saveFailed.message;
 }
 
-function fileOutcome(status: ExecStatus): FileOutcome {
+function fileOutcome(status: SandboxStatus): FileOutcome {
 	return status === "ok" || status === "failed" ? "complete" : "truncated";
 }
 
@@ -220,10 +224,10 @@ function measure(text: string): Size {
 	return { lines: totalLines, bytes: totalBytes };
 }
 
-function renderStatusLine(result: ResultState, request: ExecRequest): string {
+function renderStatusLine(result: ResultState, request: SandboxRequest): string {
 	const status =
 		result.status === "failed" && result.exitCode !== null ? `failed: exit ${result.exitCode}` : result.status;
-	return `[exec ${status}] ${commandLine(request)}`;
+	return `[run_code ${status}] ${commandLine(request)}`;
 }
 
 function excerptRoom(policy: Limits, measured: string[]): Limits {
@@ -260,25 +264,25 @@ function keptNotice(shown: string, stdout: FinalizedStdout): string {
 }
 
 function readHint(file: string, size: number): string {
-	return size <= READ_MAX_BYTES ? `read it with "read" tool, or ${execHint(file)}` : execHint(file);
+	return size <= READ_MAX_BYTES ? `read it with "read" tool, or ${runCodeHint(file)}` : runCodeHint(file);
 }
 
-function execHint(file: string): string {
-	return `process it with "exec" tool from ${DATA_PATH}/${file}.`;
+function runCodeHint(file: string): string {
+	return `process it with "run_code" tool from ${DATA_PATH}/${file}.`;
 }
 
 function longLineNotice(maxBytes: number, stdout: FinalizedStdout): string {
 	const shown = `Line 1 is longer than the ${formatSize(maxBytes)} limit; nothing shown.`;
 	if (stdout.kept === undefined || "saveFailed" in stdout.kept) return `[${shown} Print shorter lines.]`;
 	const { file, path, size } = stdout.kept.saved;
-	return `[${shown} Saved as ${path} (${formatSize(size)}); ${execHint(file)}]`;
+	return `[${shown} Saved as ${path} (${formatSize(size)}); ${runCodeHint(file)}]`;
 }
 
 function emptyStdoutNotice(result: ResultState, stdout: FinalizedStdout): string | undefined {
 	return result.status === "ok" && stdout.whole === "" ? "[stdout is empty]" : undefined;
 }
 
-function fixedNotices(result: ResultState, limits: ExecLimits): string[] {
+function fixedNotices(result: ResultState, limits: SandboxLimits): string[] {
 	return [
 		outputLimitNotice(result, limits),
 		cleanupNotice(result),
@@ -287,7 +291,7 @@ function fixedNotices(result: ResultState, limits: ExecLimits): string[] {
 	].filter((notice) => notice !== undefined);
 }
 
-function outputLimitNotice(result: ResultState, limits: ExecLimits): string | undefined {
+function outputLimitNotice(result: ResultState, limits: SandboxLimits): string | undefined {
 	if (result.status !== "output_limit") return undefined;
 	const stopped = "the program was stopped; the output is incomplete.";
 	switch (result.limit) {
@@ -322,14 +326,14 @@ function inspectionNotice({ inspection }: ResultState): string | undefined {
 	return `[The container could not be inspected${reason}.]`;
 }
 
-function statusMessage(result: ResultState, limits: ExecLimits): string | undefined {
+function statusMessage(result: ResultState, limits: SandboxLimits): string | undefined {
 	switch (result.status) {
 		case "ok":
 		case "failed":
 		case "output_limit":
 			return undefined;
 		case "timeout":
-			return `exec did not finish in ${Math.round(limits.timeoutMs / 1000)} s.`;
+			return `run_code did not finish in ${Math.round(limits.timeoutMs / 1000)} s.`;
 		case "cancelled":
 			return "Cancelled.";
 		case "out_of_memory":

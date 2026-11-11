@@ -1,3 +1,4 @@
+import { spawn } from "child_process";
 import { randomUUID } from "crypto";
 import { access, mkdir, mkdtemp, readdir, rm, stat, writeFile } from "fs/promises";
 import { homedir } from "os";
@@ -8,9 +9,10 @@ import { acquireSession, type SessionHandle } from "../../shared/session.ts";
 import { readManifest } from "../../shared/store.ts";
 import { createRuntime, DEFAULT_IMAGE } from "../index.ts";
 import { containerCommand, parseContainers, parseListing } from "../src/cli.ts";
+import { sandboxArguments } from "../src/driver.ts";
 import { buildReply } from "../src/reply.ts";
 import { admitCall } from "../src/runner.ts";
-import type { ExecLimits, ExecRequest, ExecRuntime, SessionPaths } from "../src/types.ts";
+import type { SandboxLimits, SandboxRequest, SandboxRuntime, SessionPaths } from "../src/types.ts";
 import {
 	recoverLeftovers,
 	SESSION_LABEL,
@@ -20,10 +22,10 @@ import {
 	workVolumeName,
 } from "../src/workspace.ts";
 
-const REAL = process.env.EXEC_REAL_RUNTIME === "1";
-const IMAGE = process.env.EXEC_IMAGE ?? DEFAULT_IMAGE;
+const REAL = process.env.SANDBOX_REAL_RUNTIME === "1";
+const IMAGE = process.env.POLAR_SANDBOX_IMAGE ?? DEFAULT_IMAGE;
 
-const limits: ExecLimits = {
+const limits: SandboxLimits = {
 	timeoutMs: 60_000,
 	memoryBytes: 1024 * 1024 * 1024,
 	cpus: 2,
@@ -43,7 +45,7 @@ const limits: ExecLimits = {
 let root: string;
 let handle: SessionHandle;
 let session: SessionPaths;
-let runtime: ExecRuntime;
+let runtime: SandboxRuntime;
 const timings: { step: string; ms: number }[] = [];
 const notices: string[] = [];
 const warn = (message: string) => notices.push(message);
@@ -58,7 +60,8 @@ async function timed<T>(step: string, work: () => Promise<T>): Promise<T> {
 }
 
 async function startedRuntime(sessionHandle: SessionHandle) {
-	const started = { ...createRuntime(IMAGE, process.env, sessionHandle), limits };
+	const started = createRuntime(IMAGE, process.env, sessionHandle);
+	started.limits = { ...limits };
 	const readiness = await timed(`start ${sessionHandle.paths.sessionId}`, () => startRuntime(started, warn));
 	if (readiness.ready) started.state = "open";
 	return { runtime: started, readiness };
@@ -66,23 +69,28 @@ async function startedRuntime(sessionHandle: SessionHandle) {
 
 async function call(
 	code: string,
-	language: ExecRequest["language"] = "python",
-	overrides: Partial<ExecLimits> = {},
+	language: SandboxRequest["language"] = "python",
+	overrides: Partial<SandboxLimits> = {},
 	signal?: AbortSignal,
 ) {
-	const used = { ...runtime, limits: { ...runtime.limits, ...overrides } };
-	const request: ExecRequest = { language, code };
+	const previousLimits = runtime.limits;
+	runtime.limits = { ...runtime.limits, ...overrides };
+	const request: SandboxRequest = { language, code };
 	const step = code.split("\n").find((line) => line.trim() !== "") ?? "";
-	return timed(step, async () => {
-		const admitted = admitCall(used, request, signal, randomUUID());
-		if (admitted === undefined) throw new Error("the call was not admitted");
-		try {
-			const result = await admitted.run();
-			return { result, reply: await buildReply(result, request, used.limits, session) };
-		} finally {
-			await admitted.dispose();
-		}
-	});
+	try {
+		return await timed(step, async () => {
+			const admitted = admitCall(runtime, request, signal, randomUUID());
+			if (admitted === undefined) throw new Error("the call was not admitted");
+			try {
+				const result = await admitted.run();
+				return { result, reply: await buildReply(result, request, runtime.limits, session) };
+			} finally {
+				await admitted.dispose();
+			}
+		});
+	} finally {
+		runtime.limits = previousLimits;
+	}
 }
 
 async function listing() {
@@ -96,6 +104,19 @@ async function containersOf(sessionId: string): Promise<string[]> {
 	return (await listing())
 		.filter((container) => container.labels[SESSION_LABEL] === sessionId)
 		.map((container) => container.name);
+}
+
+async function isRunning(name: string): Promise<boolean> {
+	const inspected = await containerCommand(runtime, ["inspect", name]);
+	if (inspected.code !== 0) return false;
+	try {
+		const parsed = JSON.parse(inspected.stdout) as Array<{ status?: string | { state?: string } }>;
+		const status = parsed[0]?.status;
+		const state = typeof status === "string" ? status : status?.state;
+		return state === "running";
+	} catch {
+		return false;
+	}
 }
 
 async function sleeper(name: string, paths: SessionPaths = session): Promise<void> {
@@ -123,10 +144,10 @@ function exists(path: string): Promise<boolean> {
 	);
 }
 
-describe.skipIf(!REAL)("exec on the real runtime", () => {
+describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 	beforeAll(async () => {
 		await mkdir(join(homedir(), ".cache"), { recursive: true });
-		root = await mkdtemp(join(homedir(), ".cache", "polar-exec-real-"));
+		root = await mkdtemp(join(homedir(), ".cache", "polar-sandbox-real-"));
 		handle = await acquireSession(`real-${randomUUID().slice(0, 8)}`, root, root);
 		session = handle.paths;
 		const lines: string[] = [];
@@ -145,19 +166,54 @@ describe.skipIf(!REAL)("exec on the real runtime", () => {
 	}, 120_000);
 
 	afterAll(async () => {
-		await containerCommand(runtime, ["volume", "delete", workVolumeName(session.sessionId)]);
-		await handle.release();
-		await rm(root, { recursive: true, force: true });
+		if (runtime !== undefined) {
+			await shutdownRuntime(runtime, "reload", warn);
+			await containerCommand(runtime, ["volume", "delete", workVolumeName(session.sessionId)]);
+		}
+		if (handle !== undefined) await handle.release();
+		if (root !== undefined) await rm(root, { recursive: true, force: true });
 		console.table(timings);
 	});
 
-	it("runs python with duckdb and bash with ripgrep over /data", async () => {
+	it("runs python with duckdb and bash with ripgrep over /data in a warm VM", async () => {
 		const sql = await call(
 			"import duckdb\nprint(duckdb.sql(\"select count(*) from read_json('/data/k8s_logs-1.txt', format='newline_delimited') where status >= 500\").fetchone()[0])",
 		);
 		expect(sql.reply).toEqual({ text: "28572\n", isError: false });
 		const rg = await call("rg -c '\"status\":503' /data/k8s_logs-1.txt", "bash");
 		expect(rg.reply).toEqual({ text: "28572\n", isError: false });
+	}, 60_000);
+
+	it("scrubs background processes, files, and 000 directories in /tmp, /dev/shm, and /dev/mqueue between calls in the same VM", async () => {
+		const dirty = await call(
+			[
+				"cat /proc/sys/kernel/random/boot_id",
+				"sleep 300 </dev/null >/dev/null 2>&1 &",
+				"mkdir -p /tmp/locked/sub",
+				"echo secret > /tmp/locked/sub/file.txt",
+				"chmod 000 /tmp/locked/sub /tmp/locked",
+				"echo shm > /dev/shm/leaked.txt",
+				"if [ -d /dev/mqueue ] && [ -w /dev/mqueue ]; then touch /dev/mqueue/leaked 2>/dev/null || true; fi",
+			].join("\n"),
+			"bash",
+		);
+		expect(dirty.result.status).toBe("ok");
+		const bootId1 = dirty.reply.text.trim();
+		expect(bootId1).not.toBe("");
+
+		const check = await call(
+			[
+				"cat /proc/sys/kernel/random/boot_id",
+				"procs=$(for p in /proc/[0-9]*/comm; do cat \"$p\" 2>/dev/null; done | grep -c '^sleep$' || true)",
+				"files=$(find /tmp /dev/shm /dev/mqueue -mindepth 1 ! -path '/tmp/.polar' ! -path '/tmp/.polar/*' -print 2>/dev/null | wc -l | tr -d ' ')",
+				'echo "procs=$procs files=$files"',
+			].join("\n"),
+			"bash",
+		);
+		expect(check.result.status).toBe("ok");
+		const [bootId2, counts] = check.reply.text.trim().split("\n");
+		expect(bootId2).toBe(bootId1);
+		expect(counts).toBe("procs=0 files=0");
 	}, 60_000);
 
 	it("keeps /work between calls, refuses writes to /data and has no network", async () => {
@@ -174,19 +230,24 @@ describe.skipIf(!REAL)("exec on the real runtime", () => {
 		expect(stdin.reply).toEqual({ text: "AFTER\n[]\nEND\n", isError: false });
 	}, 60_000);
 
-	it("stops writes at the hard size of /work", async () => {
+	it("stops writes at the hard size of /work (ENOSPC) and lets the next call delete files with rm and continue", async () => {
 		const over = await call("head -c 200000000 /dev/zero > /work/big", "bash");
 		expect(over.result.status).toBe("failed");
 		expect(over.reply.text).toContain("No space left on device");
-		expect((await call("rm -f /work/big; df -m /work | tail -1", "bash")).result.status).toBe("ok");
+		const recovered = await call(
+			"rm -f /work/big && echo ok > /work/after-enospc.txt && cat /work/after-enospc.txt",
+			"bash",
+		);
+		expect(recovered.result.status).toBe("ok");
+		expect(recovered.reply.text).toBe("ok\n");
 	}, 60_000);
 
 	it("publishes a large stdout as a session file that the next call can read", async () => {
 		const big = await call("head -c 40000000 /dev/zero | tr '\\0' x | fold -w 100", "bash");
 		expect(big.result.status).toBe("ok");
-		const [entry] = (await readManifest(session)).filter((item) => item.tool === "exec");
+		const [entry] = (await readManifest(session)).filter((item) => item.tool === "run_code");
 		expect(big.reply.text).toContain(`Saved as ${join(session.outputDirectory, entry.file)} (`);
-		expect(big.reply.text).toContain(`process it with "exec" tool from /data/${entry.file}.`);
+		expect(big.reply.text).toContain(`process it with "run_code" tool from /data/${entry.file}.`);
 		expect(big.reply.text).not.toContain('read it with "read" tool');
 		expect(entry.status).toBe("complete");
 		expect(entry.command).toBe("bash: head -c 40000000 /dev/zero | tr '\\0' x | fold -w 100");
@@ -195,20 +256,52 @@ describe.skipIf(!REAL)("exec on the real runtime", () => {
 		expect(next.reply.text).toBe("399999\n");
 	}, 120_000);
 
-	it("names an out-of-memory kill from the kernel line", async () => {
+	it("detects OOM by delta so an OOM in call N never marks call N+1 as OOM", async () => {
+		const caught = await call('{ python3 -c "b = bytearray(3 * 2**30)"; } 2>/dev/null || echo caught', "bash");
+		expect(caught.result.status).toBe("ok");
+		expect(caught.reply.text).toBe("caught\n");
+
+		const killedAfterSubOom = await call("kill -9 $$", "bash");
+		expect(killedAfterSubOom.result.status).toBe("failed");
+		expect(killedAfterSubOom.result.exitCode).toBe(137);
+		expect(killedAfterSubOom.result.oomEvidence).toBeUndefined();
+		expect(killedAfterSubOom.reply.text).toContain("[run_code failed: exit 137]");
+
 		const oom = await call("b = bytearray(3 * 2**30)\nprint(len(b))");
 		expect(oom.result.status).toBe("out_of_memory");
 		expect(oom.result.oomEvidence).toContain("Killed process");
-		expect(oom.reply.text).toContain("[exec out_of_memory]");
+		expect(oom.reply.text).toContain("[run_code out_of_memory]");
 		expect(oom.reply.text).toContain("The 1 GiB memory limit was reached and the process was killed.");
-	}, 60_000);
 
-	it("stops the container at the timeout and on cancel, leaving nothing behind", async () => {
+		const killedAfterFullOom = await call("kill -9 $$", "bash");
+		expect(killedAfterFullOom.result.status).toBe("failed");
+		expect(killedAfterFullOom.result.exitCode).toBe(137);
+		expect(killedAfterFullOom.result.oomEvidence).toBeUndefined();
+		expect(killedAfterFullOom.reply.text).toContain("[run_code failed: exit 137]");
+	}, 90_000);
+
+	it("recreates the VM on timeout and cancel while preserving /work", async () => {
+		const before = await call(
+			"echo survived-timeout > /work/timeout-check.txt && cat /proc/sys/kernel/random/boot_id",
+			"bash",
+		);
+		expect(before.result.status).toBe("ok");
+		const bootBefore = before.reply.text.trim();
+
 		const timeout = await call("echo started; sleep 60", "bash", { timeoutMs: 3000 });
 		expect(timeout.result.status).toBe("timeout");
 		expect(timeout.result.elapsedMs).toBeLessThan(15_000);
 		expect(timeout.reply.text).toContain("started");
-		expect(timeout.reply.text).toContain("exec did not finish in 3 s.");
+		expect(timeout.reply.text).toContain("run_code did not finish in 3 s.");
+		expect(await containersOf(session.sessionId)).toEqual([]);
+		expect(runtime.owned.size).toBe(0);
+
+		const after = await call("cat /work/timeout-check.txt && cat /proc/sys/kernel/random/boot_id", "bash");
+		expect(after.result.status).toBe("ok");
+		const [persisted, bootAfter] = after.reply.text.trim().split("\n");
+		expect(persisted).toBe("survived-timeout");
+		expect(bootAfter).not.toBe(bootBefore);
+
 		const controller = new AbortController();
 		setTimeout(() => controller.abort(), 1500);
 		const cancelled = await call("sleep 60", "bash", {}, controller.signal);
@@ -216,6 +309,49 @@ describe.skipIf(!REAL)("exec on the real runtime", () => {
 		expect(cancelled.result.elapsedMs).toBeLessThan(15_000);
 		expect(await containersOf(session.sessionId)).toEqual([]);
 		expect(runtime.owned.size).toBe(0);
+	}, 90_000);
+
+	it("collapses the VM in <1 s when the parent process is killed with SIGKILL", async () => {
+		const name = `polar-sandbox-kill9-${session.sessionId}`;
+		const args = sandboxArguments(runtime, name);
+		const parent = spawn(
+			process.execPath,
+			[
+				"-e",
+				`
+				import { spawn } from "child_process";
+				const child = spawn("container", ${JSON.stringify(args)}, { stdio: ["pipe", "pipe", "pipe"] });
+				child.stdout.once("data", () => process.stdout.write("READY\\n"));
+				setInterval(() => {}, 1000);
+				`,
+			],
+			{ stdio: ["ignore", "pipe", "pipe"] },
+		);
+		try {
+			await new Promise<void>((resolve, reject) => {
+				parent.stdout.on("data", (chunk: Buffer) => {
+					if (chunk.toString("utf8").includes("READY")) resolve();
+				});
+				parent.once("exit", (code) => reject(new Error(`parent exited early: ${code}`)));
+			});
+			expect(await isRunning(name)).toBe(true);
+
+			const killedAt = performance.now();
+			process.kill(parent.pid as number, "SIGKILL");
+			while (await isRunning(name)) {
+				if (performance.now() - killedAt > 2000) break;
+				await sleep(20);
+			}
+			const elapsedMs = performance.now() - killedAt;
+			timings.push({ step: "collapse after parent SIGKILL", ms: Math.round(elapsedMs) });
+			expect(elapsedMs).toBeLessThan(1000);
+			expect(await isRunning(name)).toBe(false);
+		} finally {
+			try {
+				process.kill(parent.pid as number, "SIGKILL");
+			} catch {}
+			await containerCommand(runtime, ["delete", "--force", name]);
+		}
 	}, 60_000);
 
 	it("reports exit codes, tracebacks and the process limit", async () => {
@@ -223,7 +359,7 @@ describe.skipIf(!REAL)("exec on the real runtime", () => {
 		expect(failed.result).toMatchObject({ status: "failed", exitCode: 1 });
 		expect(failed.result.inspection?.state).toBe("present");
 		expect(failed.reply.text).not.toContain("[The container");
-		expect(failed.reply.text).toContain("[exec failed: exit 1]");
+		expect(failed.reply.text).toContain("[run_code failed: exit 1]");
 		expect(failed.reply.text).toMatch(/\[stderr\]\nTraceback[\s\S]*ValueError: boom\n\[\/stderr\]/);
 		const procs = await call(
 			"import subprocess\nps = []\nfailed = 0\nfor i in range(200):\n    try:\n        ps.append(subprocess.Popen(['sleep', '30']))\n    except BlockingIOError:\n        failed += 1\nprint(len(ps) < 200, failed > 0)\nfor p in ps:\n    p.kill()",
@@ -232,7 +368,7 @@ describe.skipIf(!REAL)("exec on the real runtime", () => {
 	}, 60_000);
 
 	it("reads the labels of containers and volumes from list and inspect", async () => {
-		const name = `polar-exec-${session.sessionId}-998`;
+		const name = `polar-sandbox-${session.sessionId}-998`;
 		await sleeper(name);
 		const [listed] = (await listing()).filter((container) => container.name === name);
 		expect(listed.labels).toMatchObject({ "polar-session": session.sessionId, "polar-root": root });
@@ -249,7 +385,11 @@ describe.skipIf(!REAL)("exec on the real runtime", () => {
 	}, 60_000);
 
 	it("confirms kill and delete --force through the listing", async () => {
-		const name = `polar-exec-${session.sessionId}-997`;
+		const hot = runtime.activeSandbox.current;
+		runtime.activeSandbox.current = undefined;
+		if (hot !== undefined) await hot.destroy(Date.now() + 30_000);
+
+		const name = `polar-sandbox-${session.sessionId}-997`;
 		await sleeper(name);
 		const killed = await timed("kill", () => containerCommand(runtime, ["kill", name]));
 		expect(killed.code, killed.stderr).toBe(0);
@@ -260,7 +400,7 @@ describe.skipIf(!REAL)("exec on the real runtime", () => {
 	}, 60_000);
 
 	it("removes the leftovers of the session at start", async () => {
-		const name = `polar-exec-${session.sessionId}-999`;
+		const name = `polar-sandbox-${session.sessionId}-999`;
 		await sleeper(name);
 		expect(await containersOf(session.sessionId)).toEqual([name]);
 		expect(await timed("recovery", () => recoverLeftovers(runtime, warn))).toEqual({ clean: true });
@@ -286,7 +426,7 @@ describe.skipIf(!REAL)("exec on the real runtime", () => {
 			const { runtime: refused, readiness } = await startedRuntime(foreignHandle);
 			expect(readiness).toEqual({
 				ready: false,
-				message: `exec is off: the volume ${volume} is not this session's: its polar-root label is /elsewhere, expected ${root}`,
+				message: `sandbox is off: the volume ${volume} is not this session's: its polar-root label is /elsewhere, expected ${root}`,
 				leftovers: [],
 			});
 			expect(refused.state).toBe("unready");
@@ -306,7 +446,7 @@ describe.skipIf(!REAL)("exec on the real runtime", () => {
 		const { runtime: closing, readiness } = await startedRuntime(ownHandle);
 		try {
 			expect(readiness).toEqual({ ready: true });
-			const request: ExecRequest = { language: "bash", code: "echo started; sleep 60" };
+			const request: SandboxRequest = { language: "bash", code: "echo started; sleep 60" };
 			const admitted = admitCall(closing, request, undefined, "call-1");
 			if (admitted === undefined) throw new Error("the call was not admitted");
 			const finished = admitted

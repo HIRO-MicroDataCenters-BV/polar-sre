@@ -1,6 +1,6 @@
 # Extensions Architecture
 
-Polar extensions provide a modular toolset for agentic SRE diagnostics. Producer extensions collect read-only telemetry and state; `files` and `exec` inspect and process saved outputs across a shared filesystem bus (**Artifact Bus**).
+Polar extensions provide a modular toolset for agentic SRE diagnostics. Producer extensions collect read-only telemetry and state; `files` and `sandbox` inspect and process saved outputs across a shared filesystem bus (**Artifact Bus**).
 
 ---
 
@@ -10,7 +10,7 @@ Polar extensions provide a modular toolset for agentic SRE diagnostics. Producer
 |---|---|
 | Create or modify a read-only producer (`k8s`, `loki`, `grafana`, ...) | 1. [`shared/PRODUCER.md`](shared/PRODUCER.md)<br>2. `<producer>/ARCHITECTURE.md`<br>3. [`shared/ARTIFACT-BUS.md`](shared/ARTIFACT-BUS.md) (when working on artifact mode, quotas, or the manifest) |
 | Modify session locking, quotas, `manifest.jsonl`, or the `files` extension | 1. [`shared/ARTIFACT-BUS.md`](shared/ARTIFACT-BUS.md) |
-| Modify the `exec` VM sandbox | 1. [`exec/ARCHITECTURE.md`](exec/ARCHITECTURE.md)<br>2. [`shared/ARTIFACT-BUS.md`](shared/ARTIFACT-BUS.md) |
+| Modify the `sandbox` VM extension | 1. [`sandbox/ARCHITECTURE.md`](sandbox/ARCHITECTURE.md)<br>2. [`shared/ARTIFACT-BUS.md`](shared/ARTIFACT-BUS.md) |
 
 When creating any new extension directory `packages/coding-agent/src/polar/<name>/`, register it in `packages/coding-agent/src/extensions/index.ts` (`polarBuiltInExtensions`); it is then automatically included in `POLAR_DEFAULT_EXTENSION_SPECIFIERS` (`builtin:<name>`).
 
@@ -34,11 +34,12 @@ When creating any new extension directory `packages/coding-agent/src/polar/<name
                 │                              │
                 ▼                              ▼
        ┌─────────────────┐            ┌─────────────────┐
-       │      files      │            │      exec       │
-       │ • list_files    │            │ • /data:ro      │
-       │ • read gate     │            │ • /work volume  │
-       │   (<= 16 MiB,   │            │ • Python & CLI  │
-       │    *.txt only)  │            │   analytics VM  │
+       │      files      │            │     sandbox     │
+       │ • list_files    │            │ • run_code      │
+       │ • read gate     │            │ • /data:ro      │
+       │   (<= 16 MiB,   │            │ • /work volume  │
+       │    *.txt only)  │            │ • Python & CLI  │
+       │                 │            │   analytics VM  │
        └─────────────────┘            └─────────────────┘
              [ Artifact Consumers & Analysis ]
 ```
@@ -51,8 +52,8 @@ When creating any new extension directory `packages/coding-agent/src/polar/<name
    Provides `list_files` over `manifest.jsonl` and restricts Pi's built-in `read` tool to `.txt` files inside the active session directory up to `16 MiB`.
 3. **`<producer>/` (`k8s`, `loki`, `grafana`, ...)**
    Standalone, deterministic, read-only toolsets. Each producer validates structured tool parameters, streams output into `shared/store.ts`, and formats replies through `shared/reply.ts`.
-4. **`exec/` (Local VM Sandbox)**
-   An isolated Linux VM (`container` CLI) with Python and CLI analytics tools. Mounts the session artifact directory read-only at `/data` and a persistent per-session volume at `/work`. Writes its own large `stdout`/`stderr` outputs to the Artifact Bus.
+4. **`sandbox/` (Local VM Sandbox)**
+   An isolated Linux VM (`container` CLI via `SandboxDriver`) with Python and CLI analytics tools, exposed as the `run_code` tool. Mounts the session artifact directory read-only at `/data` and a persistent per-session volume at `/work`. Keeps a hot sandbox VM per session (lazily started on the first `run_code` call and scrubbed after each call) and writes its own large `stdout`/`stderr` outputs to the Artifact Bus.
 
 ---
 
@@ -108,19 +109,20 @@ packages/coding-agent/src/polar/
 │   │   └── tools/                   # One file per ToolSpec
 │   └── test/
 │
-├── exec/                            # Isolated local VM sandbox extension
+├── sandbox/                         # Isolated local VM sandbox extension (`run_code`)
 │   ├── ARCHITECTURE.md              # VM sandbox architecture and internal layer boundaries
-│   ├── index.ts                     # --exec-image flag, startup readiness, shutdown, tool registration
+│   ├── index.ts                     # --sandbox-image flag, startup readiness, shutdown, tool registration
 │   ├── image/
 │   │   ├── Containerfile
 │   │   ├── requirements.in
 │   │   └── requirements.txt
 │   ├── src/
 │   │   ├── types.ts
-│   │   ├── cli.ts                   # Layer 1: Stateless `container` CLI execution and JSON parsing
-│   │   ├── workspace.ts             # Layer 2: Readiness check, orphan container/volume GC, /work volume setup
-│   │   ├── runner.ts                # Layer 3: Single `container run` supervision, OOM boot-log check, container cleanup
-│   │   └── reply.ts                 # Sandbox reply formatting (with OOM, inspection, and cleanup notices)
+│   │   ├── cli.ts                   # Layer 1: Stateless CLI execution, JSON parsing, container cleanup
+│   │   ├── driver.ts                # Layer 2: `SandboxDriver` / `HotSandbox` contract and `AppleContainerDriver`
+│   │   ├── workspace.ts             # Layer 3: Readiness check, orphan container/volume GC, /work volume setup
+│   │   ├── runner.ts                # Layer 4: Lazy hot VM lifecycle, `spawnCall` supervision, OOM delta check, scrub
+│   │   └── reply.ts                 # Layer 5: Sandbox reply formatting (with OOM, inspection, and cleanup notices)
 │   └── test/
 │
 └── test/                            # Cross-extension architectural tests
@@ -135,17 +137,17 @@ packages/coding-agent/src/polar/
 Enforced by `test/independence.test.ts` and `test/composition.test.ts`:
 
 1. **Import Graph**
-   - `files/`, `exec/`, and `<producer>/` import only from `../shared/*`, host types/utilities in `packages/coding-agent/src/` (`../../config.ts`, `../../core/*`, `../../modes/*`), Node built-ins, and declared npm packages.
+   - `files/`, `sandbox/`, and `<producer>/` import only from `../shared/*`, host types/utilities in `packages/coding-agent/src/` (`../../config.ts`, `../../core/*`, `../../modes/*`), Node built-ins, and declared npm packages.
    - `shared/` imports only from `./*`, host types/utilities in `packages/coding-agent/src/` (`../../core/*`), Node built-ins, and declared npm packages.
    - Cross-extension imports are prohibited.
 2. **Built-in Extension Registration**
    - Every Polar extension directory under `packages/coding-agent/src/polar/<name>/` must be registered in `polarBuiltInExtensions` (`packages/coding-agent/src/extensions/index.ts`) with `builtin: true` and exposed in `POLAR_DEFAULT_EXTENSION_SPECIFIERS` as `builtin:<name>` (verified by `every Polar extension directory is registered as a built-in extension` in `test/independence.test.ts`).
 3. **Extension Isolation**
    - Extensions do not call `getActiveTools` or inspect which other extensions are loaded.
-   - Tool names, descriptions, prompt snippets, prompt guidelines, parameter descriptions, status lines, notices, and replies of an extension do not reference tool names belonging to other extensions (`list_files`, `exec`, `k8s_*`, `loki_*`, etc.).
-   - Producers reference saved files by their full path in the session directory and may mention Pi's built-in `read` tool. Only `exec` references `/data/<file>`.
+   - Tool names, descriptions, prompt snippets, prompt guidelines, parameter descriptions, status lines, notices, and replies of an extension do not reference tool names belonging to other extensions (`list_files`, `run_code`, `k8s_*`, `loki_*`, etc.).
+   - Producers reference saved files by their full path in the session directory and may mention Pi's built-in `read` tool. Only `sandbox` references `/data/<file>`.
 4. **Graceful Disablement**
-   - Missing or incomplete operator configuration at `session_start` notifies the operator, sets a footer status (for example, `kubeconfig: off, run /kubeconfig` for `k8s`, or sets no footer status at all, as in `exec`), acquires no session lock, and leaves that extension's tools unregistered while the session and other extensions continue normally.
+   - Missing or incomplete operator configuration at `session_start` notifies the operator, sets a footer status (for example, `kubeconfig: off, run /kubeconfig` for `k8s`, or sets no footer status at all, as in `sandbox`), acquires no session lock, and leaves that extension's tools unregistered while the session and other extensions continue normally.
    - Producer extensions may support deferred activation and live target switching during the session via an operator command.
 5. **Streaming Output**
    - Primary output streams directly into an `OpenFile.sink` managed by `shared/store.ts` rather than buffering full payloads in memory.

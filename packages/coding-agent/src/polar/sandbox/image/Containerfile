@@ -1,7 +1,7 @@
-# The guest environment of the exec tool: Debian 13 with Python 3.13, the Python kit from requirements.txt
+# The guest environment of the run_code tool: Debian 13 with Python 3.13, the Python kit from requirements.txt
 # and the CLI kit. Built for linux/arm64; the yq and duckdb downloads below are arm64 binaries.
 # Build (from this directory):
-#   container build --arch arm64 --tag polar-exec:0.2 --file Containerfile .
+#   container build --arch arm64 --tag polar-sandbox:0.1 --file Containerfile .
 # Versions of everything inside the image are listed in /README.md of the image.
 FROM python:3.13-slim@sha256:70729b46c69b4f1e97c4822c1af3df53a1476cf5ddc6c087c0c10bc3a5678c2f
 
@@ -36,7 +36,7 @@ RUN useradd --uid 1000 --user-group --home-dir /work --no-create-home --shell /b
 	&& chown polar:polar /work
 
 RUN { \
-	echo "# polar-exec image"; \
+	echo "# polar-sandbox image"; \
 	echo; echo "Debian: $(. /etc/os-release && echo "$PRETTY_NAME")"; \
 	echo "Python: $(python3 --version)"; \
 	echo; echo "## Python packages"; echo; pip freeze; \

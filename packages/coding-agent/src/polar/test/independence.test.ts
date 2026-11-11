@@ -86,7 +86,7 @@ describe("independence", () => {
 	});
 
 	it("every Polar extension directory is registered as a built-in extension", () => {
-		expect(EXTENSIONS).toEqual(["exec", "files", "k8s"]);
+		expect(EXTENSIONS).toEqual(["files", "k8s", "sandbox"]);
 		expect(polarBuiltInExtensions.map((ext) => ext.name).sort()).toEqual(EXTENSIONS);
 		expect(polarBuiltInExtensions.every((ext) => ext.builtin === true)).toBe(true);
 		expect([...POLAR_DEFAULT_EXTENSION_SPECIFIERS].sort()).toEqual(EXTENSIONS.map((name) => `builtin:${name}`));

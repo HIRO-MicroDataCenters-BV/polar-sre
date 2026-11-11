@@ -14,27 +14,27 @@ import type {
 	ToolDefinition,
 	ToolLoadout,
 } from "../../core/extensions/types.ts";
-import execExtension from "../exec/index.ts";
 import filesExtension from "../files/index.ts";
 import k8sExtension from "../k8s/index.ts";
+import sandboxExtension from "../sandbox/index.ts";
 
-type ExtensionName = "files" | "k8s" | "exec";
+type ExtensionName = "files" | "k8s" | "sandbox";
 type EventHandler = (event: object, ctx: ExtensionContext) => unknown;
 type Text = [origin: string, text: string];
 
 const FACTORIES: Record<ExtensionName, (pi: ExtensionAPI) => void> = {
 	files: filesExtension,
 	k8s: k8sExtension,
-	exec: execExtension,
+	sandbox: sandboxExtension,
 };
 
 const FAKES = {
-	container: fileURLToPath(new URL("../exec/test/fake-container.mjs", import.meta.url)),
+	container: fileURLToPath(new URL("../sandbox/test/fake-container.mjs", import.meta.url)),
 	kubectl: fileURLToPath(new URL("../k8s/test/fake-kubectl.mjs", import.meta.url)),
 };
 const K8S_FLAGS = { "k8s-kubeconfig": "/tmp/kc", "k8s-context": "staging" };
 const K8S_TOOLS = ["k8s_get", "k8s_events", "k8s_logs", "k8s_describe", "k8s_inspect"];
-const TOOLS: Record<ExtensionName, string[]> = { files: ["list_files"], k8s: K8S_TOOLS, exec: ["exec"] };
+const TOOLS: Record<ExtensionName, string[]> = { files: ["list_files"], k8s: K8S_TOOLS, sandbox: ["run_code"] };
 const READ_TOOL = { name: "read", description: "Read the contents of a file." };
 const LARGE_FILE = "k8s_logs-9.txt";
 const LARGE_FILE_BYTES = 17 * 1024 * 1024;
@@ -47,7 +47,7 @@ const SAVED_VARIABLES = [
 ];
 const POD_COUNT = 2500;
 const PODS = Array.from({ length: POD_COUNT }, (_, index) => `web-${index + 1} 1/1 Running\n`).join("");
-const EXEC_LINE_COUNT = 3000;
+const RUN_CODE_LINE_COUNT = 3000;
 const LONG_LINE_BYTES = 60_000;
 
 interface LoadedExtension {
@@ -68,7 +68,7 @@ interface Session {
 
 interface StartOptions {
 	cwd?: string;
-	execOff?: boolean;
+	sandboxOff?: boolean;
 }
 
 interface ToolTexts {
@@ -149,7 +149,7 @@ async function emit(session: Session, extension: LoadedExtension, event: { type:
 async function startSession(
 	names: ExtensionName[],
 	flagValues: Record<string, string> = K8S_FLAGS,
-	{ cwd = process.cwd(), execOff = false }: StartOptions = {},
+	{ cwd = process.cwd(), sandboxOff = false }: StartOptions = {},
 ) {
 	const id = randomUUID();
 	const notices: [string, string | undefined][] = [];
@@ -174,9 +174,9 @@ async function startSession(
 	for (const extension of session.extensions) {
 		await emit(session, extension, { type: "session_start", reason: "startup" });
 	}
-	if (names.includes("exec")) {
-		const started = toolNames(session).includes("exec");
-		expect(started, `exec started: ${started}; notices: ${JSON.stringify(notices)}`).toBe(!execOff);
+	if (names.includes("sandbox")) {
+		const started = toolNames(session).includes("run_code");
+		expect(started, `sandbox started: ${started}; notices: ${JSON.stringify(notices)}`).toBe(!sandboxOff);
 	}
 	return session;
 }
@@ -346,11 +346,11 @@ async function k8sAlone(): Promise<Session[]> {
 	return [k8s, off];
 }
 
-async function execAlone(): Promise<Session[]> {
-	const exec = await startSession(["exec"]);
-	const run = (code: string) => callTool(exec, "exec", { language: "bash", code });
-	savedFileOf(exec, await run(`stdout_lines:${EXEC_LINE_COUNT}`));
-	savedFileOf(exec, await run(`stdout_bytes:${LONG_LINE_BYTES}`));
+async function sandboxAlone(): Promise<Session[]> {
+	const sandbox = await startSession(["sandbox"]);
+	const run = (code: string) => callTool(sandbox, "run_code", { language: "bash", code });
+	savedFileOf(sandbox, await run(`stdout_lines:${RUN_CODE_LINE_COUNT}`));
+	savedFileOf(sandbox, await run(`stdout_bytes:${LONG_LINE_BYTES}`));
 	for (const code of ["exit:0", "exit:3", "exit137", "oom"]) await run(code);
 	await run(" ");
 	await installFake("container", { RUN_FAILS: "1" });
@@ -358,30 +358,30 @@ async function execAlone(): Promise<Session[]> {
 	await installFake("container", { INSPECT_MISSING: "1", DELETE_FAIL: "1", LIST_GARBAGE: "1" });
 	await run("exit:3");
 	await run("stdout:never");
-	await shutDown(exec);
+	await shutDown(sandbox);
 	await run("stdout:never");
-	expect(exec.replies.map(([, reply]) => reply.split("\n", 1)[0])).toEqual([
-		`[exec ok] bash: stdout_lines:${EXEC_LINE_COUNT}`,
-		`[exec ok] bash: stdout_bytes:${LONG_LINE_BYTES}`,
-		"[exec ok] bash: exit:0",
-		"[exec failed: exit 3] bash: exit:3",
-		"[exec failed: exit 137] bash: exit137",
-		"[exec out_of_memory] bash: oom",
+	expect(sandbox.replies.map(([, reply]) => reply.split("\n", 1)[0])).toEqual([
+		`[run_code ok] bash: stdout_lines:${RUN_CODE_LINE_COUNT}`,
+		`[run_code ok] bash: stdout_bytes:${LONG_LINE_BYTES}`,
+		"[run_code ok] bash: exit:0",
+		"[run_code failed: exit 3] bash: exit:3",
+		"[run_code failed: exit 137] bash: exit137",
+		"[run_code out_of_memory] bash: oom",
 		'Invalid parameter "code": the program is empty.',
-		"[exec failed: exit 1] bash: stdout:never",
-		"[exec failed: exit 3] bash: exit:3",
-		"[exec runtime_failed] bash: stdout:never",
-		"[exec runtime_failed] bash: stdout:never",
+		"[run_code runtime_failed] bash: stdout:never",
+		"[run_code failed: exit 3] bash: exit:3",
+		"[run_code runtime_failed] bash: stdout:never",
+		"[run_code runtime_failed] bash: stdout:never",
 	]);
 	await installFake("container", { IMAGE_MISSING: "1" });
-	const off = await startSession(["exec"], K8S_FLAGS, { execOff: true });
+	const off = await startSession(["sandbox"], K8S_FLAGS, { sandboxOff: true });
 	await shutDown(off);
-	return [exec, off];
+	return [sandbox, off];
 }
 
 describe("extension composition", () => {
 	it("the read policy is the same for every set and order", async () => {
-		const sets: ExtensionName[][] = [["files"], ["files", "k8s"], ["files", "exec"], ["files", "k8s", "exec"]];
+		const sets: ExtensionName[][] = [["files"], ["files", "k8s"], ["files", "sandbox"], ["files", "k8s", "sandbox"]];
 		const readDescriptions: [string, string | undefined][] = [];
 		for (const set of sets) {
 			for (const order of [set, [...set].reverse()]) {
@@ -397,19 +397,19 @@ describe("extension composition", () => {
 	});
 
 	it("an extension's texts do not change with another extension", async () => {
-		const k8sWithoutExec = await startSession(["files", "k8s"]);
-		const execWithoutK8s = await startSession(["files", "exec"]);
-		const all = await startSession(["files", "k8s", "exec"]);
+		const k8sWithoutSandbox = await startSession(["files", "k8s"]);
+		const sandboxWithoutK8s = await startSession(["files", "sandbox"]);
+		const all = await startSession(["files", "k8s", "sandbox"]);
 
-		expect(toolTexts(all, K8S_TOOLS)).toEqual(toolTexts(k8sWithoutExec, K8S_TOOLS));
-		expect(toolTexts(all, ["exec"])).toEqual(toolTexts(execWithoutK8s, ["exec"]));
+		expect(toolTexts(all, K8S_TOOLS)).toEqual(toolTexts(k8sWithoutSandbox, K8S_TOOLS));
+		expect(toolTexts(all, ["run_code"])).toEqual(toolTexts(sandboxWithoutK8s, ["run_code"]));
 	});
 
 	it("an extension's texts name no other extension", async () => {
 		const texts: Record<ExtensionName, Text[]> = {
 			files: (await filesAlone()).flatMap(textsOf),
 			k8s: (await k8sAlone()).flatMap(textsOf),
-			exec: (await execAlone()).flatMap(textsOf),
+			sandbox: (await sandboxAlone()).flatMap(textsOf),
 		};
 		for (const extension of Object.keys(TOOLS) as ExtensionName[]) {
 			for (const name of TOOLS[extension]) {
@@ -422,11 +422,11 @@ describe("extension composition", () => {
 	});
 
 	it("a k8s configuration error disables only k8s", async () => {
-		const session = await startSession(["files", "k8s", "exec"], {});
+		const session = await startSession(["files", "k8s", "sandbox"], {});
 
 		expect(session.shutdown).not.toHaveBeenCalled();
 		expect(session.extensions.find((extension) => extension.name === "k8s")?.tools).toEqual([]);
-		expect(toolNames(session)).toEqual(["list_files", "exec"]);
+		expect(toolNames(session)).toEqual(["list_files", "run_code"]);
 		await expectReadPolicy(session);
 		expect(session.notices).toContainEqual(["kubeconfig: no context selected, run /kubeconfig to select", "warning"]);
 	});
@@ -438,13 +438,16 @@ describe("extension composition", () => {
 		const k8sReply = await callTool(k8s, "k8s_get", { resource: "pods" });
 		savedFileOf(k8s, k8sReply);
 		expect(k8sReply).not.toMatch(/\blist_files\b/);
-		expect(k8sReply).not.toMatch(/\bexec\b/);
+		expect(k8sReply).not.toMatch(/\brun_code\b/);
 
-		const exec = await startSession(["exec"]);
-		const execReply = await callTool(exec, "exec", { language: "bash", code: `stdout_lines:${EXEC_LINE_COUNT}` });
-		savedFileOf(exec, execReply);
-		expect(execReply).not.toMatch(/\bk8s_/);
-		expect(execReply).not.toMatch(/\blist_files\b/);
+		const sandbox = await startSession(["sandbox"]);
+		const sandboxReply = await callTool(sandbox, "run_code", {
+			language: "bash",
+			code: `stdout_lines:${RUN_CODE_LINE_COUNT}`,
+		});
+		savedFileOf(sandbox, sandboxReply);
+		expect(sandboxReply).not.toMatch(/\bk8s_/);
+		expect(sandboxReply).not.toMatch(/\blist_files\b/);
 
 		const withFiles = await startSession(["files", "k8s"]);
 		const path = savedFileOf(withFiles, await callTool(withFiles, "k8s_get", { resource: "pods" }));
@@ -472,11 +475,11 @@ describe("extension composition", () => {
 
 	it("producers start without files", async () => {
 		const k8s = await startSession(["k8s"]);
-		const exec = await startSession(["exec"]);
+		const sandbox = await startSession(["sandbox"]);
 
 		expect(toolNames(k8s)).toEqual(K8S_TOOLS);
-		expect(toolNames(exec)).toEqual(["exec"]);
-		for (const session of [k8s, exec]) {
+		expect(toolNames(sandbox)).toEqual(["run_code"]);
+		for (const session of [k8s, sandbox]) {
 			const events = session.extensions.flatMap((extension) => [...extension.handlers.keys()]);
 			expect(events, labelOf(session)).not.toContain("tool_call");
 			await shutDown(session);

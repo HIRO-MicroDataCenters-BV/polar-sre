@@ -19,7 +19,7 @@ let handle: SessionHandle;
 let state: FakeState;
 
 beforeEach(async () => {
-	root = await mkdtemp(join(tmpdir(), "exec-cli-"));
+	root = await mkdtemp(join(tmpdir(), "sandbox-cli-"));
 	handle = await acquireSession("current", root, root);
 	state = await fakeState();
 });
@@ -33,36 +33,38 @@ afterEach(async () => {
 describe("cli", () => {
 	it("runs a CLI command with the timeout and keeps captured stderr when it times out", async () => {
 		const runtime = fakeRuntime(state, handle);
-		const inspected = await containerCommand(runtime, ["image", "inspect", "polar-exec:test"]);
+		const inspected = await containerCommand(runtime, ["image", "inspect", "polar-sandbox:test"]);
 		expect(inspected).toEqual({
 			code: 0,
-			stdout: '[{"id":"polar-exec:test"}]\n',
+			stdout: '[{"id":"polar-sandbox:test"}]\n',
 			stderr: "",
 			timedOut: false,
 		});
 		expect(runtime.children.size).toBe(0);
 
 		const hanging = fakeRuntime(state, handle, { DELETE_HANG: "1" }, { commandTimeoutMs: 250 });
-		const outcome = await containerCommand(hanging, ["delete", "--force", "polar-exec-current-1-deadbeef"]);
+		const outcome = await containerCommand(hanging, ["delete", "--force", "polar-sandbox-current-1-deadbeef"]);
 		expect(outcome).toMatchObject({ code: null, timedOut: true });
 		expect(hanging.children.size).toBe(0);
 
 		const timedOut = (stderr: string) => commandFailure({ code: null, stdout: "", stderr, timedOut: true });
 		expect(timedOut("")).toBe("timed out");
 		expect(timedOut("Error: original runtime failure\n")).toBe("timed out; stderr: Error: original runtime failure");
-		expect(timedOut("x".repeat(5000))).toBe(`timed out; stderr: ${"x".repeat(4096)} [904 more bytes not shown]`);
+		expect(timedOut("x".repeat(5000))).toBe(
+			`timedOut; stderr: ${"x".repeat(4096)} [904 more bytes not shown]`.replace("timedOut", "timed out"),
+		);
 	});
 
 	it("parses list, inspect, and volume JSON and does not take a failed or unreadable listing as an empty one", async () => {
 		const labels = { "polar-session": "current", "polar-root": root };
-		await state.addContainer("polar-exec-current-1-aaaaaaaa", labels);
+		await state.addContainer("polar-sandbox-current-1-aaaaaaaa", labels);
 		await state.addVolume("polar-work-current", labels);
 		const runtime = fakeRuntime(state, handle);
 
 		const listed = await containerCommand(runtime, ["list", "--all", "--format", "json"]);
-		expect(parseContainers(listed.stdout)).toEqual([{ name: "polar-exec-current-1-aaaaaaaa", labels }]);
-		const inspected = await containerCommand(runtime, ["inspect", "polar-exec-current-1-aaaaaaaa"]);
-		expect(parseContainers(inspected.stdout)).toEqual([{ name: "polar-exec-current-1-aaaaaaaa", labels }]);
+		expect(parseContainers(listed.stdout)).toEqual([{ name: "polar-sandbox-current-1-aaaaaaaa", labels }]);
+		const inspected = await containerCommand(runtime, ["inspect", "polar-sandbox-current-1-aaaaaaaa"]);
+		expect(parseContainers(inspected.stdout)).toEqual([{ name: "polar-sandbox-current-1-aaaaaaaa", labels }]);
 		const volumes = await containerCommand(runtime, ["volume", "list", "--format", "json"]);
 		expect(parseVolumes(volumes.stdout)).toEqual([{ name: "polar-work-current", labels }]);
 
@@ -76,36 +78,36 @@ describe("cli", () => {
 		for (const [knob, value, said] of forms) {
 			const form = `${knob}=${value}`;
 			const broken = fakeRuntime(state, handle, { DELETE_GHOST: "1", [knob]: value });
-			const outcome = await cleanupContainer(broken, "polar-exec-current-9-deadbeef", deadlineAfter(broken));
+			const outcome = await cleanupContainer(broken, "polar-sandbox-current-9-deadbeef", deadlineAfter(broken));
 			expect(outcome, form).toEqual({
 				removed: false,
 				error: {
-					container: "polar-exec-current-9-deadbeef",
+					container: "polar-sandbox-current-9-deadbeef",
 					message: `delete: Error: delete reported an error after the container went; list: ${said}`,
 				},
 			});
-			expect(broken.owned, form).toEqual(new Set(["polar-exec-current-9-deadbeef"]));
+			expect(broken.owned, form).toEqual(new Set(["polar-sandbox-current-9-deadbeef"]));
 		}
 	});
 
 	it("releases a name on delete or confirmed absence and keeps ownership and the runtime's message otherwise", async () => {
 		const runtime = fakeRuntime(state, handle);
-		await state.addContainer("polar-exec-current-1-aaaaaaaa", { "polar-session": "current", "polar-root": root });
-		expect(await cleanupContainer(runtime, "polar-exec-current-1-aaaaaaaa", deadlineAfter(runtime))).toEqual({
+		await state.addContainer("polar-sandbox-current-1-aaaaaaaa", { "polar-session": "current", "polar-root": root });
+		expect(await cleanupContainer(runtime, "polar-sandbox-current-1-aaaaaaaa", deadlineAfter(runtime))).toEqual({
 			removed: true,
 		});
 		expect(runtime.owned.size).toBe(0);
 		expect(await state.containers()).toEqual([]);
 
-		await state.addContainer("polar-exec-current-2-bbbbbbbb", { "polar-session": "current", "polar-root": root });
+		await state.addContainer("polar-sandbox-current-2-bbbbbbbb", { "polar-session": "current", "polar-root": root });
 		const ghost = fakeRuntime(state, handle, { DELETE_GHOST: "1" });
-		expect(await cleanupContainer(ghost, "polar-exec-current-2-bbbbbbbb", deadlineAfter(ghost))).toEqual({
+		expect(await cleanupContainer(ghost, "polar-sandbox-current-2-bbbbbbbb", deadlineAfter(ghost))).toEqual({
 			removed: true,
 		});
 		expect(ghost.owned.size).toBe(0);
 		expect((await state.calls()).slice(-2).map((call) => call[0])).toEqual(["delete", "list"]);
 
-		const name = "polar-exec-current-3-cccccccc";
+		const name = "polar-sandbox-current-3-cccccccc";
 		await state.addContainer(name, { "polar-session": "current", "polar-root": root });
 		const said = "runtime temporarily unavailable\ndetail: the daemon is restarting";
 		const spoke = fakeRuntime(state, handle, { DELETE_FAIL: "1", DELETE_FAIL_MESSAGE: said });
@@ -138,7 +140,7 @@ describe("cli", () => {
 	});
 
 	it("gives up within the shared deadline when the delete hangs", async () => {
-		const name = "polar-exec-current-9-deadbeef";
+		const name = "polar-sandbox-current-9-deadbeef";
 		const expired = fakeRuntime(state, handle);
 		expect(await cleanupContainer(expired, name, Date.now() - 1)).toEqual({
 			removed: false,

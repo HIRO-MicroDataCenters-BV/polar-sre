@@ -163,9 +163,9 @@ describe("acquireSession", () => {
 		const directory = join(root, "current");
 		await mkdir(directory, { recursive: true });
 		await writeFile(join(directory, "k8s_get-3.txt"), "pods\n");
-		await writeFile(join(directory, "exec-7.truncated.txt"), "rows\n");
+		await writeFile(join(directory, "run_code-7.truncated.txt"), "rows\n");
 		await writeFile(join(directory, "k8s_inspect-9.bin"), Buffer.from([1, 2, 3, 4]));
-		await writeFile(join(directory, "exec-12.part"), "partial");
+		await writeFile(join(directory, "run_code-12.part"), "partial");
 		await writeFile(join(directory, "notes-20.md"), "operator notes");
 
 		const creator = await acquireSession("current", "/w", root);
