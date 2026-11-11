@@ -30,6 +30,7 @@ function checkSource(source, manifest) {
 		...Object.keys(manifest.dependencies ?? {}),
 		...Object.keys(manifest.optionalDependencies ?? {}),
 		...Object.keys(manifest.peerDependencies ?? {}),
+		...(manifest.name === "polar-sre" ? Object.keys(manifest.devDependencies ?? {}) : []),
 	]);
 
 	function checkSpecifier(node) {

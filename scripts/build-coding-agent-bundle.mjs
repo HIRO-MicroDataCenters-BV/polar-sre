@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { isBuiltin } from "node:module";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -47,7 +47,13 @@ const require = createRequire(import.meta.url);
 let createJitiImpl;
 
 export function createJiti(...args) {
-	createJitiImpl ??= require("jiti").createJiti;
+	if (!createJitiImpl) {
+		try {
+			createJitiImpl = require("jiti").createJiti;
+		} catch {
+			throw new Error("External extension files are not supported; use builtin:<name>.");
+		}
+	}
 	return createJitiImpl(...args);
 }
 `,
@@ -258,6 +264,28 @@ createRequire(import.meta.url)("./cli-runtime.js");
 writeFileSync(join(bundleDir, "cli.js"), cliLauncher);
 chmodSync(join(bundleDir, "cli.js"), 0o755);
 chmodSync(join(bundleDir, "rpc-entry.js"), 0o755);
+
+const tuiNativeDir = join(repoRoot, "packages", "tui", "native");
+let copiedNativeCount = 0;
+for (const platformEntry of readdirSync(tuiNativeDir, { withFileTypes: true })) {
+	if (!platformEntry.isDirectory()) continue;
+	const prebuildsDir = join(tuiNativeDir, platformEntry.name, "prebuilds");
+	if (!existsSync(prebuildsDir)) continue;
+	for (const archEntry of readdirSync(prebuildsDir, { withFileTypes: true })) {
+		if (!archEntry.isDirectory()) continue;
+		const srcArchDir = join(prebuildsDir, archEntry.name);
+		for (const fileEntry of readdirSync(srcArchDir, { withFileTypes: true })) {
+			if (!fileEntry.isFile() || !fileEntry.name.endsWith(".node")) continue;
+			const destArchDir = join(bundleDir, "native", platformEntry.name, "prebuilds", archEntry.name);
+			mkdirSync(destArchDir, { recursive: true });
+			copyFileSync(join(srcArchDir, fileEntry.name), join(destArchDir, fileEntry.name));
+			copiedNativeCount += 1;
+		}
+	}
+}
+if (copiedNativeCount !== 6) {
+	throw new Error(`Expected 6 TUI native prebuilds, copied ${copiedNativeCount}`);
+}
 
 const files = new Set(metafiles.flatMap((metafile) => Object.keys(metafile.outputs))).size + 1;
 const mib = (outputBytes(metafiles) + cliLauncher.length) / (1024 * 1024);

@@ -14,11 +14,7 @@ const outputLockfilePath = join(outputDir, "package-lock.json");
 const internalPackagePrefix = "@earendil-works/pi-";
 const internalPackageNames = new Set(["@earendil-works/chord", "polar-sre"]);
 const installPackageName = "@earendil-works/pi-coding-agent-install";
-const allowedInstallScriptPackages = new Map([
-	["@google/genai@2.21.0", "preinstall is a no-op in the published package"],
-	["esbuild@0.28.2", "postinstall selects and verifies the platform-specific esbuild binary"],
-	["protobufjs@7.6.6", "postinstall only warns about protobufjs version scheme mismatches"],
-]);
+const allowedInstallScriptPackages = new Map();
 
 const args = new Set(process.argv.slice(2));
 const checkOnly = args.has("--check");
@@ -364,12 +360,6 @@ function validateGeneratedFiles(installerPackageJson, installLock, internalNames
 		}
 	}
 
-	const platformPackageCount = Object.values(installLock.packages).filter((entry) => entry.os || entry.cpu || entry.libc)
-		.length;
-	if (platformPackageCount === 0) {
-		errors.push("no platform-specific optional dependency entries found");
-	}
-
 	if (errors.length > 0) {
 		throw new Error(`Generated installer lock failed validation:\n${errors.map((error) => `  - ${error}`).join("\n")}`);
 	}
@@ -450,10 +440,8 @@ try {
 		writeFileSync(outputPackageJsonPath, packageJsonContent);
 		writeFileSync(outputLockfilePath, lockfileContent);
 		const packageCount = Object.keys(installLock.packages).length - 1;
-		const platformPackageCount = Object.values(installLock.packages).filter((entry) => entry.os || entry.cpu || entry.libc)
-			.length;
 		console.log(
-			`Wrote packages/coding-agent/install-lock/package.json and package-lock.json (${packageCount} packages, ${platformPackageCount} platform-specific).`,
+			`Wrote packages/coding-agent/install-lock/package.json and package-lock.json (${packageCount} packages).`,
 		);
 	}
 } catch (error) {

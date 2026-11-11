@@ -164,6 +164,7 @@ describe("AgentSession prompt characterization", () => {
 		let strictModel: Model<string> | undefined;
 		const harness = await createHarness({
 			models: [{ id: "wide" }, { id: "strict" }],
+			settings: { images: { autoResize: true, blockImages: false } },
 			extensionFactories: [
 				(pi) => {
 					pi.on("before_agent_start", async () => {

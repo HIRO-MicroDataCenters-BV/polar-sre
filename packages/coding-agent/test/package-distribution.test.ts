@@ -3,13 +3,10 @@ import { describe, expect, test } from "vitest";
 
 interface CodingAgentPackageJson {
 	bin: { polar: string };
-	main: string;
-	exports: {
-		".": { import: string; types: string };
-		"./client": { source: string };
-		"./experimental/plugin": { source: string };
-		"./rpc-entry": { import: string };
-	};
+	main?: string;
+	types?: string;
+	exports?: Record<string, unknown>;
+	dependencies: Record<string, string>;
 }
 
 const packageJson = JSON.parse(
@@ -17,16 +14,11 @@ const packageJson = JSON.parse(
 ) as CodingAgentPackageJson;
 
 describe("package distribution entrypoints", () => {
-	test("uses the bundle for executables and modular output for libraries", () => {
+	test("exposes only the bundled CLI entrypoint with zero runtime dependencies", () => {
 		expect(packageJson.bin.polar).toBe("dist/bundle/cli.js");
-		expect(packageJson.main).toBe("./dist/index.js");
-		expect(packageJson.exports["."].import).toBe("./dist/index.js");
-		expect(packageJson.exports["./rpc-entry"].import).toBe("./dist/bundle/rpc-entry.js");
-	});
-
-	// Regression for #9132: internal experimental entrypoints must not be published runtime exports.
-	test("keeps experimental exports source-only", () => {
-		expect(packageJson.exports["./client"]).toEqual({ source: "./src/client/index.ts" });
-		expect(packageJson.exports["./experimental/plugin"]).toEqual({ source: "./src/experimental/plugin.ts" });
+		expect(packageJson.main).toBeUndefined();
+		expect(packageJson.types).toBeUndefined();
+		expect(packageJson.exports).toBeUndefined();
+		expect(packageJson.dependencies).toEqual({});
 	});
 });

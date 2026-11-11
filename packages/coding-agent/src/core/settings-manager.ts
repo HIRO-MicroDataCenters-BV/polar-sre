@@ -1424,7 +1424,7 @@ export class SettingsManager {
 	}
 
 	getImageAutoResize(): boolean {
-		return this.settings.images?.autoResize ?? true;
+		return this.settings.images?.autoResize ?? false;
 	}
 
 	setImageAutoResize(enabled: boolean): void {
@@ -1437,7 +1437,7 @@ export class SettingsManager {
 	}
 
 	getBlockImages(): boolean {
-		return this.settings.images?.blockImages ?? false;
+		return this.settings.images?.blockImages ?? true;
 	}
 
 	setBlockImages(blocked: boolean): void {
