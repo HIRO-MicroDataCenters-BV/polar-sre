@@ -14,7 +14,7 @@ import type {
 } from "../../../core/extensions/types.ts";
 import { sessionPaths } from "../../shared/session.ts";
 import { finishOutputFile, openOutputFile, READ_MAX_BYTES } from "../../shared/store.ts";
-import filesExtension, { describeRead, EMPTY_NOTICE } from "../index.ts";
+import filesExtension, { describeRead, EMPTY_NOTICE, LIST_FILES_RULES } from "../index.ts";
 
 type EventHandler = (event: object, ctx: ExtensionContext) => unknown;
 
@@ -96,6 +96,7 @@ describe("files extension", () => {
 		expect(tool.parameters.properties).toEqual({});
 		expect((tool.parameters as { additionalProperties?: boolean }).additionalProperties).toBe(false);
 		expect(tool.promptSnippet).toBeDefined();
+		expect(tool.promptGuidelines).toEqual(LIST_FILES_RULES);
 		expect(tool.description).toContain("complete or truncated");
 		expect(tool.prepareLoadout).toBe(describeRead);
 	});

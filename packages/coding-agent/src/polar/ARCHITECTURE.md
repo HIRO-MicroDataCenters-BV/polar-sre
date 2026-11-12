@@ -111,7 +111,7 @@ packages/coding-agent/src/polar/
 │
 ├── sandbox/                         # Isolated local VM sandbox extension (`run_code`)
 │   ├── ARCHITECTURE.md              # VM sandbox architecture and internal layer boundaries
-│   ├── index.ts                     # --sandbox-image flag, startup readiness, shutdown, tool registration
+│   ├── index.ts                     # --sandbox-image / --sandbox-registry-image flags, startup readiness, shutdown, tool registration
 │   ├── image/
 │   │   ├── Containerfile
 │   │   ├── requirements.in
@@ -120,7 +120,7 @@ packages/coding-agent/src/polar/
 │   │   ├── types.ts                 # Domain types and `SandboxDriver` / `HotSandbox` contracts
 │   │   ├── cli.ts                   # Layer 1: Stateless CLI execution, JSON parsing, container cleanup
 │   │   ├── driver.ts                # Layer 2: `AppleContainerDriver` and `AppleHotSandbox` implementation
-│   │   ├── workspace.ts             # Layer 3: Readiness check, orphan container/volume GC, /work volume setup
+│   │   ├── workspace.ts             # Layer 3: Readiness check, image lookup/pull/build UX, orphan GC, /work volume setup
 │   │   ├── runner.ts                # Layer 4: Lazy hot VM lifecycle, `spawnCall` supervision, OOM delta check, scrub
 │   │   └── reply.ts                 # Layer 5: Sandbox reply formatting (with OOM, inspection, and cleanup notices)
 │   └── test/

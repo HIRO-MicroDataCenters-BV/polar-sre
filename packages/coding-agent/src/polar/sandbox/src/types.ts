@@ -52,6 +52,8 @@ export interface ActiveSandboxHolder {
 export interface SandboxDriverContext {
 	containerCommand: string;
 	image: string;
+	registryImage?: string;
+	customImage?: boolean;
 	limits: SandboxLimits;
 	environment: NodeJS.ProcessEnv;
 	handle: SessionHandle;

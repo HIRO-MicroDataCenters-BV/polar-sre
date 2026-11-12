@@ -25,8 +25,8 @@ const LIMITS: SandboxLimits = {
 	workMaxBytes: 4 * 1024 * 1024 * 1024,
 	processMax: 256,
 	tmpMaxBytes: 512 * 1024 * 1024,
-	fileMaxBytes: 2 * 1024 * 1024 * 1024,
-	sessionMaxBytes: 8 * 1024 * 1024 * 1024,
+	fileMaxBytes: 4 * 1024 * 1024 * 1024,
+	sessionMaxBytes: 16 * 1024 * 1024 * 1024,
 	stderrMaxBytes: 1024 * 1024,
 	killGraceMs: 2000,
 	commandTimeoutMs: 30_000,
@@ -35,13 +35,16 @@ const LIMITS: SandboxLimits = {
 	shutdownBudgetMs: 10_000,
 };
 
-export const DEFAULT_IMAGE = "polar-sandbox:0.1";
+export const DEFAULT_IMAGE = "polar-sandbox:0.2";
+export const REGISTRY_IMAGE: string | undefined = undefined;
 const PYTHON_KIT =
 	"duckdb, polars, pandas, numpy, orjson, ijson, pyyaml, jmespath, python-dateutil, ciso8601, regex, tabulate, drain3";
 const CLI_KIT = "bash, coreutils, gawk, ripgrep, jq, yq, duckdb, miller";
 
 export const RUN_CODE_RULES = [
 	`run_code: a session file over the ${describeBytes(READ_MAX_BYTES)} read limit is processed with "run_code" tool from ${DATA_PATH}/<file>.`,
+	`run_code: the host cwd is not mounted in the VM; only ${DATA_PATH} (read-only, inspect with ls -la ${DATA_PATH}) and ${WORK_PATH} (4 GiB, persistent across calls) exist.`,
+	`run_code: stream files over 1 GiB with rg, jq, mlr, duckdb, or polars.scan_* instead of loading whole files into memory.`,
 ];
 
 const parameters = Type.Object(
@@ -58,19 +61,36 @@ export function describeRunCode(limits: SandboxLimits): string {
 	const minutes = Math.round(limits.timeoutMs / 60_000);
 	return [
 		`Runs Python or bash code in an isolated Linux VM over the files saved in this session and returns stdout and stderr.`,
-		`Session output files are available read-only at ${DATA_PATH}/<file>.`,
+		`The host working directory is not mounted inside the VM; only ${DATA_PATH} and ${WORK_PATH} are available.`,
+		`Session output files are available read-only at ${DATA_PATH}/<file> (inspect with ls -la ${DATA_PATH}).`,
 		`${WORK_PATH} is writable, ${describeBytes(limits.workMaxBytes)} in size, and keeps files between calls.`,
 		`No network. Each call is a fresh process with ${describeBytes(limits.memoryBytes)} of memory, ${minutes} min and ${limits.processMax} processes; stdin is empty.`,
+		`Stream files over 1 GiB with rg, jq, mlr, duckdb, or polars.scan_* instead of loading them into memory.`,
 		`stdout over ${limits.replyMaxLines} lines or ${describeBytes(limits.replyMaxBytes)} is cut; the rest is saved as a session file that the reply names, readable with "read" tool up to ${describeBytes(READ_MAX_BYTES)} or with "run_code" tool from ${DATA_PATH}.`,
 		`stderr comes back unchanged between [stderr] and [/stderr]; a long stderr shows its tail and is saved whole the same way; over ${describeBytes(limits.stderrMaxBytes)} of stderr the program is stopped.`,
 		`Python 3.13 with ${PYTHON_KIT}. CLI: ${CLI_KIT}.`,
 	].join(" ");
 }
 
-export function createRuntime(image: string, environment: NodeJS.ProcessEnv, handle: SessionHandle): SandboxRuntime {
+export interface RuntimeImageOptions {
+	registryImage?: string;
+	customImage?: boolean;
+}
+
+export function createRuntime(
+	image: string,
+	environment: NodeJS.ProcessEnv,
+	handle: SessionHandle,
+	options: RuntimeImageOptions = {},
+): SandboxRuntime {
+	const envRegistry = environment.POLAR_SANDBOX_REGISTRY_IMAGE;
+	const registryImage =
+		options.registryImage ?? (typeof envRegistry === "string" && envRegistry !== "" ? envRegistry : REGISTRY_IMAGE);
 	const context: SandboxDriverContext = {
 		containerCommand: "container",
 		image,
+		registryImage,
+		customImage: options.customImage ?? image !== DEFAULT_IMAGE,
 		limits: LIMITS,
 		environment: { ...environment },
 		handle,
@@ -142,15 +162,35 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
 		type: "string",
 		default: DEFAULT_IMAGE,
 	});
+	pi.registerFlag("sandbox-registry-image", {
+		description: "Prebuilt sandbox image in a container registry (for pull)",
+		type: "string",
+	});
 
 	pi.on("session_start", async (_event, ctx) => {
 		const warn = (message: string) => ctx.ui.notify(message, "warning");
 		const flag = pi.getFlag("sandbox-image");
-		const image = typeof flag === "string" && flag !== "" ? flag : DEFAULT_IMAGE;
+		const envImage = process.env.POLAR_SANDBOX_IMAGE;
+		const image =
+			typeof flag === "string" && flag !== "" && flag !== DEFAULT_IMAGE
+				? flag
+				: typeof envImage === "string" && envImage !== ""
+					? envImage
+					: DEFAULT_IMAGE;
+		const customImage =
+			image !== DEFAULT_IMAGE ||
+			(typeof envImage === "string" && envImage !== "") ||
+			process.argv.some((arg) => arg === "--sandbox-image" || arg.startsWith("--sandbox-image="));
+		const registryFlag = pi.getFlag("sandbox-registry-image");
+		const registryImage = typeof registryFlag === "string" && registryFlag !== "" ? registryFlag : undefined;
 		const handle = await acquireSession(ctx.sessionManager.getSessionId(), ctx.cwd);
-		const runtime = createRuntime(image, process.env, handle);
+		const runtime = createRuntime(image, process.env, handle, { registryImage, customImage });
 		current = runtime;
-		const readiness = await startRuntime(runtime, warn);
+		const selectImage =
+			ctx.hasUI && typeof ctx.ui.select === "function"
+				? (title: string, options: string[]) => ctx.ui.select(title, options)
+				: undefined;
+		const readiness = await startRuntime(runtime, warn, selectImage);
 		if (runtime.state !== "unready") return;
 		if (!readiness.ready) {
 			warn(readiness.message);

@@ -480,6 +480,21 @@ export function getBundledInteractiveAssetPath(name: string): string {
 	return join(getInteractiveAssetsDir(), name);
 }
 
+/**
+ * Get path to built-in sandbox image directory (shipped with package).
+ * - For Bun binary: polar/sandbox/image/ next to executable
+ * - For Node.js (dist/): dist/polar/sandbox/image/
+ * - For source (src/): src/polar/sandbox/image/
+ */
+export function getSandboxImageDir(): string {
+	if (isBunBinary) {
+		return join(getPackageDir(), "polar", "sandbox", "image");
+	}
+	const packageDir = getPackageDir();
+	const srcOrDist = existsSync(join(packageDir, "src")) ? "src" : "dist";
+	return join(packageDir, srcOrDist, "polar", "sandbox", "image");
+}
+
 let quickJSWasmPath: string | undefined;
 
 /** Called by the Bun entry with the path of the QuickJS wasm file embedded in the compiled executable. */

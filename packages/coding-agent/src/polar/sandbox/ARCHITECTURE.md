@@ -8,8 +8,17 @@
 
 The `sandbox` extension (`builtin:sandbox`) registers the `run_code` tool, executing Python 3.13 or Bash scripts inside an isolated Linux VM behind the `SandboxDriver` interface (`AppleContainerDriver` on macOS via the `container` CLI).
 
-- **Artifact Bus Mount (`/data`):** Mounts `session.outputDirectory` read-only at `/data` inside the guest.
+- **Artifact Bus Mount (`/data`):** Mounts `session.outputDirectory` read-only at `/data` inside the guest. The host working directory (`cwd`) is never mounted inside the VM; only `/data` and `/work` exist.
 - **Persistent Workspace (`/work`):** Mounts a per-session volume (`polar-work-<sessionId>`, `4 GiB`) read-write at `/work` (`HOME=/work`). Files in `/work` persist across calls and across VM recreations within the session.
+- **Image Lookup & First-Start UX (`workspace.ts`):**
+  - Default image tag: `polar-sandbox:0.2` (multi-arch: `linux/arm64` and `linux/amd64`).
+  - Lookup order in local cache:
+    1. If `--sandbox-image` (or `POLAR_SANDBOX_IMAGE`) is explicitly provided, only that image is checked.
+    2. Otherwise, `REGISTRY_IMAGE` / `--sandbox-registry-image` (`POLAR_SANDBOX_REGISTRY_IMAGE`) is checked first (when configured), followed by the local tag `polar-sandbox:0.2`.
+  - When the image is not found in local cache:
+    - If `ctx.hasUI === false` (non-interactive / headless mode), no menu is shown and `sandbox` immediately disables itself (`sandbox is off: image ... is not installed (...)`).
+    - If `ctx.hasUI === true` (interactive TUI), `ctx.ui.select` offers `Download prebuilt image` (only when `REGISTRY_IMAGE` / `--sandbox-registry-image` is set), `Build sandbox image locally (~2 min)` (builds from `getSandboxImageDir()` with a `10 min` timeout), and `Disable sandbox for this session`.
+- **Operator Output Quotas:** `fileMaxBytes` is `4 GiB` and `sessionMaxBytes` is `16 GiB`.
 - **Lazy Hot Sandbox VM:**
   - The sandbox VM is started lazily on the first `run_code` call in the session (`driver.startSandbox`), not at `session_start`.
   - The VM runs with `--network none`, `--read-only`, `--cap-drop ALL`, `--user 1000:1000`, `2 GiB` RAM, `4` CPUs, `nproc=256`, and a `512 MiB` tmpfs at `/tmp` (without `--init`).
@@ -29,16 +38,16 @@ Each layer in `packages/coding-agent/src/polar/sandbox/src/` imports only from l
 ```text
 packages/coding-agent/src/polar/sandbox/
 ├── ARCHITECTURE.md                  # VM sandbox architecture and layer boundaries
-├── index.ts                         # --sandbox-image flag, session_start/shutdown wiring, tool registration
+├── index.ts                         # --sandbox-image / --sandbox-registry-image flags, session_start/shutdown wiring, tool registration
 ├── image/
-│   ├── Containerfile                # Guest image definition (default tag: polar-sandbox:0.1)
+│   ├── Containerfile                # Multi-arch guest image definition (default tag: polar-sandbox:0.2)
 │   ├── requirements.in
 │   └── requirements.txt
 ├── src/
 │   ├── types.ts                     # Domain data structures, state types, SandboxDriver & HotSandbox contracts
 │   ├── cli.ts                       # Layer 1: Stateless CLI execution, JSON parsing, container cleanup
 │   ├── driver.ts                    # Layer 2: AppleContainerDriver and AppleHotSandbox implementation
-│   ├── workspace.ts                 # Layer 3: Readiness check, orphan container/volume GC, /work volume setup
+│   ├── workspace.ts                 # Layer 3: Readiness check, image lookup/pull/build UX, orphan GC, /work volume setup
 │   ├── runner.ts                    # Layer 4: Admission, lazy HotSandbox lifecycle, call supervision, OOM & scrub
 │   └── reply.ts                     # Layer 5: Reply budget calculation, stdout/stderr store finalization, formatting
 └── test/
@@ -59,7 +68,7 @@ packages/coding-agent/src/polar/sandbox/
    - `AppleHotSandbox`: manages the keepalive `container run -i` process, records the boot-log OOM baseline before spawning `container exec -i ... bash -c <launcher>` (`spawnCall`), computes OOM deltas (`checkOom`), inspects container state (`inspect`: `present` when `running`, `stopped`, `absent`, or `unknown`), scrubs guest processes, files, and SysV IPC after calls (`scrubAfterCall`), and tears down the VM (`destroy`).
 
 3. **`src/workspace.ts` (Layer 3 — Session Workspace & Recovery)**
-   - `startRuntime`: checks driver readiness and image availability, recovers leftover resources under the same `polar-root`, and prepares `/work`.
+   - `startRuntime` and `checkReadiness`: checks driver readiness, inspects image candidates (`--sandbox-image` -> `REGISTRY_IMAGE` -> `polar-sandbox:0.2`), runs the interactive `ctx.ui.select` flow (`Download prebuilt image` / `Build sandbox image locally (~2 min)` / `Disable sandbox for this session`) when `ctx.hasUI === true` or disables immediately when `ctx.hasUI === false`, recovers leftover resources under the same `polar-root`, and prepares `/work`.
    - `recoverLeftovers` and `cleanupOwned`: `recoverLeftovers` deletes containers belonging to the current session or to sessions whose `sessionLiveness` is `"ended"`, deletes volumes when the owning session's directory is absent (`ENOENT`), and preserves resources of `"alive"` and `"unknown"` sessions. `cleanupOwned(runtime, deadlineAt, exclude)` deletes owned containers through `runtime.driver.deleteSandbox`.
    - `shutdownRuntime`: closes admission, waits up to `shutdownBudgetMs` (`10s`) for in-flight operations to drain, destroys the active `HotSandbox` and cleans up owned containers, kills remaining CLI processes on `quit`, and releases the session handle when drained.
 
@@ -78,9 +87,10 @@ packages/coding-agent/src/polar/sandbox/
 
 ## 3. Guest Image (`packages/coding-agent/src/polar/sandbox/image`)
 
-Build command:
+Build commands (`linux/arm64` and `linux/amd64` via `ARG TARGETARCH` with `sha256` verification of `yq` and `duckdb`, and universal wheel hashes in `requirements.txt`):
 ```bash
-(cd packages/coding-agent/src/polar/sandbox/image && container build --arch arm64 --tag polar-sandbox:0.1 --file Containerfile .)
+(cd packages/coding-agent/src/polar/sandbox/image && container build --arch arm64 --tag polar-sandbox:0.2 --file Containerfile .)
+(cd packages/coding-agent/src/polar/sandbox/image && docker build --platform linux/amd64 --tag polar-sandbox:0.2 --file Containerfile .)
 ```
 
 - **Python 3.13 kit:** `duckdb`, `polars`, `pandas`, `numpy`, `orjson`, `ijson`, `pyyaml`, `jmespath`, `python-dateutil`, `ciso8601`, `regex`, `tabulate`, `drain3`.

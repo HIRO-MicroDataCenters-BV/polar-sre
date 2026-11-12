@@ -10,7 +10,8 @@ import type {
 	ExtensionToolContext,
 	ToolDefinition,
 } from "../../../core/extensions/types.ts";
-import sandboxExtension, { DEFAULT_IMAGE } from "../index.ts";
+import sandboxExtension, { DEFAULT_IMAGE, RUN_CODE_RULES } from "../index.ts";
+import { BUILD_IMAGE_OPTION, DISABLE_SANDBOX_OPTION, DOWNLOAD_IMAGE_OPTION } from "../src/workspace.ts";
 import { FAKE_CONTAINER, type FakeState, fakeState, until } from "./fixtures.ts";
 
 const fault = vi.hoisted(() => ({ failReplyOnce: false }));
@@ -33,7 +34,6 @@ type Method = (...args: never[]) => unknown;
 type ShutdownReason = "quit" | "reload" | "new" | "resume" | "fork";
 
 const SESSION_ID = randomUUID();
-const RULE = 'run_code: a session file over the 16 MiB read limit is processed with "run_code" tool from /data/<file>.';
 const ENV_KEYS = ["PATH", "POLAR_ARTIFACTS_DIR", "FAKE_CONTAINER_STATE"];
 
 let root: string;
@@ -78,25 +78,34 @@ function shellWord(value: string): string {
 	return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-function fakeContext() {
+function fakeContext(options: { hasUI?: boolean; selectChoice?: string } = {}) {
 	const notices: [string, string | undefined][] = [];
 	const footer = new Map<string, string | undefined>();
+	const selects: [string, string[]][] = [];
+	const hasUI = options.hasUI ?? true;
 	const context = {
-		mode: "tui",
-		hasUI: true,
+		mode: hasUI ? "tui" : "print",
+		hasUI,
 		cwd: process.cwd(),
 		ui: {
 			notify: (message: string, type?: string) => notices.push([message, type]),
 			setStatus: (key: string, text: string | undefined) => footer.set(key, text),
+			select: async (title: string, items: string[]) => {
+				selects.push([title, items]);
+				return options.selectChoice;
+			},
 		},
 		sessionManager: { getSessionId: () => SESSION_ID },
 		shutdown: () => {},
 	};
-	return { ctx: context as unknown as ExtensionContext, notices, footer };
+	return { ctx: context as unknown as ExtensionContext, notices, footer, selects };
 }
 
-function loadExtension(flagValues: Record<string, string> = {}) {
-	const { ctx, notices, footer } = fakeContext();
+function loadExtension(
+	flagValues: Record<string, string> = {},
+	contextOptions: { hasUI?: boolean; selectChoice?: string } = {},
+) {
+	const { ctx, notices, footer, selects } = fakeContext(contextOptions);
 	const tools: ToolDefinition<TObject>[] = [];
 	const flagDefaults = new Map<string, string | undefined>();
 	const handlers = new Map<string, EventHandler>();
@@ -126,6 +135,7 @@ function loadExtension(flagValues: Record<string, string> = {}) {
 		tools,
 		notices,
 		footer,
+		selects,
 		flagDefaults,
 		startSession: () => fire("session_start", { type: "session_start", reason: "startup" }),
 		shutdown: (reason: ShutdownReason = "quit") => fire("session_shutdown", { type: "session_shutdown", reason }),
@@ -221,14 +231,22 @@ describe("sandbox extension", () => {
 		expect(pi.flagDefaults.get("sandbox-image")).toBe(DEFAULT_IMAGE);
 		expect(pi.footer.get("sandbox")).toBeUndefined();
 		expect(await state.calls()).toContainEqual(["image", "inspect", image]);
-		expect(tool.description).toContain(" Session output files are available read-only at /data/<file>. ");
+		expect(tool.description).toContain(
+			"The host working directory is not mounted inside the VM; only /data and /work are available.",
+		);
+		expect(tool.description).toContain(
+			"Session output files are available read-only at /data/<file> (inspect with ls -la /data).",
+		);
 		for (const phrase of [
 			"/data",
 			"/work",
+			"ls -la /data",
 			"No network",
 			"stdin is empty",
 			"duckdb",
 			"ripgrep",
+			"polars.scan_*",
+			"1 GiB",
 			"16 MiB",
 			"2 GiB",
 			"4 GiB",
@@ -244,12 +262,50 @@ describe("sandbox extension", () => {
 			expect(tool.description).toContain(phrase);
 		}
 		expect(tool.promptSnippet).toBe("run python or bash over the session files in an isolated VM");
-		expect(tool.promptGuidelines).toEqual([RULE]);
+		expect(tool.promptGuidelines).toEqual(RUN_CODE_RULES);
 		for (const item of [tool.description, tool.promptSnippet ?? "", ...(tool.promptGuidelines ?? [])]) {
 			expect(item).not.toContain("list_files");
 			expect(item).not.toContain("k8s_");
 		}
 		expect(Object.keys(tool.parameters.properties)).toEqual(["language", "code"]);
+	});
+
+	it("turns off without menu when hasUI is false and prompts with ctx.ui.select when hasUI is true", async () => {
+		await setKnobs({ IMAGE_MISSING: "1" });
+		const headless = loadExtension({}, { hasUI: false });
+		await headless.startSession();
+		expect(headless.tools).toEqual([]);
+		expect(headless.selects).toEqual([]);
+		expect(headless.notices).toEqual([
+			[
+				`sandbox is off: image ${DEFAULT_IMAGE} is not installed (container image inspect ${DEFAULT_IMAGE} failed: Error: image ${DEFAULT_IMAGE} not found)`,
+				"warning",
+			],
+		]);
+		await headless.shutdown();
+
+		const built = loadExtension({}, { hasUI: true, selectChoice: BUILD_IMAGE_OPTION });
+		await built.startSession();
+		expect(built.selects).toEqual([
+			[`Sandbox image ${DEFAULT_IMAGE} is not installed`, [BUILD_IMAGE_OPTION, DISABLE_SANDBOX_OPTION]],
+		]);
+		expect(built.tools.map((tool) => tool.name)).toEqual(["run_code"]);
+		await built.shutdown();
+
+		const registry = "registry.example/polar-sandbox@sha256:abc";
+		const pulled = loadExtension(
+			{ "sandbox-registry-image": registry },
+			{ hasUI: true, selectChoice: DOWNLOAD_IMAGE_OPTION },
+		);
+		await pulled.startSession();
+		expect(pulled.selects).toEqual([
+			[
+				`Sandbox image ${DEFAULT_IMAGE} is not installed`,
+				[DOWNLOAD_IMAGE_OPTION, BUILD_IMAGE_OPTION, DISABLE_SANDBOX_OPTION],
+			],
+		]);
+		expect(pulled.tools.map((tool) => tool.name)).toEqual(["run_code"]);
+		await pulled.shutdown();
 	});
 
 	it("rejects an empty or NUL program before any run", async () => {

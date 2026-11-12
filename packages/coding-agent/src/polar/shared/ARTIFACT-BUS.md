@@ -52,8 +52,8 @@ Process-wide session state is stored in `globalThis[Symbol.for("polar/session-re
 ### Operator Limits
 | Setting | Value | Scope |
 |---|---|---|
-| `fileMaxBytes` | `2 GiB` | Maximum bytes written to a single output file |
-| `sessionMaxBytes` | `8 GiB` | Maximum bytes across all published and open files in the session |
+| `fileMaxBytes` | `4 GiB` | Maximum bytes written to a single output file |
+| `sessionMaxBytes` | `16 GiB` | Maximum bytes across all published and open files in the session |
 | `READ_MAX_BYTES` | `16 MiB` | Maximum file size Pi's built-in `read` tool may open |
 
 Live session byte count:
@@ -101,6 +101,7 @@ export interface ManifestEntry {
 
 1. **`list_files` tool**
    - Reads `manifest.jsonl` via `readManifest(handle.paths)` and renders a Markdown table: `| File | Command | Size | Status | Created |`.
+   - Provides `promptGuidelines` (`LIST_FILES_RULES`) instructing the model to inspect saved session files before re-running commands or reading large outputs.
    - Uses `prepareLoadout` to append `"Reads files up to 16 MiB."` to Pi's built-in `read` tool description.
 2. **Built-in `read` Gate (`files/src/gate.ts`)**
    Evaluates every `tool_call` for `"read"` in this order:

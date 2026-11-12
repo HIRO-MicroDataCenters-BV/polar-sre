@@ -3,13 +3,17 @@ import { access, chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 
 import { tmpdir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { getSandboxImageDir } from "../../../config.ts";
 import { acquireSession, type SessionHandle } from "../../shared/session.ts";
 import { containerCommand } from "../src/cli.ts";
 import { admitCall } from "../src/runner.ts";
 import type { SandboxRuntime, SessionPaths } from "../src/types.ts";
 import {
+	BUILD_IMAGE_OPTION,
 	checkReadiness,
 	closeAdmission,
+	DISABLE_SANDBOX_OPTION,
+	DOWNLOAD_IMAGE_OPTION,
 	ensureWorkVolume,
 	recoverLeftovers,
 	shutdownRuntime,
@@ -97,7 +101,97 @@ describe("start", () => {
 		expect(await checkReadiness(fakeRuntime(state, handle, { IMAGE_MISSING: "1" }))).toEqual({
 			ready: false,
 			message:
-				"sandbox is off: container image inspect polar-sandbox:test failed: Error: image polar-sandbox:test not found. Build the image as packages/coding-agent/src/polar/sandbox/ARCHITECTURE.md describes.",
+				"sandbox is off: image polar-sandbox:test is not installed (container image inspect polar-sandbox:test failed: Error: image polar-sandbox:test not found)",
+			leftovers: [],
+		});
+	});
+
+	it("checks custom --sandbox-image first, else registryImage then local default tag, and prompts only when UI is present", async () => {
+		const registry = "registry.example/polar-sandbox@sha256:deadbeef";
+		const local = "polar-sandbox:0.2";
+
+		// 1. Explicit custom image is checked alone even if registryImage is set
+		const custom = startingRuntime(state, handle, { IMAGE_PRESENT: "custom:1" });
+		custom.image = "custom:1";
+		custom.registryImage = registry;
+		custom.customImage = true;
+		expect(await checkReadiness(custom)).toEqual({ ready: true });
+		expect(custom.image).toBe("custom:1");
+		expect(await callsOf("image")).toEqual([["image", "inspect", "custom:1"]]);
+
+		// 2. Default image with registryImage present in cache uses registryImage without checking local tag
+		state = await fakeState();
+		const cachedRegistry = startingRuntime(state, handle, { IMAGE_PRESENT: registry });
+		cachedRegistry.image = local;
+		cachedRegistry.registryImage = registry;
+		cachedRegistry.customImage = false;
+		expect(await checkReadiness(cachedRegistry)).toEqual({ ready: true });
+		expect(cachedRegistry.image).toBe(registry);
+		expect(await callsOf("image")).toEqual([["image", "inspect", registry]]);
+
+		// 3. Default image with registryImage absent falls back to local tag in cache without prompting
+		state = await fakeState();
+		const cachedLocal = startingRuntime(state, handle, { IMAGE_PRESENT: local });
+		cachedLocal.image = local;
+		cachedLocal.registryImage = registry;
+		cachedLocal.customImage = false;
+		let prompted = false;
+		expect(
+			await checkReadiness(cachedLocal, async () => {
+				prompted = true;
+				return undefined;
+			}),
+		).toEqual({ ready: true });
+		expect(prompted).toBe(false);
+		expect(cachedLocal.image).toBe(local);
+		expect(await callsOf("image")).toEqual([
+			["image", "inspect", registry],
+			["image", "inspect", local],
+		]);
+
+		// 4. Missing image with UI and no registryImage offers Build and Disable (no Download)
+		state = await fakeState();
+		const buildRuntime = startingRuntime(state, handle, { IMAGE_MISSING: "1" });
+		buildRuntime.image = local;
+		buildRuntime.customImage = false;
+		let seenOptions: string[] = [];
+		expect(
+			await checkReadiness(buildRuntime, async (_title, options) => {
+				seenOptions = options;
+				return BUILD_IMAGE_OPTION;
+			}),
+		).toEqual({ ready: true });
+		expect(seenOptions).toEqual([BUILD_IMAGE_OPTION, DISABLE_SANDBOX_OPTION]);
+		const imageDir = getSandboxImageDir();
+		expect(await callsOf("build")).toEqual([
+			["build", "--arch", "arm64", "--tag", local, "--file", join(imageDir, "Containerfile"), imageDir],
+		]);
+
+		// 5. Missing image with UI and registryImage offers Download, Build, and Disable
+		state = await fakeState();
+		const pullRuntime = startingRuntime(state, handle, { IMAGE_MISSING: "1" });
+		pullRuntime.image = local;
+		pullRuntime.registryImage = registry;
+		pullRuntime.customImage = false;
+		expect(
+			await checkReadiness(pullRuntime, async (_title, options) => {
+				seenOptions = options;
+				return DOWNLOAD_IMAGE_OPTION;
+			}),
+		).toEqual({ ready: true });
+		expect(seenOptions).toEqual([DOWNLOAD_IMAGE_OPTION, BUILD_IMAGE_OPTION, DISABLE_SANDBOX_OPTION]);
+		expect(pullRuntime.image).toBe(registry);
+		expect((await callsOf("image")).at(-1)).toEqual(["image", "pull", registry]);
+
+		// 6. Selecting Disable turns off sandbox
+		state = await fakeState();
+		const disabled = startingRuntime(state, handle, { IMAGE_MISSING: "1" });
+		disabled.image = local;
+		disabled.customImage = false;
+		expect(await checkReadiness(disabled, async () => DISABLE_SANDBOX_OPTION)).toEqual({
+			ready: false,
+			message:
+				"sandbox is off: image polar-sandbox:0.2 is not installed (container image inspect polar-sandbox:0.2 failed: Error: image polar-sandbox:0.2 not found)",
 			leftovers: [],
 		});
 	});

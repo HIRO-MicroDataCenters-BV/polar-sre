@@ -260,9 +260,23 @@ async function main() {
 		case "system":
 			process.exit(Number(knob("STATUS_EXIT", 0)));
 			break;
-		case "image":
-			if (knob("IMAGE_MISSING") === "1") fail(`image ${args[1]} not found`);
-			process.stdout.write(`[{"id":"${args[1]}"}]\n`);
+		case "image": {
+			const [sub, img] = args;
+			if (sub === "pull") {
+				if (knob("PULL_FAIL") === "1") fail(`pull ${img} failed`);
+				process.stdout.write(`pulled ${img}\n`);
+				break;
+			}
+			const present = knob("IMAGE_PRESENT");
+			if (knob("IMAGE_MISSING") === "1" || (present !== undefined && present !== img)) {
+				fail(`image ${img} not found`);
+			}
+			process.stdout.write(`[{"id":"${img}"}]\n`);
+			break;
+		}
+		case "build":
+			if (knob("BUILD_FAIL") === "1") fail("build failed");
+			process.stdout.write("built\n");
 			break;
 		case "run":
 			return run(args);

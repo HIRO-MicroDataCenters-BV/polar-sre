@@ -18,6 +18,10 @@ const NOT_STARTED = "The session has not started.";
 
 const READ_LIMIT_SENTENCE = "Reads files up to 16 MiB.";
 
+export const LIST_FILES_RULES = [
+	"list_files: check saved session output files, their sizes, and the commands that produced them before re-running commands or reading large outputs with read (up to 16 MiB).",
+];
+
 const TABLE_HEADER = ["| File | Command | Size | Status | Created |", "|---|---|---|---|---|"];
 
 export function renderFileTable(entries: ManifestEntry[]): string {
@@ -52,6 +56,7 @@ export default function filesExtension(pi: ExtensionAPI): void {
 		description:
 			"The output files saved in this session, one row per file: name, the command that produced it, size, status (complete or truncated) and creation time. Read a file with read.",
 		promptSnippet: "the output files saved in this session and the commands that produced them",
+		promptGuidelines: LIST_FILES_RULES,
 		parameters: Type.Object({}, { additionalProperties: false }),
 		annotations: { readOnlyHint: true },
 		prepareLoadout: describeRead,

@@ -1,15 +1,21 @@
 import { stat } from "fs/promises";
 import { join } from "path";
 import { setTimeout as sleep } from "timers/promises";
+import { getSandboxImageDir } from "../../../config.ts";
 import type { SessionShutdownEvent } from "../../../core/extensions/types.ts";
 import { type SessionLiveness, sessionLiveness } from "../../shared/session.ts";
-import { deadlineAfter, describeCleanupErrors, remainingMs } from "./cli.ts";
+import { commandFailure, deadlineAfter, describeCleanupErrors, remainingMs } from "./cli.ts";
 import { artifactsRootOf, LEFTOVERS_STAYED, START_ENDED } from "./driver.ts";
 import type { ChildKind, CleanupError, OwnedResource, Readiness, SandboxRuntime, VolumeFailure } from "./types.ts";
 
 export type Recovery = { clean: true } | { leftover: CleanupError[] } | { unknown: string };
 
 export type Warn = (message: string) => void;
+export type SelectMissingImage = (title: string, options: string[]) => Promise<string | undefined>;
+
+export const DOWNLOAD_IMAGE_OPTION = "Download prebuilt image";
+export const BUILD_IMAGE_OPTION = "Build sandbox image locally (~2 min)";
+export const DISABLE_SANDBOX_OPTION = "Disable sandbox for this session";
 
 const TICKET_POLL_MS = 20;
 
@@ -58,21 +64,57 @@ function leftoverNotice(runtime: SandboxRuntime, errors: CleanupError[]): string
 	return `${describeCleanupErrors(errors)} could not be deleted; delete them with: ${runtime.driver.manualDeleteCommand(names)}`;
 }
 
-export async function checkReadiness(runtime: SandboxRuntime): Promise<Readiness> {
+export async function checkReadiness(runtime: SandboxRuntime, selectImage?: SelectMissingImage): Promise<Readiness> {
 	const status = await runtime.driver.checkRuntime(deadlineAfter(runtime));
 	if (!status.ready) return off(runtime, status.reason);
-	const image = await runtime.driver.inspectImage(runtime.image, deadlineAfter(runtime));
-	if (!image.found) {
-		return off(
-			runtime,
-			`${image.reason}. Build the image as packages/coding-agent/src/polar/sandbox/ARCHITECTURE.md describes.`,
-		);
+	const candidates =
+		!runtime.customImage && runtime.registryImage !== undefined && runtime.registryImage !== runtime.image
+			? [runtime.registryImage, runtime.image]
+			: [runtime.image];
+	let lastReason = "";
+	for (const candidate of candidates) {
+		const inspected = await runtime.driver.inspectImage(candidate, deadlineAfter(runtime));
+		if (inspected.found) {
+			runtime.image = candidate;
+			return { ready: true };
+		}
+		lastReason = inspected.reason;
 	}
-	return { ready: true };
+	if (selectImage === undefined) {
+		return off(runtime, `image ${runtime.image} is not installed (${lastReason})`);
+	}
+	const options =
+		runtime.registryImage !== undefined
+			? [DOWNLOAD_IMAGE_OPTION, BUILD_IMAGE_OPTION, DISABLE_SANDBOX_OPTION]
+			: [BUILD_IMAGE_OPTION, DISABLE_SANDBOX_OPTION];
+	const choice = await selectImage(`Sandbox image ${runtime.image} is not installed`, options);
+	if (runtime.state !== "unready") return off(runtime, START_ENDED);
+	if (choice === DOWNLOAD_IMAGE_OPTION && runtime.registryImage !== undefined) {
+		const pulled = await runtime.driver.pullImage(runtime.registryImage);
+		if (runtime.state !== "unready") return off(runtime, START_ENDED);
+		if (pulled.code !== 0) {
+			return off(runtime, `image pull ${runtime.registryImage} failed: ${commandFailure(pulled)}`);
+		}
+		runtime.image = runtime.registryImage;
+		return { ready: true };
+	}
+	if (choice === BUILD_IMAGE_OPTION) {
+		const built = await runtime.driver.buildImage(runtime.image, getSandboxImageDir());
+		if (runtime.state !== "unready") return off(runtime, START_ENDED);
+		if (built.code !== 0) {
+			return off(runtime, `image build ${runtime.image} failed: ${commandFailure(built)}`);
+		}
+		return { ready: true };
+	}
+	return off(runtime, `image ${runtime.image} is not installed (${lastReason})`);
 }
 
-export async function startRuntime(runtime: SandboxRuntime, warn: Warn): Promise<Readiness> {
-	const starting = performStart(runtime, warn);
+export async function startRuntime(
+	runtime: SandboxRuntime,
+	warn: Warn,
+	selectImage?: SelectMissingImage,
+): Promise<Readiness> {
+	const starting = performStart(runtime, warn, selectImage);
 	runtime.starting = starting;
 	try {
 		return await starting;
@@ -82,8 +124,8 @@ export async function startRuntime(runtime: SandboxRuntime, warn: Warn): Promise
 	}
 }
 
-async function performStart(runtime: SandboxRuntime, warn: Warn): Promise<Readiness> {
-	const readiness = await checkReadiness(runtime);
+async function performStart(runtime: SandboxRuntime, warn: Warn, selectImage?: SelectMissingImage): Promise<Readiness> {
+	const readiness = await checkReadiness(runtime, selectImage);
 	if (!readiness.ready) return readiness;
 	if (runtime.state !== "unready") return off(runtime, START_ENDED);
 	const recovery = await recoverLeftovers(runtime, warn);

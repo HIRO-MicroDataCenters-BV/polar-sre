@@ -13,7 +13,7 @@ import { SESSION_LABEL, sandboxArguments, sessionLabels, workVolumeName } from "
 import { buildReply } from "../src/reply.ts";
 import { admitCall } from "../src/runner.ts";
 import type { SandboxLimits, SandboxRequest, SandboxRuntime, SessionPaths } from "../src/types.ts";
-import { recoverLeftovers, shutdownRuntime, startRuntime } from "../src/workspace.ts";
+import { BUILD_IMAGE_OPTION, recoverLeftovers, shutdownRuntime, startRuntime } from "../src/workspace.ts";
 
 const REAL = process.env.SANDBOX_REAL_RUNTIME === "1";
 const IMAGE = process.env.POLAR_SANDBOX_IMAGE ?? DEFAULT_IMAGE;
@@ -55,7 +55,9 @@ async function timed<T>(step: string, work: () => Promise<T>): Promise<T> {
 async function startedRuntime(sessionHandle: SessionHandle) {
 	const started = createRuntime(IMAGE, process.env, sessionHandle);
 	started.limits = { ...limits };
-	const readiness = await timed(`start ${sessionHandle.paths.sessionId}`, () => startRuntime(started, warn));
+	const readiness = await timed(`start ${sessionHandle.paths.sessionId}`, () =>
+		startRuntime(started, warn, async () => BUILD_IMAGE_OPTION),
+	);
 	if (readiness.ready) started.state = "open";
 	return { runtime: started, readiness };
 }
@@ -156,7 +158,7 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 		expect(started.readiness).toEqual({ ready: true });
 		expect(runtime.state).toBe("open");
 		expect(runtime.owned.size).toBe(0);
-	}, 120_000);
+	}, 600_000);
 
 	afterAll(async () => {
 		if (runtime !== undefined) {

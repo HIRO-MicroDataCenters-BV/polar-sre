@@ -1,9 +1,12 @@
 # The guest environment of the run_code tool: Debian 13 with Python 3.13, the Python kit from requirements.txt
-# and the CLI kit. Built for linux/arm64; the yq and duckdb downloads below are arm64 binaries.
+# and the CLI kit. Supports linux/arm64 and linux/amd64 via TARGETARCH.
 # Build (from this directory):
-#   container build --arch arm64 --tag polar-sandbox:0.1 --file Containerfile .
+#   container build --arch arm64 --tag polar-sandbox:0.2 --file Containerfile .
+#   docker build --platform linux/amd64 --tag polar-sandbox:0.2 --file Containerfile .
 # Versions of everything inside the image are listed in /README.md of the image.
 FROM python:3.13-slim@sha256:70729b46c69b4f1e97c4822c1af3df53a1476cf5ddc6c087c0c10bc3a5678c2f
+
+ARG TARGETARCH
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
 	PIP_NO_CACHE_DIR=1 \
@@ -16,14 +19,28 @@ RUN apt-get update \
 	&& rm -rf /var/lib/apt/lists/*
 
 # mikefarah/yq v4.54.1 (MIT) and the duckdb CLI v1.5.6 (MIT), pinned by the sha256 of the release assets.
-ADD --checksum=sha256:189088da0c6429ec5178dfaab1a114805f6cab0b61b165ab236efedf1d57a71b \
-	https://github.com/mikefarah/yq/releases/download/v4.54.1/yq_linux_arm64 /usr/local/bin/yq
-ADD --checksum=sha256:c544e92c9b7c31fc53c2139802cabd8e2d1b2b3e3f933117f31611239c1402db \
-	https://github.com/duckdb/duckdb/releases/download/v1.5.6/duckdb_cli-linux-arm64.zip /tmp/duckdb_cli.zip
-RUN chmod 0755 /usr/local/bin/yq \
-	&& python3 -c "import zipfile; zipfile.ZipFile('/tmp/duckdb_cli.zip').extract('duckdb', '/usr/local/bin')" \
-	&& chmod 0755 /usr/local/bin/duckdb \
-	&& rm /tmp/duckdb_cli.zip
+RUN set -eu; \
+	case "${TARGETARCH}" in \
+		arm64) \
+			yq_sha256="189088da0c6429ec5178dfaab1a114805f6cab0b61b165ab236efedf1d57a71b"; \
+			duckdb_sha256="c544e92c9b7c31fc53c2139802cabd8e2d1b2b3e3f933117f31611239c1402db"; \
+			;; \
+		amd64) \
+			yq_sha256="8e34fc298390875de416e6a4afcb8cabeceb25d9aa8506c1a2f9353cf702ea5f"; \
+			duckdb_sha256="6e89deac1ebbc36eed0291caf8b567b030c7b86ac35998f71854e22b3c5d5e2f"; \
+			;; \
+		*) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+	esac; \
+	python3 -c "import sys, urllib.request; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])" \
+		"https://github.com/mikefarah/yq/releases/download/v4.54.1/yq_linux_${TARGETARCH}" /usr/local/bin/yq; \
+	echo "${yq_sha256}  /usr/local/bin/yq" | sha256sum -c -; \
+	chmod 0755 /usr/local/bin/yq; \
+	python3 -c "import sys, urllib.request; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])" \
+		"https://github.com/duckdb/duckdb/releases/download/v1.5.6/duckdb_cli-linux-${TARGETARCH}.zip" /tmp/duckdb_cli.zip; \
+	echo "${duckdb_sha256}  /tmp/duckdb_cli.zip" | sha256sum -c -; \
+	python3 -c "import zipfile; zipfile.ZipFile('/tmp/duckdb_cli.zip').extract('duckdb', '/usr/local/bin')"; \
+	chmod 0755 /usr/local/bin/duckdb; \
+	rm /tmp/duckdb_cli.zip
 
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --require-hashes --no-deps --requirement /tmp/requirements.txt \

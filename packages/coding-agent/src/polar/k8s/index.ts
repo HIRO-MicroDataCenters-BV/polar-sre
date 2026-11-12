@@ -26,8 +26,8 @@ import type { ExecutionLimits, K8sRuntime, KubectlCall, LaunchConfig, SessionHan
 const LIMITS: ExecutionLimits = {
 	timeoutMs: 60_000,
 	logsTimeoutMs: 600_000,
-	fileMaxBytes: 2 * 1024 * 1024 * 1024,
-	sessionMaxBytes: 8 * 1024 * 1024 * 1024,
+	fileMaxBytes: 4 * 1024 * 1024 * 1024,
+	sessionMaxBytes: 16 * 1024 * 1024 * 1024,
 	stderrMaxBytes: 1024 * 1024,
 	killGraceMs: 1000,
 	replyMaxLines: 2000,
