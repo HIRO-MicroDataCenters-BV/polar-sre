@@ -1,6 +1,7 @@
 import { type ChildProcessByStdio, spawn } from "child_process";
 import { randomBytes } from "crypto";
 import { once } from "events";
+import { tmpdir } from "os";
 import { dirname, join } from "path";
 import type { Readable, Writable } from "stream";
 import {
@@ -281,6 +282,7 @@ export class AppleHotSandbox implements HotSandbox {
 		}
 		const args = execArguments(this.name, language);
 		const child = spawn(this.runtime.containerCommand, args, {
+			cwd: tmpdir(),
 			env: this.runtime.environment,
 			stdio: ["pipe", "pipe", "pipe"],
 		});
@@ -478,6 +480,7 @@ export class AppleContainerDriver implements SandboxDriver {
 		if (remainingMs(deadlineAt) === 0) return { failed: "timed out" };
 		const args = sandboxArguments(this.runtime, name, session);
 		const child = spawn(this.runtime.containerCommand, args, {
+			cwd: tmpdir(),
 			env: this.runtime.environment,
 			stdio: ["pipe", "pipe", "pipe"],
 		});
@@ -757,6 +760,7 @@ export class OciHotSandbox implements HotSandbox {
 		}
 		const args = ociExecArguments(this.name, language, this.guestUser, this.runtime.limits.workMaxBytes);
 		const child = spawn(this.runtime.containerCommand, args, {
+			cwd: tmpdir(),
 			env: this.runtime.environment,
 			stdio: ["pipe", "pipe", "pipe"],
 		});
@@ -1053,6 +1057,7 @@ export class OciDriver implements SandboxDriver {
 		if (remainingMs(deadlineAt) === 0) return { failed: "timed out" };
 		const args = ociSandboxArguments(this.runtime, name, this.runOptions, session);
 		const child = spawn(this.runtime.containerCommand, args, {
+			cwd: tmpdir(),
 			env: this.runtime.environment,
 			stdio: ["pipe", "pipe", "pipe"],
 		});

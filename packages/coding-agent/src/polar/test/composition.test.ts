@@ -122,6 +122,7 @@ function shellWord(value: string): string {
 }
 
 function loadExtension(name: ExtensionName, flagValues: Record<string, string>): LoadedExtension {
+	const flags: Record<string, string> = { "sandbox-driver": "apple-container", ...flagValues };
 	const tools: ToolDefinition<TObject>[] = [];
 	const flagDefaults = new Map<string, unknown>();
 	const handlers = new Map<string, EventHandler[]>();
@@ -133,7 +134,7 @@ function loadExtension(name: ExtensionName, flagValues: Record<string, string>):
 		registerFlag: (flag: string, options: { default?: unknown }) => {
 			flagDefaults.set(flag, options.default);
 		},
-		getFlag: (flag: string) => flagValues[flag] ?? flagDefaults.get(flag),
+		getFlag: (flag: string) => flags[flag] ?? flagDefaults.get(flag),
 		on: (event: string, handler: EventHandler) => {
 			handlers.set(event, [...(handlers.get(event) ?? []), handler]);
 		},

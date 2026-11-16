@@ -96,10 +96,7 @@ function createDriver(
 	if (choice === "auto") {
 		if (typeof environment.POLAR_SANDBOX_K8S_PVC === "string" && environment.POLAR_SANDBOX_K8S_PVC !== "") {
 			driverName = "k8s";
-		} else if (
-			platform === "darwin" ||
-			(environment.FAKE_CONTAINER_STATE !== undefined && environment.FAKE_OCI_STATE === undefined)
-		) {
+		} else if (platform === "darwin") {
 			driverName = "apple-container";
 		} else if (platform === "linux") {
 			driverName = "oci";

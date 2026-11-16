@@ -105,6 +105,7 @@ function loadExtension(
 	flagValues: Record<string, string> = {},
 	contextOptions: { hasUI?: boolean; selectChoice?: string } = {},
 ) {
+	const flags: Record<string, string> = { "sandbox-driver": "apple-container", ...flagValues };
 	const { ctx, notices, footer, selects } = fakeContext(contextOptions);
 	const tools: ToolDefinition<TObject>[] = [];
 	const flagDefaults = new Map<string, string | undefined>();
@@ -114,7 +115,7 @@ function loadExtension(
 			flagDefaults.set(name, options.default);
 		},
 		getFlag(name: string) {
-			return flagValues[name] ?? flagDefaults.get(name);
+			return flags[name] ?? flagDefaults.get(name);
 		},
 		registerTool(tool: ToolDefinition<TObject>) {
 			tools.push(tool);

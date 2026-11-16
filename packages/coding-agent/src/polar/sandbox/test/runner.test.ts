@@ -257,6 +257,14 @@ describe("SandboxCall", () => {
 		expect(callIndex(calls, "inspect", name)).toBeGreaterThan(callIndex(calls, "exec", "--interactive"));
 		expect(runtime.activeSandbox.current?.name).toBe(name);
 
+		const exit199 = await run("stdout:code199\nexit:199", runtime);
+		expect(exit199).toMatchObject({
+			status: "failed",
+			exitCode: 199,
+			stdout: "code199\n",
+			inspection: { state: "present" },
+		});
+
 		runtime.environment.FAKE_CONTAINER_EXEC_FAILS = "1";
 		const execFailed = await run("stdout:never", runtime);
 		expect(execFailed).toMatchObject({

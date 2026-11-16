@@ -1,4 +1,5 @@
 import { spawn } from "child_process";
+import { tmpdir } from "os";
 import type { CleanupError, CleanupOutcome, CommandOutcome, SandboxDriverContext } from "./types.ts";
 
 export const CLI_STOPPED = "sandbox is stopping; no command starts";
@@ -23,6 +24,7 @@ export function containerCommand(
 	if (signal?.aborted) return Promise.resolve({ code: null, stdout: "", stderr: "cancelled", timedOut: false });
 	return new Promise((resolve) => {
 		const child = spawn(command, args, {
+			cwd: tmpdir(),
 			env: runtime.environment,
 			stdio: ["ignore", "pipe", "pipe"],
 		});

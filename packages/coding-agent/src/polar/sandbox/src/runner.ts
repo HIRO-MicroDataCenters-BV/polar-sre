@@ -375,7 +375,7 @@ export class SandboxRun implements RunningCall {
 	}
 
 	private async judgeExit(): Promise<Pick<SandboxResult, "status" | "oomEvidence" | "inspection">> {
-		if (this.exitCode === WORK_LIMIT_EXIT_CODE) {
+		if (this.exitCode === WORK_LIMIT_EXIT_CODE && this.runtime.driver.name !== "apple-container") {
 			return { status: "work_limit" };
 		}
 		if (this.exitCode === SIGKILL_EXIT_CODE) {
