@@ -3,10 +3,11 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { setTimeout as sleep } from "timers/promises";
 import { fileURLToPath } from "url";
-import { AppleContainerDriver } from "../src/driver.ts";
+import { AppleContainerDriver, OciDriver, type OciDriverOptions } from "../src/driver.ts";
 import type { RunningCall, SandboxDriverContext, SandboxLimits, SandboxRuntime, SessionHandle } from "../src/types.ts";
 
 export const FAKE_CONTAINER = fileURLToPath(new URL("./fake-container.mjs", import.meta.url));
+export const FAKE_OCI = fileURLToPath(new URL("./fake-oci.mjs", import.meta.url));
 
 export const testLimits: SandboxLimits = {
 	timeoutMs: 10_000,
@@ -118,6 +119,52 @@ export function startingRuntime(
 	limits: Partial<SandboxLimits> = {},
 ): SandboxRuntime {
 	const runtime = fakeRuntime(state, handle, knobs, limits);
+	runtime.state = "unready";
+	return runtime;
+}
+
+export function fakeOciEnvironment(state: FakeState, knobs: Record<string, string> = {}): NodeJS.ProcessEnv {
+	const environment: NodeJS.ProcessEnv = { PATH: process.env.PATH, FAKE_OCI_STATE: state.directory };
+	for (const [name, value] of Object.entries(knobs)) {
+		environment[`FAKE_OCI_${name}`] = value;
+	}
+	return environment;
+}
+
+export function fakeOciRuntime(
+	state: FakeState,
+	handle: SessionHandle,
+	knobs: Record<string, string> = {},
+	limits: Partial<SandboxLimits> = {},
+	driverOptions: OciDriverOptions = {},
+): SandboxRuntime {
+	const context: SandboxDriverContext = {
+		containerCommand: FAKE_OCI,
+		image: "polar-sandbox:test",
+		limits: { ...testLimits, ...limits },
+		environment: fakeOciEnvironment(state, knobs),
+		handle,
+		state: "open",
+		owned: new Set(),
+		children: new Map(),
+		cliStopped: false,
+	};
+	return Object.assign(context, {
+		inFlight: new Set<string>(),
+		running: new Set<RunningCall>(),
+		driver: new OciDriver(context, driverOptions),
+		activeSandbox: {},
+	});
+}
+
+export function startingOciRuntime(
+	state: FakeState,
+	handle: SessionHandle,
+	knobs: Record<string, string> = {},
+	limits: Partial<SandboxLimits> = {},
+	driverOptions: OciDriverOptions = {},
+): SandboxRuntime {
+	const runtime = fakeOciRuntime(state, handle, knobs, limits, driverOptions);
 	runtime.state = "unready";
 	return runtime;
 }

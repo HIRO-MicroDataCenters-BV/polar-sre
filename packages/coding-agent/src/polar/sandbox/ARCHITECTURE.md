@@ -6,10 +6,17 @@
 
 ## 1. Isolation Model & Hot VM Lifecycle
 
-The `sandbox` extension (`builtin:sandbox`) registers the `run_code` tool, executing Python 3.13 or Bash scripts inside an isolated Linux VM behind the `SandboxDriver` interface (`AppleContainerDriver` on macOS via the `container` CLI).
+The `sandbox` extension (`builtin:sandbox`) registers the `run_code` tool, executing Python 3.13 or Bash scripts inside an isolated Linux sandbox behind the `SandboxDriver` interface:
+- **`AppleContainerDriver` (`apple-container`):** macOS Desktop microVM via the native `container` CLI (`Virtualization.framework`).
+- **`OciDriver` (`oci`):** Linux Desktop OCI container via `podman` (rootless `>= 4.3` with `--userns=keep-id:uid=1000,gid=1000 --user 1000:1000`) or standard `docker` (`--user <hostUid>:<hostGid>`), with optional `--sandbox-oci-runtime` (`krun` or `runsc`). Rootless Docker is rejected with an explicit actionable reason.
 
+- **Driver Selection (`--sandbox-driver`):**
+  - Default `"auto"`: selects `"k8s"` if `POLAR_SANDBOX_K8S_PVC` is set, `"apple-container"` on `darwin`, and `"oci"` on `linux`.
+  - On `oci` startup, notifies the operator of the selected engine and isolation boundary (`sandbox: oci (podman/krun)` or `sandbox: oci (docker/runc, shared kernel)`).
 - **Artifact Bus Mount (`/data`):** Mounts `session.outputDirectory` read-only at `/data` inside the guest. The host working directory (`cwd`) is never mounted inside the VM; only `/data` and `/work` exist.
 - **Persistent Workspace (`/work`):** Mounts a per-session volume (`polar-work-<sessionId>`, `4 GiB`) read-write at `/work` (`HOME=/work`). Files in `/work` persist across calls and across VM recreations within the session.
+  - On `apple-container`, the volume is created with `-s 4096M` (hard ext4 block limit returning `ENOSPC`).
+  - On `oci` (where named volumes have no block size limit), `launcher` runs a background `du -sk /work` watchdog (using a pure-bash `read -t 0.1` timer on an unlinked FIFO without extra child processes) that kills the interpreter process group and exits with code `199` (`status: "work_limit"`) if `/work` exceeds `workMaxBytes` (`4 GiB`) and grows beyond its size at the start of the call (`currentBytes > workMaxBytes && currentBytes > initialBytes`). Calls that do not increase `/work` size (such as `rm` to free space) proceed freely.
 - **Image Lookup & First-Start UX (`workspace.ts`):**
   - Default image tag: `polar-sandbox:0.2` (multi-arch: `linux/arm64` and `linux/amd64`).
   - Lookup order in local cache:
@@ -19,13 +26,13 @@ The `sandbox` extension (`builtin:sandbox`) registers the `run_code` tool, execu
     - If `ctx.hasUI === false` (non-interactive / headless mode), no menu is shown and `sandbox` immediately disables itself (`sandbox is off: image ... is not installed (...)`).
     - If `ctx.hasUI === true` (interactive TUI), `ctx.ui.select` offers `Download prebuilt image` (only when `REGISTRY_IMAGE` / `--sandbox-registry-image` is set, with a `10 min` timeout), `Build sandbox image locally (~2 min)` (builds from `getSandboxImageDir()` with a `10 min` timeout), and `Disable sandbox for this session`.
 - **Operator Output Quotas:** `fileMaxBytes` is `4 GiB` and `sessionMaxBytes` is `16 GiB`.
-- **Lazy Hot Sandbox VM:**
-  - The sandbox VM is started lazily on the first `run_code` call in the session (`driver.startSandbox`), not at `session_start`.
-  - The VM runs with `--network none`, `--read-only`, `--cap-drop ALL`, `--user 1000:1000`, `2 GiB` RAM, `4` CPUs, `nproc=256`, and a `512 MiB` tmpfs at `/tmp` (without `--init`).
+- **Lazy Hot Sandbox VM / Container:**
+  - The sandbox is started lazily on the first `run_code` call in the session (`driver.startSandbox`), not at `session_start`.
+  - Runs with `--network none`, `--read-only`, `--cap-drop ALL`, `2 GiB` RAM (`--memory 2048m --memory-swap 2048m` on `oci`), `4` CPUs (checked against `host.cgroupControllers` in `podman info`), `256` max processes (`--ulimit nproc=256:256` on `apple-container`, `--pids-limit 256` on `oci`), and a `512 MiB` tmpfs at `/tmp` (without `--init`). On `oci`, also passes `--security-opt=no-new-privileges` and `--security-opt label=disable`.
   - PID 1 inside the guest is `bash -c 'echo; while read -r _; do :; done'`. Built-in `read` spawns no child process, survives `kill -9 -1`, reaps zombies, and exits immediately on `stdin` EOF if the host `polar` process exits or is killed with `SIGKILL`.
-  - Each `run_code` invocation executes via `container exec --interactive --user 1000:1000 --workdir /work ... bash -c <launcher>` (`spawnCall`). The `300s` per-call timeout starts strictly when `spawnCall` spawns the script, excluding lazy VM boot time.
-  - After every completed call, `scrubAfterCall` runs an external `container exec` that kills any remaining processes of `uid 1000`, removes SysV IPC objects (`ipcrm --all`), resets permissions (`chmod -R u+rwX`), deletes all entries under `/tmp`, `/dev/shm`, and `/dev/mqueue`, and verifies that no user processes, temporary files, or SysV IPC objects remain.
-  - On timeout, cancellation, output limit, OOM, stopped/missing/unknown container inspection, or `scrubAfterCall` returning `false`, the hot VM is destroyed (`hot.destroy`) and transparently recreated on the next call while preserving `/work`.
+  - Each `run_code` invocation executes via `<engine> exec --interactive --user <guestUser> --workdir /work ... bash -c <launcher>` (`spawnCall`). The `300s` per-call timeout starts strictly when `spawnCall` spawns the script, excluding lazy boot time.
+  - After every completed call, `scrubAfterCall` runs an external `<engine> exec` that kills any remaining processes of the guest user, removes SysV IPC objects (`ipcrm --all`), resets permissions (`chmod -R u+rwX`), deletes all entries under `/tmp`, `/dev/shm`, and `/dev/mqueue`, and verifies that no user processes, temporary files, or SysV IPC objects remain.
+  - On timeout, cancellation, output limit, OOM, stopped/missing/unknown container inspection, or `scrubAfterCall` returning `false`, the hot sandbox is destroyed (`hot.destroy`) and transparently recreated on the next call while preserving `/work`.
 - **Sequential Execution:** `executionMode: "sequential"` runs one call at a time per session.
 - **UI vs LLM Naming Contract:** No footer status (`ctx.ui.setStatus`) is set. User-facing notifications (`ctx.ui.notify`) refer to the runtime as `sandbox` (`sandbox is off: ...`, `sandbox: ...`), whereas the tool name, `promptGuidelines`, and model-facing replies use `run_code` (`[run_code <status>]`, `run_code-<n>.txt`, `run_code-stderr-<n>.txt`).
 
@@ -38,7 +45,7 @@ Each layer in `packages/coding-agent/src/polar/sandbox/src/` imports only from l
 ```text
 packages/coding-agent/src/polar/sandbox/
 ├── ARCHITECTURE.md                  # VM sandbox architecture and layer boundaries
-├── index.ts                         # --sandbox-image / --sandbox-registry-image flags, session_start/shutdown wiring, tool registration
+├── index.ts                         # --sandbox-driver / --sandbox-image / --sandbox-registry-image / --sandbox-oci-* flags, session_start/shutdown wiring, tool registration
 ├── image/
 │   ├── Containerfile                # Multi-arch guest image definition (default tag: polar-sandbox:0.2)
 │   ├── requirements.in
@@ -46,12 +53,13 @@ packages/coding-agent/src/polar/sandbox/
 ├── src/
 │   ├── types.ts                     # Domain data structures, state types, SandboxDriver & HotSandbox contracts
 │   ├── cli.ts                       # Layer 1: Stateless CLI execution, JSON parsing, container cleanup
-│   ├── driver.ts                    # Layer 2: AppleContainerDriver and AppleHotSandbox implementation
+│   ├── driver.ts                    # Layer 2: AppleContainerDriver / AppleHotSandbox and OciDriver / OciHotSandbox implementations
 │   ├── workspace.ts                 # Layer 3: Readiness check, image lookup/pull/build UX, orphan GC, /work volume setup
-│   ├── runner.ts                    # Layer 4: Admission, lazy HotSandbox lifecycle, call supervision, OOM & scrub
+│   ├── runner.ts                    # Layer 4: Admission, lazy HotSandbox lifecycle, call supervision, OOM, work_limit & scrub
 │   └── reply.ts                     # Layer 5: Reply budget calculation, stdout/stderr store finalization, formatting
 └── test/
     ├── fake-container.mjs           # Stateful stand-in for the `container` CLI in tests
+    ├── fake-oci.mjs                 # Stateful stand-in for the `podman` / `docker` CLI in tests
     ├── fixtures.ts
     └── *.test.ts
 ```
@@ -59,13 +67,13 @@ packages/coding-agent/src/polar/sandbox/
 ### Layer Responsibilities
 
 1. **`src/cli.ts` (Layer 1 — Stateless CLI & Diagnostic Primitives)**
-   - Spawns short `container` commands with `commandTimeoutMs` (`30s`) and optional `AbortSignal`, tracking child processes in `runtime.children`.
-   - Parses JSON array outputs (`parseListing`, `parseContainers`, `parseVolumes`, including container runtime state) and bounds diagnostic stderr (`boundDiagnostic`: `4 KiB` / `64` lines).
-   - Implements `cleanupContainer(runtime, name, deadlineAt)`: runs `container delete --force <name>`, and if non-zero, checks `container list --all --format json` before removing `name` from `runtime.owned`.
+   - Spawns short runtime CLI commands with `commandTimeoutMs` (`30s`) and optional `AbortSignal`, tracking child processes in `runtime.children`.
+   - Parses `apple-container` and `oci` (`podman` / `docker`) JSON/line outputs (`parseListing`, `parseContainers`, `parseVolumes`, `parseOciNames`, `parseOciContainers`, `parseOciVolumes`, `parseOciOomKilled`) and bounds diagnostic stderr (`boundDiagnostic`: `4 KiB` / `64` lines).
+   - Implements `cleanupContainer` (`container delete --force` + `list --all --format json`) and `cleanupOciContainer` (`<engine> rm --force` + `ps -a --format {{.Names}}`).
 
 2. **`src/driver.ts` (Layer 2 — `SandboxDriver` & `HotSandbox`)**
-   - `AppleContainerDriver`: implements runtime readiness (`checkRuntime`, `inspectImage`, `pullImage`, `buildImage`), orphan discovery and deletion (`listSandboxes`, `deleteSandbox`, `manualDeleteCommand`), `/work` volume lifecycle (`listWorkVolumes`, `ensureWorkVolume`, `deleteWorkVolume`), and lazy hot VM startup (`startSandbox`).
-   - `AppleHotSandbox`: manages the keepalive `container run -i` process, records the boot-log OOM baseline before spawning `container exec -i ... bash -c <launcher>` (`spawnCall`), computes OOM deltas (`checkOom`), inspects container state (`inspect`: `present` when `running`, `stopped`, `absent`, or `unknown`), scrubs guest processes, files, and SysV IPC after calls (`scrubAfterCall`), and tears down the VM (`destroy`).
+   - `AppleContainerDriver` & `AppleHotSandbox`: macOS microVM implementation via `container`, recording the boot-log OOM baseline before `spawnCall` and computing OOM deltas via `logs --boot`.
+   - `OciDriver` & `OciHotSandbox`: Linux OCI implementation via `podman` or `docker`. Discovers the engine (`podman` then `docker` in `auto` mode via `<engine> info --format "{{json .}}"`), rejects rootless Docker and rootless Podman `< 4.3`, checks `cpu` cgroup delegation in `podman info`, lists leftovers via `ps -a --filter label=polar-root=<root> --format {{.Names}}` + `inspect`, prepares `/work` (`:nocopy`) with `chown`, enforces the soft `work_limit` (`exit 199`) in `launcher`, and detects OOM by `oom_kill` delta in `/sys/fs/cgroup/memory.events` or container `.State.OOMKilled`.
 
 3. **`src/workspace.ts` (Layer 3 — Session Workspace & Recovery)**
    - `startRuntime` and `checkReadiness`: checks driver readiness, inspects image candidates (`--sandbox-image` -> `REGISTRY_IMAGE` -> `polar-sandbox:0.2`), runs the interactive `ctx.ui.select` flow (`Download prebuilt image` / `Build sandbox image locally (~2 min)` / `Disable sandbox for this session`) when `ctx.hasUI === true` or disables immediately when `ctx.hasUI === false`, recovers leftover resources under the same `polar-root`, and prepares `/work`.

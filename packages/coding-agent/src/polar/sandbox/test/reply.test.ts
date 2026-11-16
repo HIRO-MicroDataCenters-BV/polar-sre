@@ -134,7 +134,15 @@ describe("buildReply", () => {
 	});
 
 	it("publishes the file with the outcome by how the run ended or deletes it, naming the absolute path", async () => {
-		const statuses: SandboxStatus[] = ["ok", "failed", "timeout", "cancelled", "output_limit", "out_of_memory"];
+		const statuses: SandboxStatus[] = [
+			"ok",
+			"failed",
+			"timeout",
+			"cancelled",
+			"output_limit",
+			"work_limit",
+			"out_of_memory",
+		];
 		const outputs: [string, string][] = [
 			["fits", rows(3)],
 			["does not fit", rows(500)],
@@ -236,6 +244,13 @@ describe("buildReply", () => {
 				[
 					"[run_code out_of_memory]",
 					`The ${describeBytes(limits.memoryBytes)} memory limit was reached and the process was killed. Kernel: Memory cgroup out of memory: Killed process 129 (python3)`,
+				],
+			],
+			[
+				{ status: "work_limit", exitCode: 199 },
+				[
+					"[run_code work_limit]",
+					`The ${describeBytes(limits.workMaxBytes)} /work limit was reached and the process was killed.`,
 				],
 			],
 			[{ status: "failed", exitCode: 137 }, ["[run_code failed: exit 137]"]],

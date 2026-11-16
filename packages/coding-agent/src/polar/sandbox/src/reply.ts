@@ -341,6 +341,8 @@ function statusMessage(result: ResultState, limits: SandboxLimits): string | und
 			return "Cancelled.";
 		case "out_of_memory":
 			return `The ${describeBytes(limits.memoryBytes)} memory limit was reached and the process was killed. Kernel: ${result.oomEvidence ?? ""}`.trimEnd();
+		case "work_limit":
+			return `The ${describeBytes(limits.workMaxBytes)} /work limit was reached and the process was killed.`;
 		case "save_failed":
 			return `The output could not be saved: ${result.saveError?.message}. Tell the user.`;
 		case "runtime_failed":

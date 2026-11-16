@@ -8,6 +8,7 @@ import {
 	quotaMessage,
 } from "../../shared/store.ts";
 import { deadlineAfter, describeCleanupErrors, StreamCapture } from "./cli.ts";
+import { WORK_LIMIT_EXIT_CODE } from "./driver.ts";
 import type {
 	HotSandbox,
 	OutputLimit,
@@ -340,7 +341,10 @@ export class SandboxRun implements RunningCall {
 		} else if (this.exitCode !== 0) {
 			const judged = await this.judgeExit();
 			Object.assign(result, judged);
-			if (judged.status === "out_of_memory" || judged.inspection?.state !== "present") {
+			if (
+				judged.status === "out_of_memory" ||
+				(judged.status !== "work_limit" && judged.inspection?.state !== "present")
+			) {
 				shouldDestroy = true;
 			}
 		}
@@ -371,6 +375,9 @@ export class SandboxRun implements RunningCall {
 	}
 
 	private async judgeExit(): Promise<Pick<SandboxResult, "status" | "oomEvidence" | "inspection">> {
+		if (this.exitCode === WORK_LIMIT_EXIT_CODE) {
+			return { status: "work_limit" };
+		}
 		if (this.exitCode === SIGKILL_EXIT_CODE) {
 			const oomEvidence = await this.hot.checkOom(deadlineAfter(this.runtime));
 			if (oomEvidence !== undefined) return { status: "out_of_memory", oomEvidence };

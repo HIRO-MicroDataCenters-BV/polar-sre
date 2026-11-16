@@ -12,7 +12,7 @@ import type {
 } from "../../../core/extensions/types.ts";
 import sandboxExtension, { DEFAULT_IMAGE, RUN_CODE_RULES } from "../index.ts";
 import { BUILD_IMAGE_OPTION, DISABLE_SANDBOX_OPTION, DOWNLOAD_IMAGE_OPTION } from "../src/workspace.ts";
-import { FAKE_CONTAINER, type FakeState, fakeState, until } from "./fixtures.ts";
+import { FAKE_CONTAINER, FAKE_OCI, type FakeState, fakeState, until } from "./fixtures.ts";
 
 const fault = vi.hoisted(() => ({ failReplyOnce: false }));
 vi.mock(import("../src/reply.ts"), async (importOriginal) => {
@@ -220,6 +220,40 @@ describe("sandbox extension", () => {
 		expect(ready.notices).toEqual([]);
 		expect(await state.volumes()).toEqual([{ name: `polar-work-${SESSION_ID}`, labels, size: "4096M" }]);
 		expect(await readFile(lockPath(), "utf8")).toBe(`${process.pid}\n`);
+	});
+
+	it("notifies the operator of the OCI driver and isolation boundary on start", async () => {
+		const podmanWrapper = join(bin, "podman");
+		await writeFile(
+			podmanWrapper,
+			`#!/bin/sh\nexport FAKE_OCI_ENGINE=podman\nexport FAKE_OCI_STATE=${shellWord(state.directory)}\nexec "${process.execPath}" "${FAKE_OCI}" "$@"\n`,
+		);
+		await chmod(podmanWrapper, 0o755);
+		const dockerWrapper = join(bin, "docker");
+		await writeFile(
+			dockerWrapper,
+			`#!/bin/sh\nexport FAKE_OCI_ENGINE=docker\nexport FAKE_OCI_STATE=${shellWord(state.directory)}\nexec "${process.execPath}" "${FAKE_OCI}" "$@"\n`,
+		);
+		await chmod(dockerWrapper, 0o755);
+
+		const krun = loadExtension({
+			"sandbox-driver": "oci",
+			"sandbox-oci-engine": "podman",
+			"sandbox-oci-runtime": "krun",
+		});
+		await krun.startSession();
+		expect(krun.tools.map((tool) => tool.name)).toEqual(["run_code"]);
+		expect(krun.notices).toEqual([["sandbox: oci (podman/krun)", "info"]]);
+		await krun.shutdown();
+
+		const sharedKernel = loadExtension({
+			"sandbox-driver": "oci",
+			"sandbox-oci-engine": "docker",
+		});
+		await sharedKernel.startSession();
+		expect(sharedKernel.tools.map((tool) => tool.name)).toEqual(["run_code"]);
+		expect(sharedKernel.notices).toEqual([["sandbox: oci (docker/runc, shared kernel)", "info"]]);
+		await sharedKernel.shutdown();
 	});
 
 	it("describes the tool from the operator limits and the image flag", async () => {

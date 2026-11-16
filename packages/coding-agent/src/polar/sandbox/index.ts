@@ -4,13 +4,17 @@ import { acquireSession, type SessionHandle } from "../shared/session.ts";
 import { describeBytes, READ_MAX_BYTES } from "../shared/store.ts";
 import { nulCharacterError } from "../shared/validation.ts";
 import { describeCleanupErrors } from "./src/cli.ts";
-import { AppleContainerDriver, WORK_PATH } from "./src/driver.ts";
+import { AppleContainerDriver, OciDriver, UnsupportedSandboxDriver, WORK_PATH } from "./src/driver.ts";
 import { buildReply } from "./src/reply.ts";
 import { admitCall, shutdownRefusal } from "./src/runner.ts";
 import {
 	DATA_PATH,
+	type OciEngineChoice,
 	type RunningCall,
+	type SandboxDriver,
+	type SandboxDriverChoice,
 	type SandboxDriverContext,
+	type SandboxDriverName,
 	type SandboxLimits,
 	type SandboxRequest,
 	type SandboxRuntime,
@@ -75,6 +79,51 @@ export function describeRunCode(limits: SandboxLimits): string {
 export interface RuntimeImageOptions {
 	registryImage?: string;
 	customImage?: boolean;
+	driver?: SandboxDriverChoice;
+	ociEngine?: OciEngineChoice;
+	ociRuntime?: string;
+	platform?: NodeJS.Platform;
+}
+
+function createDriver(
+	context: SandboxDriverContext,
+	environment: NodeJS.ProcessEnv,
+	options: RuntimeImageOptions,
+): SandboxDriver {
+	const choice = options.driver ?? "auto";
+	const platform = options.platform ?? process.platform;
+	let driverName: SandboxDriverName | undefined;
+	if (choice === "auto") {
+		if (typeof environment.POLAR_SANDBOX_K8S_PVC === "string" && environment.POLAR_SANDBOX_K8S_PVC !== "") {
+			driverName = "k8s";
+		} else if (
+			platform === "darwin" ||
+			(environment.FAKE_CONTAINER_STATE !== undefined && environment.FAKE_OCI_STATE === undefined)
+		) {
+			driverName = "apple-container";
+		} else if (platform === "linux") {
+			driverName = "oci";
+		} else {
+			return new UnsupportedSandboxDriver("oci", `unsupported platform "${platform}" for --sandbox-driver=auto`);
+		}
+	} else if (choice === "apple-container" || choice === "oci" || choice === "k8s") {
+		driverName = choice;
+	} else {
+		return new UnsupportedSandboxDriver(
+			"oci",
+			`invalid --sandbox-driver "${String(choice)}"; expected auto, apple-container, oci, or k8s`,
+		);
+	}
+	if (driverName === "apple-container") {
+		context.containerCommand = "container";
+		return new AppleContainerDriver(context);
+	}
+	if (driverName === "oci") {
+		const engine = options.ociEngine ?? "auto";
+		context.containerCommand = engine === "docker" ? "docker" : "podman";
+		return new OciDriver(context, { engine, ociRuntime: options.ociRuntime });
+	}
+	return new UnsupportedSandboxDriver("k8s", "k8s sandbox driver is not enabled in this build");
 }
 
 export function createRuntime(
@@ -96,10 +145,11 @@ export function createRuntime(
 		children: new Map(),
 		cliStopped: false,
 	};
+	const driver = createDriver(context, context.environment, options);
 	return Object.assign(context, {
 		inFlight: new Set<string>(),
 		running: new Set<RunningCall>(),
-		driver: new AppleContainerDriver(context),
+		driver,
 		activeSandbox: {},
 	});
 }
@@ -154,6 +204,11 @@ export function createRunCodeTool(runtime: SandboxRuntime) {
 export default function sandboxExtension(pi: ExtensionAPI): void {
 	let current: SandboxRuntime | undefined;
 
+	pi.registerFlag("sandbox-driver", {
+		description: 'Sandbox driver: "auto", "apple-container", "oci", or "k8s" (default: auto)',
+		type: "string",
+		default: "auto",
+	});
 	pi.registerFlag("sandbox-image", {
 		description: `Image of the sandbox guest (default: ${DEFAULT_IMAGE})`,
 		type: "string",
@@ -161,6 +216,15 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
 	});
 	pi.registerFlag("sandbox-registry-image", {
 		description: "Prebuilt sandbox image in a container registry (for pull)",
+		type: "string",
+	});
+	pi.registerFlag("sandbox-oci-engine", {
+		description: 'OCI engine on Linux: "auto", "podman", or "docker" (default: auto)',
+		type: "string",
+		default: "auto",
+	});
+	pi.registerFlag("sandbox-oci-runtime", {
+		description: "Optional OCI runtime on Linux (e.g. krun or runsc)",
 		type: "string",
 	});
 
@@ -173,8 +237,21 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
 			process.argv.some((arg) => arg === "--sandbox-image" || arg.startsWith("--sandbox-image="));
 		const registryFlag = pi.getFlag("sandbox-registry-image");
 		const registryImage = typeof registryFlag === "string" && registryFlag !== "" ? registryFlag : undefined;
+		const driverFlag = pi.getFlag("sandbox-driver");
+		const driver = typeof driverFlag === "string" && driverFlag !== "" ? (driverFlag as SandboxDriverChoice) : "auto";
+		const ociEngineFlag = pi.getFlag("sandbox-oci-engine");
+		const ociEngine =
+			typeof ociEngineFlag === "string" && ociEngineFlag !== "" ? (ociEngineFlag as OciEngineChoice) : "auto";
+		const ociRuntimeFlag = pi.getFlag("sandbox-oci-runtime");
+		const ociRuntime = typeof ociRuntimeFlag === "string" && ociRuntimeFlag !== "" ? ociRuntimeFlag : undefined;
 		const handle = await acquireSession(ctx.sessionManager.getSessionId(), ctx.cwd);
-		const runtime = createRuntime(image, process.env, handle, { registryImage, customImage });
+		const runtime = createRuntime(image, process.env, handle, {
+			registryImage,
+			customImage,
+			driver,
+			ociEngine,
+			ociRuntime,
+		});
 		current = runtime;
 		const selectImage =
 			ctx.hasUI && typeof ctx.ui.select === "function"
@@ -187,6 +264,9 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
 			return;
 		}
 		runtime.state = "open";
+		if (runtime.driver.name === "oci") {
+			ctx.ui.notify(`sandbox: ${runtime.driver.boundaryDescription}`, "info");
+		}
 		pi.registerTool(createRunCodeTool(runtime));
 	});
 

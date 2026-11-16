@@ -78,6 +78,11 @@ export interface CleanupError {
 
 export type CleanupOutcome = { removed: true } | { removed: false; error: CleanupError };
 
+export type SandboxDriverName = "apple-container" | "oci" | "k8s";
+export type SandboxDriverChoice = "auto" | SandboxDriverName;
+export type OciEngine = "podman" | "docker";
+export type OciEngineChoice = "auto" | OciEngine;
+
 export type SandboxStatus =
 	| "ok"
 	| "failed"
@@ -85,6 +90,7 @@ export type SandboxStatus =
 	| "cancelled"
 	| "out_of_memory"
 	| "output_limit"
+	| "work_limit"
 	| "save_failed"
 	| "runtime_failed";
 

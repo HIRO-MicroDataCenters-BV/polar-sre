@@ -52,8 +52,8 @@ When creating any new extension directory `packages/coding-agent/src/polar/<name
    Provides `list_files` over `manifest.jsonl` and restricts Pi's built-in `read` tool to `.txt` files inside the active session directory up to `16 MiB`.
 3. **`<producer>/` (`k8s`, `loki`, `grafana`, ...)**
    Standalone, deterministic, read-only toolsets. Each producer validates structured tool parameters, streams output into `shared/store.ts`, and formats replies through `shared/reply.ts`.
-4. **`sandbox/` (Local VM Sandbox)**
-   An isolated Linux VM (`container` CLI via `SandboxDriver`) with Python and CLI analytics tools, exposed as the `run_code` tool. Mounts the session artifact directory read-only at `/data` and a persistent per-session volume at `/work`. Keeps a hot sandbox VM per session (lazily started on the first `run_code` call and scrubbed after each call) and writes its own large `stdout`/`stderr` outputs to the Artifact Bus.
+4. **`sandbox/` (Local VM / Container Sandbox)**
+   An isolated Linux sandbox (`AppleContainerDriver` on macOS via `container`, `OciDriver` on Linux via `podman` / `docker` behind `SandboxDriver`) with Python and CLI analytics tools, exposed as the `run_code` tool. Mounts the session artifact directory read-only at `/data` and a persistent per-session volume at `/work`. Keeps a hot sandbox per session (lazily started on the first `run_code` call and scrubbed after each call) and writes its own large `stdout`/`stderr` outputs to the Artifact Bus.
 
 ---
 
@@ -109,9 +109,9 @@ packages/coding-agent/src/polar/
 │   │   └── tools/                   # One file per ToolSpec
 │   └── test/
 │
-├── sandbox/                         # Isolated local VM sandbox extension (`run_code`)
-│   ├── ARCHITECTURE.md              # VM sandbox architecture and internal layer boundaries
-│   ├── index.ts                     # --sandbox-image / --sandbox-registry-image flags, startup readiness, shutdown, tool registration
+├── sandbox/                         # Isolated local VM / container sandbox extension (`run_code`)
+│   ├── ARCHITECTURE.md              # Sandbox architecture and internal layer boundaries
+│   ├── index.ts                     # --sandbox-driver / --sandbox-image / --sandbox-registry-image / --sandbox-oci-* flags, startup readiness, shutdown, tool registration
 │   ├── image/
 │   │   ├── Containerfile
 │   │   ├── requirements.in
@@ -119,10 +119,10 @@ packages/coding-agent/src/polar/
 │   ├── src/
 │   │   ├── types.ts                 # Domain types and `SandboxDriver` / `HotSandbox` contracts
 │   │   ├── cli.ts                   # Layer 1: Stateless CLI execution, JSON parsing, container cleanup
-│   │   ├── driver.ts                # Layer 2: `AppleContainerDriver` and `AppleHotSandbox` implementation
+│   │   ├── driver.ts                # Layer 2: `AppleContainerDriver` / `AppleHotSandbox` and `OciDriver` / `OciHotSandbox` implementations
 │   │   ├── workspace.ts             # Layer 3: Readiness check, image lookup/pull/build UX, orphan GC, /work volume setup
-│   │   ├── runner.ts                # Layer 4: Lazy hot VM lifecycle, `spawnCall` supervision, OOM delta check, scrub
-│   │   └── reply.ts                 # Layer 5: Sandbox reply formatting (with OOM, inspection, and cleanup notices)
+│   │   ├── runner.ts                # Layer 4: Lazy hot VM lifecycle, `spawnCall` supervision, OOM delta & work_limit check, scrub
+│   │   └── reply.ts                 # Layer 5: Sandbox reply formatting (with OOM, work_limit, inspection, and cleanup notices)
 │   └── test/
 │
 └── test/                            # Cross-extension architectural tests

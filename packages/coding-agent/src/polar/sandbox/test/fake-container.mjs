@@ -250,7 +250,11 @@ async function execCommand(args) {
 			current.execPid = null;
 			writeContainer(current);
 		}
-		process.exit(exitCode);
+		process.stdout.end(() => {
+			process.stderr.end(() => {
+				process.exit(exitCode);
+			});
+		});
 	}, delayMs);
 }
 
