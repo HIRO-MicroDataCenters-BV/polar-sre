@@ -1,7 +1,7 @@
 # The Python kit of the sandbox image. Pinned with universal wheel hashes (aarch64 and x86_64) into requirements.txt by:
 #   uv pip compile --python-version 3.13 --python-platform aarch64-manylinux_2_28 --generate-hashes -o requirements.txt requirements.in
 duckdb
-polars
+polars[rtcompat]
 pandas
 orjson
 ijson
