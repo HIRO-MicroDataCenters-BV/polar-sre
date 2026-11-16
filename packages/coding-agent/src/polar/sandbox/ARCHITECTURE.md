@@ -13,11 +13,11 @@ The `sandbox` extension (`builtin:sandbox`) registers the `run_code` tool, execu
 - **Image Lookup & First-Start UX (`workspace.ts`):**
   - Default image tag: `polar-sandbox:0.2` (multi-arch: `linux/arm64` and `linux/amd64`).
   - Lookup order in local cache:
-    1. If `--sandbox-image` (or `POLAR_SANDBOX_IMAGE`) is explicitly provided, only that image is checked.
-    2. Otherwise, `REGISTRY_IMAGE` / `--sandbox-registry-image` (`POLAR_SANDBOX_REGISTRY_IMAGE`) is checked first (when configured), followed by the local tag `polar-sandbox:0.2`.
+    1. If `--sandbox-image` is explicitly provided, only that image is checked.
+    2. Otherwise, `REGISTRY_IMAGE` / `--sandbox-registry-image` is checked first (when configured), followed by the local tag `polar-sandbox:0.2`.
   - When the image is not found in local cache:
     - If `ctx.hasUI === false` (non-interactive / headless mode), no menu is shown and `sandbox` immediately disables itself (`sandbox is off: image ... is not installed (...)`).
-    - If `ctx.hasUI === true` (interactive TUI), `ctx.ui.select` offers `Download prebuilt image` (only when `REGISTRY_IMAGE` / `--sandbox-registry-image` is set), `Build sandbox image locally (~2 min)` (builds from `getSandboxImageDir()` with a `10 min` timeout), and `Disable sandbox for this session`.
+    - If `ctx.hasUI === true` (interactive TUI), `ctx.ui.select` offers `Download prebuilt image` (only when `REGISTRY_IMAGE` / `--sandbox-registry-image` is set, with a `10 min` timeout), `Build sandbox image locally (~2 min)` (builds from `getSandboxImageDir()` with a `10 min` timeout), and `Disable sandbox for this session`.
 - **Operator Output Quotas:** `fileMaxBytes` is `4 GiB` and `sessionMaxBytes` is `16 GiB`.
 - **Lazy Hot Sandbox VM:**
   - The sandbox VM is started lazily on the first `run_code` call in the session (`driver.startSandbox`), not at `session_start`.

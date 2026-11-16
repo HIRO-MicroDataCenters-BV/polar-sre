@@ -83,13 +83,10 @@ export function createRuntime(
 	handle: SessionHandle,
 	options: RuntimeImageOptions = {},
 ): SandboxRuntime {
-	const envRegistry = environment.POLAR_SANDBOX_REGISTRY_IMAGE;
-	const registryImage =
-		options.registryImage ?? (typeof envRegistry === "string" && envRegistry !== "" ? envRegistry : REGISTRY_IMAGE);
 	const context: SandboxDriverContext = {
 		containerCommand: "container",
 		image,
-		registryImage,
+		registryImage: options.registryImage ?? REGISTRY_IMAGE,
 		customImage: options.customImage ?? image !== DEFAULT_IMAGE,
 		limits: LIMITS,
 		environment: { ...environment },
@@ -170,16 +167,9 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
 	pi.on("session_start", async (_event, ctx) => {
 		const warn = (message: string) => ctx.ui.notify(message, "warning");
 		const flag = pi.getFlag("sandbox-image");
-		const envImage = process.env.POLAR_SANDBOX_IMAGE;
-		const image =
-			typeof flag === "string" && flag !== "" && flag !== DEFAULT_IMAGE
-				? flag
-				: typeof envImage === "string" && envImage !== ""
-					? envImage
-					: DEFAULT_IMAGE;
+		const image = typeof flag === "string" && flag !== "" ? flag : DEFAULT_IMAGE;
 		const customImage =
 			image !== DEFAULT_IMAGE ||
-			(typeof envImage === "string" && envImage !== "") ||
 			process.argv.some((arg) => arg === "--sandbox-image" || arg.startsWith("--sandbox-image="));
 		const registryFlag = pi.getFlag("sandbox-registry-image");
 		const registryImage = typeof registryFlag === "string" && registryFlag !== "" ? registryFlag : undefined;

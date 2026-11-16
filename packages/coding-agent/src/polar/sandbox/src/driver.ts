@@ -321,7 +321,7 @@ export class AppleContainerDriver implements SandboxDriver {
 	}
 
 	pullImage(image: string, signal?: AbortSignal): Promise<CommandOutcome> {
-		return containerCommand(this.runtime, ["image", "pull", image], this.runtime.limits.commandTimeoutMs, signal);
+		return containerCommand(this.runtime, ["image", "pull", image], BUILD_TIMEOUT_MS, signal);
 	}
 
 	buildImage(image: string, contextDir: string, signal?: AbortSignal): Promise<CommandOutcome> {
