@@ -302,6 +302,20 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 		expect(next.reply.text).toBe("399999\n");
 	}, 120_000);
 
+	it("does not truncate unbuffered python stdout writes larger than 64 KiB", async () => {
+		const big = await call(
+			"import sys\nprint('x' * 4000000)\nfor i in range(16):\n    sys.stdout.buffer.write(bytes([97 + i]) * 262144)",
+		);
+		expect(big.result.status).toBe("ok");
+		const entry = (await readManifest(session)).filter((item) => item.tool === "run_code").at(-1);
+		expect(entry?.size).toBe(4000001 + 16 * 262144);
+		const next = await call(
+			`wc -c < /data/${entry?.file}; tail -c 262144 /data/${entry?.file} | tr -d p | wc -c`,
+			"bash",
+		);
+		expect(next.reply.text).toBe("8194305\n0\n");
+	}, 60_000);
+
 	it("detects OOM by delta so an OOM in call N never marks call N+1 as OOM", async () => {
 		const alloc = "b = [bytearray(16 * 2**20) for _ in range(128)]";
 		const caught = await call(`{ python3 -c "${alloc}"; } 2>/dev/null || echo caught`, "bash");

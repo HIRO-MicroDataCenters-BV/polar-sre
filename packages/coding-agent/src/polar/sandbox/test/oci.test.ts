@@ -523,4 +523,44 @@ describe("OciHotSandbox execution, OOM, and work_limit", () => {
 			await rm(tmpDir, { recursive: true, force: true });
 		}
 	});
+
+	it("copies program stdout and stderr through pipes in the bash launcher", async () => {
+		const tmpDir = await mkdtemp(join(tmpdir(), "sandbox-launcher-pipes-"));
+		const workDir = join(tmpDir, "work");
+		await mkdir(workDir, { recursive: true });
+		const execLauncher = (language: SandboxLanguage, code: string) =>
+			spawnSync("bash", ["-c", launcher(language, { workMaxBytes: 64 * 1024 })], {
+				input: code,
+				encoding: "utf8",
+				env: { ...process.env, TMPDIR: tmpDir, POLAR_WORK_DIR: workDir },
+			});
+		try {
+			// 1. Large stdout and stderr (> 64 KiB pipe buffer) are drained in full and the exit code is preserved
+			const failed = execLauncher(
+				"python",
+				"import sys\nprint('x' * 300000)\nsys.stderr.write('e' * 300000)\nsys.exit(7)\n",
+			);
+			expect(failed.status).toBe(7);
+			expect(failed.stdout).toBe(`${"x".repeat(300000)}\n`);
+			expect(failed.stderr).toBe("e".repeat(300000));
+
+			// 2. Output flushed before a work_limit watchdog kill is preserved
+			const overLimit = execLauncher(
+				"python",
+				`print("before", flush=True)\nwith open(${JSON.stringify(join(workDir, "big.bin"))}, "wb") as f:\n    f.write(b"x" * 262144)\n    f.flush()\nimport time\ntime.sleep(30)\n`,
+			);
+			expect(overLimit.status).toBe(WORK_LIMIT_EXIT_CODE);
+			expect(overLimit.stdout).toBe("before\n");
+			await rm(join(workDir, "big.bin"));
+
+			// 3. Background child inheriting stdout is killed with the interpreter process group and does not hang wait
+			const started = performance.now();
+			const background = execLauncher("bash", "sleep 30 &\necho started\n");
+			expect(background.status).toBe(0);
+			expect(background.stdout).toBe("started\n");
+			expect(performance.now() - started).toBeLessThan(3000);
+		} finally {
+			await rm(tmpDir, { recursive: true, force: true });
+		}
+	});
 });
