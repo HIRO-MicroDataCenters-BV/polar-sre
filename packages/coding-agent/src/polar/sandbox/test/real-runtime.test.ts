@@ -8,12 +8,16 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { acquireSession, type SessionHandle } from "../../shared/session.ts";
 import { readManifest } from "../../shared/store.ts";
 import { createRuntime, DEFAULT_IMAGE } from "../index.ts";
-import { containerCommand, parseContainers, parseListing, parseOciContainers, parseOciVolumes } from "../src/cli.ts";
+import { containerCommand } from "../src/cli.ts";
 import {
 	inspectionOf,
 	type OciDriver,
 	ociInspectionOf,
 	ociSandboxArguments,
+	parseContainers,
+	parseListing,
+	parseOciContainers,
+	parseOciVolumes,
 	SESSION_LABEL,
 	sandboxArguments,
 	sessionLabels,

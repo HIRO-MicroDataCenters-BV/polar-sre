@@ -67,6 +67,13 @@ export function artifactsRoot(environment: NodeJS.ProcessEnv = process.env): str
 	return join(cacheHome, "polar-artifacts");
 }
 
+export function staleSessionMs(environment: NodeJS.ProcessEnv = process.env): number {
+	const raw = environment.POLAR_SESSION_TTL_MS?.trim();
+	if (raw === undefined || !/^\d+$/.test(raw)) return STALE_SESSION_MS;
+	const parsed = Number(raw);
+	return Number.isSafeInteger(parsed) ? parsed : STALE_SESSION_MS;
+}
+
 export function sessionPaths(sessionId: string, cwd: string, root: string = artifactsRoot()): SessionPaths {
 	return { sessionId, cwd, outputDirectory: join(resolve(root), sessionId) };
 }
@@ -116,6 +123,9 @@ export async function sessionLiveness(root: string, sessionId: string): Promise<
 	const text = content.trim();
 	const pid = Number(text);
 	if (!/^\d+$/.test(text) || !Number.isSafeInteger(pid) || pid <= 0) return "unknown";
+	if (pid === process.pid) {
+		return registry().has(join(resolve(root), sessionId)) ? "alive" : "ended";
+	}
 	try {
 		process.kill(pid, 0);
 		return "alive";
@@ -157,7 +167,7 @@ async function prepare(context: RegisteredContext, options: AcquireOptions): Pro
 			dirname(directory),
 			directory,
 			options.now ?? Date.now(),
-			options.staleAfterMs ?? STALE_SESSION_MS,
+			options.staleAfterMs ?? staleSessionMs(),
 		);
 		const measured = await measureOutputFiles(directory);
 		context.publishedBytes = measured.publishedBytes;

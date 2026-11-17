@@ -1,0 +1,61 @@
+# Multi-arch image for running the Polar agent 24/7 in Kubernetes (--mode rpc).
+# Build from repository root:
+#   docker build --platform linux/arm64 --tag polar:0.2 --file deploy/k8s/Containerfile .
+#   docker build --platform linux/amd64 --tag polar:0.2 --file deploy/k8s/Containerfile .
+FROM node:22-bookworm-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee AS builder
+
+ARG TARGETARCH
+ARG KUBECTL_VERSION=v1.35.2
+ARG KUBECTL_SHA256_ARM64=cd859449f54ad2cb05b491c490c13bb836cdd0886ae013c0aed3dd67ff747467
+ARG KUBECTL_SHA256_AMD64=924eb50779153f20cb668117d141440b95df2f325a64452d78dff9469145e277
+
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends ca-certificates curl \
+	&& rm -rf /var/lib/apt/lists/* \
+	&& case "${TARGETARCH}" in \
+		arm64) KUBECTL_SHA256="${KUBECTL_SHA256_ARM64}" ;; \
+		amd64) KUBECTL_SHA256="${KUBECTL_SHA256_AMD64}" ;; \
+		*) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+	esac \
+	&& curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl" -o /usr/local/bin/kubectl \
+	&& echo "${KUBECTL_SHA256}  /usr/local/bin/kubectl" | sha256sum -c - \
+	&& chmod 0755 /usr/local/bin/kubectl
+
+WORKDIR /build
+COPY . .
+RUN npm ci --ignore-scripts && npm run build:offline
+
+FROM node:22-bookworm-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee
+
+ENV NODE_ENV=production \
+	HOME=/home/polar \
+	TMPDIR=/tmp \
+	LANG=C.UTF-8
+
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends ca-certificates \
+	&& rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/bin/kubectl /usr/local/bin/kubectl
+
+WORKDIR /app
+COPY --from=builder /build/package.json /app/package.json
+COPY --from=builder /build/packages/chord/package.json /app/node_modules/@earendil-works/chord/package.json
+COPY --from=builder /build/packages/chord/dist /app/node_modules/@earendil-works/chord/dist
+COPY --from=builder /build/node_modules/@silvia-odwyer/photon-node /app/node_modules/@silvia-odwyer/photon-node
+COPY --from=builder /build/packages/coding-agent/package.json /app/packages/coding-agent/package.json
+COPY --from=builder /build/packages/coding-agent/README.md /app/packages/coding-agent/README.md
+COPY --from=builder /build/packages/coding-agent/CHANGELOG.md /app/packages/coding-agent/CHANGELOG.md
+COPY --from=builder /build/packages/coding-agent/dist/bundle /app/packages/coding-agent/dist/bundle
+COPY --from=builder /build/packages/coding-agent/dist/modes/interactive/theme /app/packages/coding-agent/dist/modes/interactive/theme
+COPY --from=builder /build/packages/coding-agent/dist/core/export-html /app/packages/coding-agent/dist/core/export-html
+COPY --from=builder /build/packages/coding-agent/dist/polar/sandbox/image /app/packages/coding-agent/dist/polar/sandbox/image
+
+RUN ln -s /app/packages/coding-agent/dist/bundle/cli.js /usr/local/bin/polar \
+	&& mkdir -p /artifacts /sessions /home/polar \
+	&& chown -R 1000:1000 /artifacts /sessions /home/polar
+
+USER 1000:1000
+WORKDIR /home/polar
+ENTRYPOINT ["polar"]
+CMD ["--mode", "rpc", "--session-dir", "/sessions"]

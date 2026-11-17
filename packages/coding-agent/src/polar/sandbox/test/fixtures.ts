@@ -3,11 +3,18 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { setTimeout as sleep } from "timers/promises";
 import { fileURLToPath } from "url";
-import { AppleContainerDriver, OciDriver, type OciDriverOptions } from "../src/driver.ts";
+import {
+	AppleContainerDriver,
+	K8sDriver,
+	type K8sDriverOptions,
+	OciDriver,
+	type OciDriverOptions,
+} from "../src/driver.ts";
 import type { RunningCall, SandboxDriverContext, SandboxLimits, SandboxRuntime, SessionHandle } from "../src/types.ts";
 
 export const FAKE_CONTAINER = fileURLToPath(new URL("./fake-container.mjs", import.meta.url));
 export const FAKE_OCI = fileURLToPath(new URL("./fake-oci.mjs", import.meta.url));
+export const FAKE_KUBECTL = fileURLToPath(new URL("./fake-kubectl.mjs", import.meta.url));
 
 export const testLimits: SandboxLimits = {
 	timeoutMs: 10_000,
@@ -35,9 +42,10 @@ export interface VolumeRecord {
 export interface FakeState {
 	directory: string;
 	calls(): Promise<string[][]>;
+	manifests(): Promise<Record<string, unknown>[]>;
 	containers(): Promise<string[]>;
 	volumes(): Promise<VolumeRecord[]>;
-	addContainer(id: string, labels: Record<string, string>): Promise<void>;
+	addContainer(id: string, labels: Record<string, string>, annotations?: Record<string, string>): Promise<void>;
 	addVolume(name: string, labels: Record<string, string>): Promise<void>;
 }
 
@@ -64,14 +72,29 @@ export async function fakeState(): Promise<FakeState> {
 				.filter((line) => line !== "")
 				.map((line) => JSON.parse(line) as string[]);
 		},
+		async manifests() {
+			const text = await readFile(join(directory, "manifests.jsonl"), "utf8").catch(() => "");
+			return text
+				.split("\n")
+				.filter((line) => line !== "")
+				.map((line) => JSON.parse(line) as Record<string, unknown>);
+		},
 		async containers() {
 			return (await listJson<{ id: string }>("containers")).map((record) => record.id).sort();
 		},
 		volumes() {
 			return listJson<VolumeRecord>("volumes");
 		},
-		addContainer(id, labels) {
-			return writeRecord("containers", id, { id, labels, state: "stopped", pid: null, execPid: null, bootLog: [] });
+		addContainer(id, labels, annotations = {}) {
+			return writeRecord("containers", id, {
+				id,
+				labels,
+				annotations,
+				state: "stopped",
+				pid: null,
+				execPid: null,
+				bootLog: [],
+			});
 		},
 		addVolume(name, labels) {
 			return writeRecord("volumes", name, { name, labels, size: "4M" });
@@ -165,6 +188,85 @@ export function startingOciRuntime(
 	driverOptions: OciDriverOptions = {},
 ): SandboxRuntime {
 	const runtime = fakeOciRuntime(state, handle, knobs, limits, driverOptions);
+	runtime.state = "unready";
+	return runtime;
+}
+
+export async function fakeServiceAccountDir(
+	baseDir: string,
+	values: { namespace?: string; token?: string; ca?: string } = {},
+): Promise<string> {
+	const saDir = join(baseDir, "serviceaccount");
+	await mkdir(saDir, { recursive: true });
+	await writeFile(join(saDir, "namespace"), `${values.namespace ?? "polar"}\n`);
+	await writeFile(join(saDir, "token"), `${values.token ?? "test-sa-token"}\n`);
+	await writeFile(
+		join(saDir, "ca.crt"),
+		values.ca ?? "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n",
+	);
+	return saDir;
+}
+
+export function fakeK8sEnvironment(state: FakeState, knobs: Record<string, string> = {}): NodeJS.ProcessEnv {
+	const environment: NodeJS.ProcessEnv = {
+		PATH: process.env.PATH,
+		FAKE_KUBECTL_STATE: state.directory,
+		POLAR_SANDBOX_K8S_PVC: "polar-shared",
+		POLAR_SANDBOX_K8S_RUNTIME_CLASS: "gvisor",
+		POLAR_SANDBOX_K8S_IMAGE: "registry.example/polar-sandbox@sha256:deadbeef",
+		POLAR_SANDBOX_K8S_POD_NAME: "polar-0",
+		POLAR_SANDBOX_K8S_POD_UID: "uid-polar-0",
+		POLAR_SANDBOX_K8S_NODE_NAME: "polar-node-1",
+		KUBERNETES_SERVICE_HOST: "10.43.0.1",
+		KUBERNETES_SERVICE_PORT: "443",
+	};
+	for (const [name, value] of Object.entries(knobs)) {
+		if (name.startsWith("POLAR_") || name.startsWith("KUBERNETES_")) {
+			environment[name] = value;
+		} else {
+			environment[`FAKE_KUBECTL_${name}`] = value;
+		}
+	}
+	return environment;
+}
+
+export function fakeK8sRuntime(
+	state: FakeState,
+	handle: SessionHandle,
+	saDir: string,
+	knobs: Record<string, string> = {},
+	limits: Partial<SandboxLimits> = {},
+	driverOptions: K8sDriverOptions = {},
+): SandboxRuntime {
+	const environment = fakeK8sEnvironment(state, knobs);
+	const context: SandboxDriverContext = {
+		containerCommand: FAKE_KUBECTL,
+		image: environment.POLAR_SANDBOX_K8S_IMAGE || "polar-sandbox:test",
+		limits: { ...testLimits, ...limits },
+		environment,
+		handle,
+		state: "open",
+		owned: new Set(),
+		children: new Map(),
+		cliStopped: false,
+	};
+	return Object.assign(context, {
+		inFlight: new Set<string>(),
+		running: new Set<RunningCall>(),
+		driver: new K8sDriver(context, { serviceAccountDir: saDir, ...driverOptions }),
+		activeSandbox: {},
+	});
+}
+
+export function startingK8sRuntime(
+	state: FakeState,
+	handle: SessionHandle,
+	saDir: string,
+	knobs: Record<string, string> = {},
+	limits: Partial<SandboxLimits> = {},
+	driverOptions: K8sDriverOptions = {},
+): SandboxRuntime {
+	const runtime = fakeK8sRuntime(state, handle, saDir, knobs, limits, driverOptions);
 	runtime.state = "unready";
 	return runtime;
 }

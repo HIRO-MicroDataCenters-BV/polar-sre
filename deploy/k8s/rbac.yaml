@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: polar
+  namespace: polar
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: polar-sandbox-runner
+  namespace: polar
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: polar-sandbox-runner
+  namespace: polar
+subjects:
+  - kind: ServiceAccount
+    name: polar
+    namespace: polar
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: polar-sandbox-runner

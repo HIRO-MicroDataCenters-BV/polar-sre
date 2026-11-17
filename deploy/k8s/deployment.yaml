@@ -1,0 +1,125 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: polar
+  namespace: polar
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: polar
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: polar
+    spec:
+      serviceAccountName: polar
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 15
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: warm-sandbox-image
+          image: polar-sandbox:0.2
+          command: ["true"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+      containers:
+        - name: polar
+          image: polar:0.2
+          command: ["polar"]
+          args: ["--mode", "rpc", "--session-dir", "/sessions"]
+          stdin: true
+          envFrom:
+            - secretRef:
+                name: polar-env
+                optional: true
+          env:
+            - name: HOME
+              value: /home/polar
+            - name: TMPDIR
+              value: /tmp
+            - name: POLAR_ARTIFACTS_DIR
+              value: /artifacts
+            - name: POLAR_SESSION_TTL_MS
+              value: "86400000"
+            - name: POLAR_SANDBOX_K8S_PVC
+              value: polar-shared
+            - name: POLAR_SANDBOX_K8S_RUNTIME_CLASS
+              value: gvisor
+            - name: POLAR_SANDBOX_K8S_IMAGE
+              value: polar-sandbox:0.2
+            - name: POLAR_SANDBOX_K8S_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POLAR_SANDBOX_K8S_POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: POLAR_SANDBOX_K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: shared
+              mountPath: /artifacts
+              subPath: artifacts
+            - name: shared
+              mountPath: /sessions
+              subPath: sessions
+            - name: tmp
+              mountPath: /tmp
+            - name: home
+              mountPath: /home/polar
+      volumes:
+        - name: shared
+          persistentVolumeClaim:
+            claimName: polar-shared
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 512Mi
+        - name: home
+          emptyDir:
+            sizeLimit: 256Mi

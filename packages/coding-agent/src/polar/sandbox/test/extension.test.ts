@@ -255,6 +255,17 @@ describe("sandbox extension", () => {
 		expect(sharedKernel.tools.map((tool) => tool.name)).toEqual(["run_code"]);
 		expect(sharedKernel.notices).toEqual([["sandbox: oci (docker/runc, shared kernel)", "info"]]);
 		await sharedKernel.shutdown();
+
+		// --sandbox-k8s-pvc selects k8s driver even when --sandbox-driver=auto
+		const k8sAuto = loadExtension({
+			"sandbox-driver": "auto",
+			"sandbox-k8s-pvc": "polar-shared",
+		});
+		expect(k8sAuto.flagDefaults.has("sandbox-k8s-pvc")).toBe(true);
+		await k8sAuto.startSession();
+		expect(k8sAuto.tools).toEqual([]);
+		expect(k8sAuto.notices[0]?.[0]).toContain("POLAR_SANDBOX_K8S_RUNTIME_CLASS is not set");
+		await k8sAuto.shutdown();
 	});
 
 	it("describes the tool from the operator limits and the image flag", async () => {

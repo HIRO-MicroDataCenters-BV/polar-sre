@@ -31,7 +31,7 @@ Process-wide session state is stored in `globalThis[Symbol.for("polar/session-re
    - Creates `<outputDirectory>` (`0700`) and writes `<pid>\n` to `lock` (`0600`).
    - Deletes leftover `*.part` files.
    - Truncates any incomplete trailing line in `manifest.jsonl` once at startup.
-   - Removes directories of other sessions where `sessionLiveness` is `"ended"` and `mtime` is older than `7 days`.
+   - Removes directories of other sessions where `sessionLiveness` is `"ended"` and `mtime` is older than `$POLAR_SESSION_TTL_MS` (default: `7 days`).
    - Scans existing published files to initialize `publishedBytes` and `nextFileNumber` (`highestNumber + 1`).
 2. Subsequent callers in the same process increment `holders` and await the same `prepare()` promise.
 
@@ -41,8 +41,9 @@ Process-wide session state is stored in `globalThis[Symbol.for("polar/session-re
 
 ### Liveness Check (`sessionLiveness`)
 - Reads `<root>/<sessionId>/lock`.
-- `"ended"`: `ENOENT` on the lock file, or `process.kill(pid, 0)` throws `ESRCH`.
-- `"alive"`: `process.kill(pid, 0)` succeeds or throws `EPERM`.
+- If `pid === process.pid`, checks `registry().has(join(resolve(root), sessionId))` and returns `"alive"` only when the current process holds the session (returning `"ended"` when a restarted container reuses PID 1 against a stale lock file).
+- `"ended"`: `ENOENT` on the lock file, `pid === process.pid` not in the active registry, or `process.kill(pid, 0)` throws `ESRCH`.
+- `"alive"`: `pid === process.pid` in the active registry, or `process.kill(pid, 0)` succeeds or throws `EPERM`.
 - `"unknown"`: any other filesystem error or non-PID content. Resources of `"alive"` and `"unknown"` sessions are preserved during cleanup.
 
 ---

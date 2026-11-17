@@ -7,14 +7,18 @@ import { getSandboxImageDir } from "../../../config.ts";
 import { acquireSession, type SessionHandle } from "../../shared/session.ts";
 import { discardOutputFile, readExcerpt } from "../../shared/store.ts";
 import { createRuntime } from "../index.ts";
-import { cleanupOciContainer, deadlineAfter, parseOciContainers, parseOciNames, parseOciVolumes } from "../src/cli.ts";
+import { deadlineAfter } from "../src/cli.ts";
 import {
+	cleanupOciContainer,
 	KEEPALIVE_COMMAND,
 	launcher,
 	type OciDriver,
 	ociExecArguments,
 	ociInspectionOf,
 	ociSandboxArguments,
+	parseOciContainers,
+	parseOciNames,
+	parseOciVolumes,
 	ROOTLESS_DOCKER_UNSUPPORTED,
 	SCRUB_SCRIPT,
 	WORK_LIMIT_EXIT_CODE,
@@ -328,7 +332,7 @@ describe("OciDriver arguments, volumes, and leftovers", () => {
 	it("recovers leftovers via ps -a + inspect and cleans up volumes of gone sessions", async () => {
 		const liveDir = join(artifactsRoot(), "live");
 		await mkdir(liveDir, { recursive: true });
-		await writeFile(join(liveDir, "lock"), `${process.pid}\n`);
+		await writeFile(join(liveDir, "lock"), `${process.ppid}\n`);
 
 		const exitedPid = spawnSync(process.execPath, ["-e", ""]).pid;
 		const endedDir = join(artifactsRoot(), "ended");

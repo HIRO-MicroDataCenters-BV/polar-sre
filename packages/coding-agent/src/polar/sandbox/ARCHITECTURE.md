@@ -9,14 +9,16 @@
 The `sandbox` extension (`builtin:sandbox`) registers the `run_code` tool, executing Python 3.13 or Bash scripts inside an isolated Linux sandbox behind the `SandboxDriver` interface:
 - **`AppleContainerDriver` (`apple-container`):** macOS Desktop microVM via the native `container` CLI (`Virtualization.framework`).
 - **`OciDriver` (`oci`):** Linux Desktop OCI container via `podman` (rootless `>= 4.3` with `--userns=keep-id:uid=1000,gid=1000 --user 1000:1000`) or standard `docker` (`--user <hostUid>:<hostGid>`), with optional `--sandbox-oci-runtime` (`krun` or `runsc`). Rootless Docker is rejected with an explicit actionable reason.
+- **`K8sDriver` (`k8s`):** Kubernetes 24/7 cluster Pod via `kubectl` with an isolated in-cluster kubeconfig, mandatory `runtimeClassName` (`POLAR_SANDBOX_K8S_RUNTIME_CLASS`, e.g. `gvisor` or `kata`), `ownerReferences` to the `polar` Pod, static `NetworkPolicy` deny-all verified by a startup TCP probe to `KUBERNETES_SERVICE_HOST:KUBERNETES_SERVICE_PORT`, and shared PVC `subPath` mounts (`artifacts/<sessionId>` read-only at `/data` and `work/<sessionId>` read-write at `/work` with `fsGroup: 1000`). Deployment manifests and `Containerfile` for the `polar` Pod live in `deploy/k8s/`.
 
 - **Driver Selection (`--sandbox-driver`):**
-  - Default `"auto"`: selects `"k8s"` if `POLAR_SANDBOX_K8S_PVC` is set, `"apple-container"` on `darwin`, and `"oci"` on `linux`.
-  - On `oci` startup, notifies the operator of the selected engine and isolation boundary (`sandbox: oci (podman/krun)` or `sandbox: oci (docker/runc, shared kernel)`).
+  - Default `"auto"`: selects `"k8s"` if `POLAR_SANDBOX_K8S_PVC` or `--sandbox-k8s-pvc` is set, `"apple-container"` on `darwin`, and `"oci"` on `linux`.
+  - On `oci` and `k8s` startup, notifies the operator of the selected engine/runtime and isolation boundary (`sandbox: oci (podman/krun)`, `sandbox: oci (docker/runc, shared kernel)`, or `sandbox: k8s (gvisor)`).
 - **Artifact Bus Mount (`/data`):** Mounts `session.outputDirectory` read-only at `/data` inside the guest. The host working directory (`cwd`) is never mounted inside the VM; only `/data` and `/work` exist.
 - **Persistent Workspace (`/work`):** Mounts a per-session volume (`polar-work-<sessionId>`, `4 GiB`) read-write at `/work` (`HOME=/work`). Files in `/work` persist across calls and across VM recreations within the session.
   - On `apple-container`, the volume is created with `-s 4096M` (hard ext4 block limit returning `ENOSPC`).
-  - On `oci` (where named volumes have no block size limit), `launcher` runs a background `du -sk /work` watchdog (using a pure-bash `read -t 0.1` timer on an unlinked FIFO without extra child processes) that kills the interpreter process group and exits with code `199` (`status: "work_limit"`) if `/work` exceeds `workMaxBytes` (`4 GiB`) and grows beyond its size at the start of the call (`currentBytes > workMaxBytes && currentBytes > initialBytes`). Calls that do not increase `/work` size (such as `rm` to free space) proceed freely.
+  - On `oci` and `k8s` (where named volumes or shared PVC `subPath` directories have no block size limit), `launcher` runs a background `du -sk /work` watchdog (using a pure-bash `read -t 0.1` timer on an unlinked FIFO without extra child processes) that kills the interpreter process group and exits with code `199` (`status: "work_limit"`) if `/work` exceeds `workMaxBytes` (`4 GiB`) and grows beyond its size at the start of the call (`currentBytes > workMaxBytes && currentBytes > initialBytes`). Calls that do not increase `/work` size (such as `rm` to free space) proceed freely.
+  - On `k8s`, `launcher` also sets `ulimit -u 256` (`limits.processMax`), and kubelet creates `work/<sessionId>` on the shared PVC when the sandbox Pod starts. Orphaned `work/<id>` directories of gone sessions are listed via `kubectl exec` (`polar-work-ls-...`) and removed via short cleanup Pods (`polar-work-rm-...`) without requiring `pods/log` RBAC permissions.
 - **Image Lookup & First-Start UX (`workspace.ts`):**
   - Default image tag: `polar-sandbox:0.2` (multi-arch: `linux/arm64` and `linux/amd64`).
   - Lookup order in local cache:
@@ -45,21 +47,27 @@ Each layer in `packages/coding-agent/src/polar/sandbox/src/` imports only from l
 ```text
 packages/coding-agent/src/polar/sandbox/
 ├── ARCHITECTURE.md                  # VM sandbox architecture and layer boundaries
-├── index.ts                         # --sandbox-driver / --sandbox-image / --sandbox-registry-image / --sandbox-oci-* flags, session_start/shutdown wiring, tool registration
+├── index.ts                         # --sandbox-driver / --sandbox-image / --sandbox-registry-image / --sandbox-oci-* / --sandbox-k8s-pvc flags, session_start/shutdown wiring, tool registration
 ├── image/
 │   ├── Containerfile                # Multi-arch guest image definition (default tag: polar-sandbox:0.2)
 │   ├── requirements.in
 │   └── requirements.txt
 ├── src/
 │   ├── types.ts                     # Domain data structures, state types, SandboxDriver & HotSandbox contracts
-│   ├── cli.ts                       # Layer 1: Stateless CLI execution, JSON parsing, container cleanup
-│   ├── driver.ts                    # Layer 2: AppleContainerDriver / AppleHotSandbox and OciDriver / OciHotSandbox implementations
+│   ├── cli.ts                       # Layer 1: Stateless CLI execution and diagnostic primitives
+│   ├── driver.ts                    # Layer 2: Driver barrel exports
+│   ├── drivers/
+│   │   ├── shared.ts                # Shared guest constants, launcher, and UnsupportedSandboxDriver
+│   │   ├── apple.ts                 # AppleContainerDriver & AppleHotSandbox (`container` microVM)
+│   │   ├── oci.ts                   # OciDriver & OciHotSandbox (`podman` / `docker`)
+│   │   └── k8s.ts                   # K8sDriver & K8sHotSandbox (`kubectl` Pod)
 │   ├── workspace.ts                 # Layer 3: Readiness check, image lookup/pull/build UX, orphan GC, /work volume setup
 │   ├── runner.ts                    # Layer 4: Admission, lazy HotSandbox lifecycle, call supervision, OOM, work_limit & scrub
 │   └── reply.ts                     # Layer 5: Reply budget calculation, stdout/stderr store finalization, formatting
 └── test/
     ├── fake-container.mjs           # Stateful stand-in for the `container` CLI in tests
     ├── fake-oci.mjs                 # Stateful stand-in for the `podman` / `docker` CLI in tests
+    ├── fake-kubectl.mjs             # Stateful stand-in for the `kubectl` CLI in tests
     ├── fixtures.ts
     └── *.test.ts
 ```
@@ -67,13 +75,15 @@ packages/coding-agent/src/polar/sandbox/
 ### Layer Responsibilities
 
 1. **`src/cli.ts` (Layer 1 — Stateless CLI & Diagnostic Primitives)**
-   - Spawns short runtime CLI commands with `commandTimeoutMs` (`30s`) and optional `AbortSignal`, tracking child processes in `runtime.children`.
-   - Parses `apple-container` and `oci` (`podman` / `docker`) JSON/line outputs (`parseListing`, `parseContainers`, `parseVolumes`, `parseOciNames`, `parseOciContainers`, `parseOciVolumes`, `parseOciOomKilled`) and bounds diagnostic stderr (`boundDiagnostic`: `4 KiB` / `64` lines).
-   - Implements `cleanupContainer` (`container delete --force` + `list --all --format json`) and `cleanupOciContainer` (`<engine> rm --force` + `ps -a --format {{.Names}}`).
+   - Spawns short runtime CLI commands with `commandTimeoutMs` (`30s`), optional `AbortSignal`, and optional child `env` override (`containerCommand`), tracking child processes in `runtime.children`.
+   - Provides stream retention (`StreamCapture`), deadline helpers (`deadlineAfter`, `remainingMs`, `firstLine`), and bounded diagnostic formatting (`boundDiagnostic`: `4 KiB` / `64` lines, `commandFailure`, `describeCleanupErrors`).
 
-2. **`src/driver.ts` (Layer 2 — `SandboxDriver` & `HotSandbox`)**
-   - `AppleContainerDriver` & `AppleHotSandbox`: macOS microVM implementation via `container`, recording the boot-log OOM baseline before `spawnCall` and computing OOM deltas via `logs --boot`.
-   - `OciDriver` & `OciHotSandbox`: Linux OCI implementation via `podman` or `docker`. Discovers the engine (`podman` then `docker` in `auto` mode via `<engine> info --format "{{json .}}"`), rejects rootless Docker and rootless Podman `< 4.3`, checks `cpu` cgroup delegation in `podman info`, lists leftovers via `ps -a --filter label=polar-root=<root> --format {{.Names}}` + `inspect`, prepares `/work` (`:nocopy`) with `chown`, enforces the soft `work_limit` (`exit 199`) in `launcher`, and detects OOM by `oom_kill` delta in `/sys/fs/cgroup/memory.events` or container `.State.OOMKilled`.
+2. **`src/driver.ts` & `src/drivers/{shared,apple,oci,k8s}.ts` (Layer 2 — `SandboxDriver` & `HotSandbox`)**
+   - `src/drivers/shared.ts`: defines shared guest constants (`WORK_PATH`, `TMP_PATH`, `GUEST_USER`, `KEEPALIVE_COMMAND`, `SCRUB_SCRIPT`, `WORK_LIMIT_EXIT_CODE`, `SESSION_LABEL`, `ROOT_LABEL`), `launcher`, `workVolumeName`, `artifactsRootOf`, `sessionLabels`, and `UnsupportedSandboxDriver`.
+   - `src/driver.ts`: barrel module re-exporting the concrete drivers and shared helpers.
+   - `src/drivers/apple.ts` (`AppleContainerDriver` & `AppleHotSandbox`): macOS microVM implementation via `container`, JSON parsers (`parseListing`, `parseContainers`, `parseVolumes`), `cleanupContainer` (`container delete --force` + `list --all --format json`), and boot-log OOM delta detection (`logs --boot`).
+   - `src/drivers/oci.ts` (`OciDriver` & `OciHotSandbox`): Linux OCI implementation via `podman` or `docker`, parsers (`parseOciNames`, `parseOciContainers`, `parseOciVolumes`, `parseOciOomKilled`), and `cleanupOciContainer` (`<engine> rm --force` + `ps -a --format {{.Names}}`). Discovers the engine (`podman` then `docker` in `auto` mode via `<engine> info --format "{{json .}}"`), rejects rootless Docker and rootless Podman `< 4.3`, checks `cpu` cgroup delegation in `podman info`, lists leftovers via `ps -a --filter label=polar-root=<root> --format {{.Names}}` + `inspect`, prepares `/work` (`:nocopy`) with `chown`, enforces the soft `work_limit` (`exit 199`) in `launcher`, and detects OOM by `oom_kill` delta in `/sys/fs/cgroup/memory.events` or container `.State.OOMKilled`.
+   - `src/drivers/k8s.ts` (`K8sDriver` & `K8sHotSandbox`): Kubernetes Pod implementation via `kubectl` with an isolated kubeconfig (`user.tokenFile`) atomically written to a deterministic path in `/tmp` from `/var/run/secrets/kubernetes.io/serviceaccount/` and `KUBECONFIG` stripped from child process environments. Verifies `POLAR_SANDBOX_K8S_*` and self-Pod UID (`get pod <POLAR_SANDBOX_K8S_POD_NAME> -o json`) in `checkRuntime`, runs the combined `/work` writability + `NetworkPolicy` deny-all probe Pod (`polar-netprobe-*` with `socket.create_connection`) in `ensureWorkVolume` (after `recoverLeftovers`), creates sandbox Pods under Pod Security `restricted` (`restartPolicy: Never`, `stdin: true` without `kubectl attach`, `ownerReferences`, `nodeSelector`, `polar-root-hash` label + `polar-root` annotation), strips the `command terminated with exit code N\n` trailer from `kubectl exec -i` `stderr` before resolving `closed`, deletes the Pod immediately on `kill()`, and performs two-step OOM detection on exit `137` or `128` (`state.terminated.reason === "OOMKilled"` with status-lag polling when the Pod is dead, or `/sys/fs/cgroup/memory.events` `oom_kill` delta when the Pod remains alive).
 
 3. **`src/workspace.ts` (Layer 3 — Session Workspace & Recovery)**
    - `startRuntime` and `checkReadiness`: checks driver readiness, inspects image candidates (`--sandbox-image` -> `REGISTRY_IMAGE` -> `polar-sandbox:0.2`), runs the interactive `ctx.ui.select` flow (`Download prebuilt image` / `Build sandbox image locally (~2 min)` / `Disable sandbox for this session`) when `ctx.hasUI === true` or disables immediately when `ctx.hasUI === false`, recovers leftover resources under the same `polar-root`, and prepares `/work`.
@@ -84,7 +94,7 @@ packages/coding-agent/src/polar/sandbox/
    - `admitCall`: admits a call when `runtime.state === "open"` and records `toolCallId` in `runtime.inFlight`.
    - `SandboxCall`: cleans up leftover owned containers from prior calls (excluding the active warm `HotSandbox`), opens `<outputDirectory>/run_code-<n>.part` via `openOutputFile`, reuses `runtime.activeSandbox.current` (or recreates it once if `spawnCall` reports `{ gone }`, or lazily starts it on the first call), and starts `SandboxRun`.
    - `SandboxRun`: writes the script to `stdin` of the guest launcher (`bash -c 'd="${TMPDIR:-/tmp}/.polar"; mkdir -p "$d" && cat > "$d/program.<ext>" && exec <interpreter> "$d/program.<ext>" </dev/null'`), streams `stdout` into `OpenFile.sink` with backpressure, captures `stderr` up to `1 MiB`, and stops the call on timeout, abort, output limit, or shutdown.
-   - On completion: checks OOM delta on exit `137`, inspects container state on non-zero exit, runs `scrubAfterCall` when the VM remains healthy, and destroys the VM whenever stopped, OOM-killed, not `present` on inspection (`stopped`, `absent`, or `unknown`), or when `scrubAfterCall` returns `false`.
+   - On completion: checks OOM delta on exit `137` (and exit `128` on `k8s`), inspects container/pod state on non-zero exit, runs `scrubAfterCall` when the VM remains healthy, and destroys the VM whenever stopped, OOM-killed, not `present` on inspection (`stopped`, `absent`, or `unknown`), or when `scrubAfterCall` returns `false`.
 
 5. **`src/reply.ts` (Layer 5 — Sandbox Reply Builder)**
    - Finalizes `result.output` (`discardOutputFile` if a plain `ok` or if the full output fits the reply room; `finishOutputFile` otherwise) and saves oversized `stderr` via `saveBytes` as `run_code-stderr-<n>.txt`.

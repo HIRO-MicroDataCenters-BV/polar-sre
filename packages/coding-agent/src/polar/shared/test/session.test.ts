@@ -10,8 +10,10 @@ import {
 	artifactsRoot,
 	type SessionContext,
 	type SessionHandle,
+	STALE_SESSION_MS,
 	sessionLiveness,
 	sessionPaths,
+	staleSessionMs,
 } from "../session.ts";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -204,7 +206,7 @@ describe("acquireSession", () => {
 		await writeFile(join(directory, "k8s_logs-2.txt"), "done");
 		const stale = await sessionDirectory("stale", { lock: `${await exitedPid()}\n`, "k8s_get-1.txt": "x" }, 8);
 		const unlocked = await sessionDirectory("unlocked", { "k8s_get-1.txt": "x" }, 8);
-		const live = await sessionDirectory("live", { lock: `${process.pid}\n`, "k8s_get-1.txt": "x" }, 30);
+		const live = await sessionDirectory("live", { lock: `${process.ppid}\n`, "k8s_get-1.txt": "x" }, 30);
 		const recent = await sessionDirectory("recent", {}, 6);
 		const unreadable = await sessionDirectory("unreadable", { lock: `${await exitedPid()}\n` }, 30);
 		await chmod(join(unreadable, "lock"), 0o000);
@@ -231,11 +233,35 @@ describe("acquireSession", () => {
 			await chmod(join(unreadable, "lock"), 0o600);
 		}
 	});
+
+	it("respects POLAR_SESSION_TTL_MS when removing stale sessions", async () => {
+		expect(staleSessionMs({})).toBe(STALE_SESSION_MS);
+		expect(staleSessionMs({ POLAR_SESSION_TTL_MS: "3600000" })).toBe(3_600_000);
+		expect(staleSessionMs({ POLAR_SESSION_TTL_MS: "0" })).toBe(0);
+		expect(staleSessionMs({ POLAR_SESSION_TTL_MS: "-5" })).toBe(STALE_SESSION_MS);
+		expect(staleSessionMs({ POLAR_SESSION_TTL_MS: "invalid" })).toBe(STALE_SESSION_MS);
+
+		const saved = process.env.POLAR_SESSION_TTL_MS;
+		process.env.POLAR_SESSION_TTL_MS = String(DAY_MS);
+		try {
+			const twoDaysOld = await sessionDirectory("two-days", { lock: `${await exitedPid()}\n` }, 2);
+			const halfDayOld = await sessionDirectory("half-day", { lock: `${await exitedPid()}\n` }, 0.5);
+			const handle = await acquireSession("current", "/w", root);
+			await handle.release();
+			expect(await exists(twoDaysOld)).toBe(false);
+			expect(await exists(halfDayOld)).toBe(true);
+		} finally {
+			if (saved === undefined) delete process.env.POLAR_SESSION_TTL_MS;
+			else process.env.POLAR_SESSION_TTL_MS = saved;
+		}
+	});
 });
 
 describe("sessionLiveness", () => {
-	it("reports liveness", async () => {
-		await sessionDirectory("live", { lock: `${process.pid}\n` }, 0);
+	it("reports liveness and treats unregistered process.pid locks as ended", async () => {
+		const active = await acquireSession("active", "/w", root);
+		await sessionDirectory("stale-self-pid", { lock: `${process.pid}\n` }, 0);
+		await sessionDirectory("live", { lock: `${process.ppid}\n` }, 0);
 		await sessionDirectory("foreign", { lock: "1\n" }, 0);
 		await sessionDirectory("unlocked", {}, 0);
 		await sessionDirectory("exited", { lock: `${await exitedPid()}\n` }, 0);
@@ -244,6 +270,8 @@ describe("sessionLiveness", () => {
 		const unreadable = await sessionDirectory("unreadable", { lock: `${process.pid}\n` }, 0);
 		await chmod(join(unreadable, "lock"), 0o000);
 		try {
+			expect(await sessionLiveness(root, "active")).toBe("alive");
+			expect(await sessionLiveness(root, "stale-self-pid")).toBe("ended");
 			expect(await sessionLiveness(root, "live")).toBe("alive");
 			expect(await sessionLiveness(root, "foreign")).toBe("alive");
 			expect(await sessionLiveness(root, "missing")).toBe("ended");
@@ -253,6 +281,7 @@ describe("sessionLiveness", () => {
 			expect(await sessionLiveness(root, "garbage")).toBe("unknown");
 			expect(await sessionLiveness(root, "zero")).toBe("unknown");
 		} finally {
+			await active.release();
 			await chmod(join(unreadable, "lock"), 0o600);
 		}
 	});

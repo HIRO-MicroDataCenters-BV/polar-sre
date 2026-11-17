@@ -3,15 +3,8 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { acquireSession, type SessionHandle } from "../../shared/session.ts";
-import {
-	cleanupContainer,
-	commandFailure,
-	containerCommand,
-	deadlineAfter,
-	parseContainers,
-	parseVolumes,
-} from "../src/cli.ts";
-import { inspectionOf } from "../src/driver.ts";
+import { commandFailure, containerCommand, deadlineAfter } from "../src/cli.ts";
+import { cleanupContainer, inspectionOf, parseContainers, parseVolumes } from "../src/driver.ts";
 import { cleanupOwned } from "../src/workspace.ts";
 import { type FakeState, fakeRuntime, fakeState } from "./fixtures.ts";
 

@@ -4,7 +4,14 @@ import { acquireSession, type SessionHandle } from "../shared/session.ts";
 import { describeBytes, READ_MAX_BYTES } from "../shared/store.ts";
 import { nulCharacterError } from "../shared/validation.ts";
 import { describeCleanupErrors } from "./src/cli.ts";
-import { AppleContainerDriver, OciDriver, UnsupportedSandboxDriver, WORK_PATH } from "./src/driver.ts";
+import {
+	AppleContainerDriver,
+	K8sDriver,
+	type K8sDriverOptions,
+	OciDriver,
+	UnsupportedSandboxDriver,
+	WORK_PATH,
+} from "./src/driver.ts";
 import { buildReply } from "./src/reply.ts";
 import { admitCall, shutdownRefusal } from "./src/runner.ts";
 import {
@@ -82,6 +89,8 @@ export interface RuntimeImageOptions {
 	driver?: SandboxDriverChoice;
 	ociEngine?: OciEngineChoice;
 	ociRuntime?: string;
+	k8sPvc?: string;
+	k8sOptions?: K8sDriverOptions;
 	platform?: NodeJS.Platform;
 }
 
@@ -120,7 +129,13 @@ function createDriver(
 		context.containerCommand = engine === "docker" ? "docker" : "podman";
 		return new OciDriver(context, { engine, ociRuntime: options.ociRuntime });
 	}
-	return new UnsupportedSandboxDriver("k8s", "k8s sandbox driver is not enabled in this build");
+	context.containerCommand = "kubectl";
+	const k8sImage = (environment.POLAR_SANDBOX_K8S_IMAGE ?? "").trim();
+	if (!context.customImage && k8sImage !== "") {
+		context.image = k8sImage;
+	}
+	context.registryImage = undefined;
+	return new K8sDriver(context, options.k8sOptions);
 }
 
 export function createRuntime(
@@ -129,13 +144,17 @@ export function createRuntime(
 	handle: SessionHandle,
 	options: RuntimeImageOptions = {},
 ): SandboxRuntime {
+	const env: NodeJS.ProcessEnv = { ...environment };
+	if (options.k8sPvc !== undefined && options.k8sPvc !== "") {
+		env.POLAR_SANDBOX_K8S_PVC = options.k8sPvc;
+	}
 	const context: SandboxDriverContext = {
 		containerCommand: "container",
 		image,
 		registryImage: options.registryImage ?? REGISTRY_IMAGE,
 		customImage: options.customImage ?? image !== DEFAULT_IMAGE,
 		limits: LIMITS,
-		environment: { ...environment },
+		environment: env,
 		handle,
 		state: "unready",
 		owned: new Set(),
@@ -224,6 +243,10 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
 		description: "Optional OCI runtime on Linux (e.g. krun or runsc)",
 		type: "string",
 	});
+	pi.registerFlag("sandbox-k8s-pvc", {
+		description: "Shared PVC name for the Kubernetes sandbox driver (overrides POLAR_SANDBOX_K8S_PVC)",
+		type: "string",
+	});
 
 	pi.on("session_start", async (_event, ctx) => {
 		const warn = (message: string) => ctx.ui.notify(message, "warning");
@@ -241,6 +264,8 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
 			typeof ociEngineFlag === "string" && ociEngineFlag !== "" ? (ociEngineFlag as OciEngineChoice) : "auto";
 		const ociRuntimeFlag = pi.getFlag("sandbox-oci-runtime");
 		const ociRuntime = typeof ociRuntimeFlag === "string" && ociRuntimeFlag !== "" ? ociRuntimeFlag : undefined;
+		const k8sPvcFlag = pi.getFlag("sandbox-k8s-pvc");
+		const k8sPvc = typeof k8sPvcFlag === "string" && k8sPvcFlag !== "" ? k8sPvcFlag : undefined;
 		const handle = await acquireSession(ctx.sessionManager.getSessionId(), ctx.cwd);
 		const runtime = createRuntime(image, process.env, handle, {
 			registryImage,
@@ -248,6 +273,7 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
 			driver,
 			ociEngine,
 			ociRuntime,
+			k8sPvc,
 		});
 		current = runtime;
 		const selectImage =
@@ -261,7 +287,7 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
 			return;
 		}
 		runtime.state = "open";
-		if (runtime.driver.name === "oci") {
+		if (runtime.driver.name === "oci" || runtime.driver.name === "k8s") {
 			ctx.ui.notify(`sandbox: ${runtime.driver.boundaryDescription}`, "info");
 		}
 		pi.registerTool(createRunCodeTool(runtime));

@@ -52,8 +52,8 @@ When creating any new extension directory `packages/coding-agent/src/polar/<name
    Provides `list_files` over `manifest.jsonl` and restricts Pi's built-in `read` tool to `.txt` files inside the active session directory up to `16 MiB`.
 3. **`<producer>/` (`k8s`, `loki`, `grafana`, ...)**
    Standalone, deterministic, read-only toolsets. Each producer validates structured tool parameters, streams output into `shared/store.ts`, and formats replies through `shared/reply.ts`.
-4. **`sandbox/` (Local VM / Container Sandbox)**
-   An isolated Linux sandbox (`AppleContainerDriver` on macOS via `container`, `OciDriver` on Linux via `podman` / `docker` behind `SandboxDriver`) with Python and CLI analytics tools, exposed as the `run_code` tool. Mounts the session artifact directory read-only at `/data` and a persistent per-session volume at `/work`. Keeps a hot sandbox per session (lazily started on the first `run_code` call and scrubbed after each call) and writes its own large `stdout`/`stderr` outputs to the Artifact Bus.
+4. **`sandbox/` (Local VM / Container / Kubernetes Sandbox)**
+   An isolated Linux sandbox (`AppleContainerDriver` on macOS via `container`, `OciDriver` on Linux via `podman` / `docker`, and `K8sDriver` in Kubernetes clusters via `kubectl` behind `SandboxDriver`) with Python and CLI analytics tools, exposed as the `run_code` tool. Mounts the session artifact directory read-only at `/data` and a persistent per-session volume at `/work`. Keeps a hot sandbox per session (lazily started on the first `run_code` call and scrubbed after each call) and writes its own large `stdout`/`stderr` outputs to the Artifact Bus.
 
 ---
 
@@ -111,15 +111,20 @@ packages/coding-agent/src/polar/
 │
 ├── sandbox/                         # Isolated local VM / container sandbox extension (`run_code`)
 │   ├── ARCHITECTURE.md              # Sandbox architecture and internal layer boundaries
-│   ├── index.ts                     # --sandbox-driver / --sandbox-image / --sandbox-registry-image / --sandbox-oci-* flags, startup readiness, shutdown, tool registration
+│   ├── index.ts                     # --sandbox-driver / --sandbox-image / --sandbox-registry-image / --sandbox-oci-* / --sandbox-k8s-pvc flags, startup readiness, shutdown, tool registration
 │   ├── image/
 │   │   ├── Containerfile
 │   │   ├── requirements.in
 │   │   └── requirements.txt
 │   ├── src/
 │   │   ├── types.ts                 # Domain types and `SandboxDriver` / `HotSandbox` contracts
-│   │   ├── cli.ts                   # Layer 1: Stateless CLI execution, JSON parsing, container cleanup
-│   │   ├── driver.ts                # Layer 2: `AppleContainerDriver` / `AppleHotSandbox` and `OciDriver` / `OciHotSandbox` implementations
+│   │   ├── cli.ts                   # Layer 1: Stateless CLI execution and diagnostic primitives
+│   │   ├── driver.ts                # Layer 2: Driver barrel exports
+│   │   ├── drivers/
+│   │   │   ├── shared.ts            # Shared guest constants, launcher, and UnsupportedSandboxDriver
+│   │   │   ├── apple.ts             # AppleContainerDriver & AppleHotSandbox (`container` microVM)
+│   │   │   ├── oci.ts               # OciDriver & OciHotSandbox (`podman` / `docker`)
+│   │   │   └── k8s.ts               # K8sDriver & K8sHotSandbox (`kubectl` Pod)
 │   │   ├── workspace.ts             # Layer 3: Readiness check, image lookup/pull/build UX, orphan GC, /work volume setup
 │   │   ├── runner.ts                # Layer 4: Lazy hot VM lifecycle, `spawnCall` supervision, OOM delta & work_limit check, scrub
 │   │   └── reply.ts                 # Layer 5: Sandbox reply formatting (with OOM, work_limit, inspection, and cleanup notices)

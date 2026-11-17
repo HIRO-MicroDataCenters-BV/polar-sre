@@ -62,8 +62,39 @@ function describeEdge({ from, to }: ImportEdge): string {
 	return `${from} -> ${to}`;
 }
 
+function findImportCycles(edges: ImportEdge[]): string[] {
+	const adjacency = new Map<string, string[]>();
+	for (const { from, to } of edges) {
+		const list = adjacency.get(from) ?? [];
+		if (!list.includes(to)) list.push(to);
+		adjacency.set(from, list);
+	}
+	const state = new Map<string, "visiting" | "visited">();
+	const stack: string[] = [];
+	const cycles: string[] = [];
+	const visit = (node: string) => {
+		state.set(node, "visiting");
+		stack.push(node);
+		for (const next of adjacency.get(node) ?? []) {
+			const nextState = state.get(next);
+			if (nextState === "visiting") {
+				const start = stack.indexOf(next);
+				cycles.push([...stack.slice(start), next].join(" -> "));
+			} else if (nextState === undefined && adjacency.has(next)) {
+				visit(next);
+			}
+		}
+		stack.pop();
+		state.set(node, "visited");
+	};
+	for (const node of adjacency.keys()) {
+		if (state.get(node) === undefined) visit(node);
+	}
+	return cycles;
+}
+
 describe("independence", () => {
-	it("extensions and shared import only downwards", () => {
+	it("extensions and shared import only downwards without cycles", () => {
 		const edges = [...EXTENSIONS, SHARED].flatMap(moduleFiles).flatMap(importEdges);
 
 		expect(edges.map(describeEdge)).toEqual(
@@ -75,6 +106,8 @@ describe("independence", () => {
 		);
 		const crossing = edges.filter(crossesAreas).map(describeEdge);
 		expect(crossing, `imports across extensions:\n${crossing.join("\n")}`).toEqual([]);
+		const cycles = findImportCycles(edges);
+		expect(cycles, `import cycles:\n${cycles.join("\n")}`).toEqual([]);
 	});
 
 	it("no extension reads the tool set or hooks a tool of another extension", () => {

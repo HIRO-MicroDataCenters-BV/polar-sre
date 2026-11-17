@@ -1,0 +1,14 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: polar-sandbox-deny-all
+  namespace: polar
+spec:
+  podSelector:
+    matchLabels:
+      polar-sandbox: "true"
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress: []

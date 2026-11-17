@@ -222,7 +222,7 @@ describe("start", () => {
 
 	it("judges other sessions by their lock", async () => {
 		const otherRoot = join(root, "other-artifacts");
-		await otherSession("live", process.pid);
+		await otherSession("live", process.ppid);
 		const exited = spawnSync(process.execPath, ["-e", ""]).pid;
 		const ended = await otherSession("ended", exited);
 		await writeFile(join(ended, "k8s_logs-1.txt"), "kept\n");
