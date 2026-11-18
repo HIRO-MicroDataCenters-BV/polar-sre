@@ -14,11 +14,12 @@ Before reading or modifying code in this repository, read [`AGENTS.md`](AGENTS.m
 
 ## Required Checks Before Submitting a PR
 
-Run the Polar extension test suite, full repository checks, and the isolated monorepo test suite:
+Run the Polar extension test suite, full repository checks, and the isolated monorepo test suite (`./test.sh` requires Rust `1.96.0`, pinned in [`packages/env/daemon/rust-toolchain.toml`](packages/env/daemon/rust-toolchain.toml)):
 
 ```bash
-cd packages/coding-agent && npx vitest --run src/polar
+(cd packages/coding-agent && npx vitest --run src/polar)
 npm run check
+npm run build:daemon --workspace packages/env
 ./test.sh
 ```
 

@@ -90,11 +90,12 @@ See [`deploy/k8s/README.md`](deploy/k8s/README.md) for cluster prerequisites, si
 - Security model and vulnerability reporting: [`SECURITY.md`](SECURITY.md)
 - Contribution guidelines: [`CONTRIBUTING.md`](CONTRIBUTING.md)
 
-Verification commands:
+Verification commands (running the full `./test.sh` suite requires Rust `1.96.0`, pinned in [`packages/env/daemon/rust-toolchain.toml`](packages/env/daemon/rust-toolchain.toml)):
 
 ```bash
-cd packages/coding-agent && npx vitest --run src/polar
+(cd packages/coding-agent && npx vitest --run src/polar)
 npm run check
+npm run build:daemon --workspace packages/env
 ./test.sh
 ```
 
