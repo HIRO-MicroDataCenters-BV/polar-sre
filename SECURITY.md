@@ -24,7 +24,7 @@ Every invocation of the built-in `read` tool is intercepted by `packages/coding-
 
 ### 4. Analytics Sandbox (`builtin:sandbox` / `run_code`)
 
-`run_code` executes Python or Bash inside a non-root (`1000:1000`), read-only-rootfs Linux guest with no network, `2 GiB` RAM, `256` max processes, `300s` per-call timeout, and post-call scrubbing of user processes, `/tmp`, `/dev/shm`, `/dev/mqueue`, and SysV IPC objects. The host working directory (`cwd`) is never mounted; only `session.outputDirectory` (`/data`, read-only) and the session workspace (`/work`, `4 GiB` read-write) are mounted.
+`run_code` executes Python or Bash inside a read-only-rootfs Linux guest with no network, `2 GiB` RAM, `256` max processes, `300s` per-call timeout, and post-call scrubbing of user processes, `/tmp`, `/dev/shm`, `/dev/mqueue`, and SysV IPC objects. The guest runs as `1000:1000` on `apple-container`, rootless Podman, and `k8s`, and as `<hostUid>:<hostGid>` on standard Docker (`0:0` if `polar` itself is launched as `root`). The host working directory (`cwd`) is never mounted; only `session.outputDirectory` (`/data`, read-only) and the session workspace (`/work`, `4 GiB` read-write) are mounted.
 
 Kernel isolation depends on the selected driver and runtime:
 

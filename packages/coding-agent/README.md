@@ -21,7 +21,7 @@ polar
 # Single-shot non-interactive investigation
 polar --k8s-context prod-eu -p "Check recent Warning events and failing Pods in payments"
 
-# Headless JSON-RPC server (used by deploy/k8s)
+# Headless RPC mode: JSONL commands on stdin and events on stdout (used by deploy/k8s)
 polar --mode rpc --session-dir /sessions
 ```
 

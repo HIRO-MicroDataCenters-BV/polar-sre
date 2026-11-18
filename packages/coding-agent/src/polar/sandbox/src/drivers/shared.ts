@@ -93,6 +93,7 @@ export function launcher(language: SandboxLanguage, options: LauncherOptions = {
 			`wpid=$!`,
 			`wait "$pid" 2>/dev/null`,
 			`rc=$?`,
+			// Close inherited .o/.e FIFO write ends held by background children in the interpreter pgrp so wait on both cat processes does not hang.
 			`kill -9 -"$pid" 2>/dev/null`,
 			`wait "$opid" "$epid"`,
 			`exec 2>/dev/null`,
