@@ -1,87 +1,55 @@
 # Security Policy
 
-This document should guide you about understanding the security concept behind
-Pi and also where the boundaries are.
+Polar (`polar-sre`) is designed as a read-only SRE and incident investigation agent with explicit boundaries around host file access, telemetry collection, and analytical code execution.
 
-In general Pi is a coding agent that runs locally within the security boundary
-of the user that is running it.  It's the responsibility of the user to monitor
-its operations or to contain it within a container, virtual machine or other
-Sandbox solution.
+## Security Architecture and Isolation Boundaries
 
-Pi treats the local user account and files writable by that account as inside
-the same trust boundary as the Pi process itself.  If an attacker can modify files
-under the user's home directory, workspace, shell startup files, environment, or
-Pi configuration, they can generally influence Pi or other local developer tools.
-Reports that depend on such prior local write access are not security
-vulnerabilities unless they demonstrate how Pi grants that write access or crosses
-an operating-system privilege boundary.
+### 1. Disabled Host Mutation and Discovery Surface
 
-Pi relies on users installing trustworthy extensions and loading trustworthy
-skills and only to use pi within trusted repositories.  This is because files
-like `AGENTS.md` or instructions in comments can be used to prompt inject the
-coding agent trivially and this cannot be protected against.
+By default, Polar disables general-purpose host execution and file-mutation tools (`bash`, `powershell`, `edit`, `write`, `grep`, `find`, `ls`, `codemode`, `tool_search`), disables package/update management subcommands (`install`, `remove`, `uninstall`, `update`, `list`, `config`, `mcp`), and disables automatic loading of project context files, skills, prompt templates, external extensions, and MCP servers (`-nc -ns -np -ne --no-mcp`).
+
+### 2. Session File Read Gate (`builtin:files`)
+
+Every invocation of the built-in `read` tool is intercepted by `packages/coding-agent/src/polar/files/src/gate.ts`:
+
+- Both the requested path and the active session output directory (`$POLAR_ARTIFACTS_DIR/<sessionId>` or `${XDG_CACHE_HOME:-~/.cache}/polar-artifacts/<sessionId>`) are resolved with `realpath`.
+- Symlink escapes, missing files, non-regular files, and any path outside `session.outputDirectory` are denied.
+- Only `.txt` session files up to `16 MiB` (`READ_MAX_BYTES`) are permitted; raw `.bin` captures and in-flight `.part` files are rejected.
+
+### 3. Read-Only Kubernetes Producer (`builtin:k8s`)
+
+- `kubectl` runs without a shell, strips inherited `KUBECTL_*` environment variables, and sets `KUBERC=off`.
+- Every flag for `get`, `describe`, `logs`, and `events` is validated against a static per-operation allowlist; output formats that read local host files (`jsonpath-file`, `go-template-file`, `custom-columns-file`, `templatefile`) are rejected.
+- `k8s_inspect` executes only fixed, structured read-only diagnostic commands (`read`, `list`, `find`, `copyOut`, `df`, `du`, `processes`, `sockets`) inside a target container after validating pod/container/namespace tokens; arbitrary command strings are not accepted.
+
+### 4. Analytics Sandbox (`builtin:sandbox` / `run_code`)
+
+`run_code` executes Python or Bash inside a non-root (`1000:1000`), read-only-rootfs Linux guest with no network, `2 GiB` RAM, `256` max processes, `300s` per-call timeout, and post-call scrubbing of user processes, `/tmp`, `/dev/shm`, `/dev/mqueue`, and SysV IPC objects. The host working directory (`cwd`) is never mounted; only `session.outputDirectory` (`/data`, read-only) and the session workspace (`/work`, `4 GiB` read-write) are mounted.
+
+Kernel isolation depends on the selected driver and runtime:
+
+- **Hardware VM or user-space kernel boundary:**
+  - macOS `apple-container` (`Virtualization.framework` Linux microVM).
+  - Linux `oci` with `--sandbox-oci-runtime krun` (libkrun microVM) or `--sandbox-oci-runtime runsc` (gVisor).
+  - Kubernetes `k8s` with `POLAR_SANDBOX_K8S_RUNTIME_CLASS` set to `gvisor` or `kata`, Pod Security `restricted`, and CNI-enforced `NetworkPolicy` deny-all (verified at `session_start` by `polar-netprobe`).
+- **Shared-kernel container boundary:**
+  - Linux `oci` using standard `crun` or `runc` enforces namespaces, `--cap-drop ALL`, `no-new-privileges`, and cgroups, but shares the host Linux kernel (`sandbox: oci (<engine>/<runtime>, shared kernel)`). Use `krun` or `runsc` when kernel-level isolation is required on Linux.
+
+## Operator Trust Boundary and Out of Scope
+
+The `polar` process itself runs with the privileges of the local OS user (or Kubernetes `polar` Pod). The following are within the operator's trust boundary and are out of scope unless a vulnerability in Polar grants that access or crosses an enforced boundary above:
+
+- Prior write access to `~/.polar`, `$POLAR_ARTIFACTS_DIR`, kubeconfig files, shell startup files, or process environment variables.
+- Code loaded explicitly by the operator via `-e` / `--extension`, `--skill`, `--prompt-template`, `--theme`, or `--approve`.
+- RBAC over-provisioning on the observed Kubernetes kubeconfig supplied to `builtin:k8s` or missing CNI/RBAC enforcement after `session_start` in user-managed clusters.
+- Prompt injection via untrusted cluster logs, events, or resource annotations that does not bypass the `files` read gate, `k8s` command/flag restrictions, or `sandbox` isolation boundary.
 
 ## Reporting a Vulnerability
 
-If you believe you found a security vulnerability in pi or another package in
-this repository, please report it privately by either:
+Do not open public GitHub issues for security vulnerabilities.
 
-- Emailing `security@earendil.com`, or
-- Opening a private report through GitHub Security Advisories for this repository
+Report vulnerabilities privately through [GitHub Security Advisories](https://github.com/HIRO-MicroDataCenters-BV/polar-sre/security/advisories/new) on `HIRO-MicroDataCenters-BV/polar-sre`. Include:
 
-Please include:
-
-- A description of the issue and its impact
-- Steps to reproduce, proof of concept, or relevant logs
-- Affected package, version, commit, or configuration
-- Any known mitigations
-
-Do not open a public issue for security-sensitive reports.  We will review
-reports and coordinate disclosure as appropriate.
-
-## Scope
-
-Security issues in the distributed packages, command-line tools, APIs, and
-repository code are in scope as well as earendil operated infrastructure
-on `pi.dev`.
-
-## Out Of Scope
-
-- Local code execution or sandboxing behavior (the Pi coding agent intentionally does not have a sandbox)
-- Behavior of pi extensions or skills installed by the user
-- Risks from working in untrusted repositories
-- Risks from installing untrusted extensions, skills, packages, or tools
-- Isuses caused by non trustworthy MITM proxies
-- Public internet exposure of a Pi installation
-- Prompt injection attacks
-- Exposed secrets that are third-party/user-controlled credentials
-- Reports requiring the ability to create, modify, delete, or replace files,
-  directories, symlinks, environment variables, shell configuration, or other
-  user-controlled local state on the target machine. This includes `~/.pi`,
-  `~/.pi/agent/models.json`, workspace files, `AGENTS.md`, skills, extensions,
-  extension configuration, dotfiles, and files synchronized through NFS, roaming
-  profiles, or dotfile managers, unless the report shows how Pi itself grants
-  that access.
-- Issues caused by intentionally weakened user configuration.
-- Resource/DOS claims that require trusted local input/config against the pi coding agent.
-- Reports about malicious model output.
-- User-approved or user-initiated local actions presented as vulnerabilities.
-
-## Notes for Reporters
-
-The most useful reports show a current, reproducible security boundary bypass
-with demonstrated impact.  Reports that only show expected local-agent behavior,
-prompt injection, or a malicious trusted extension/skill are not security
-vulnerabilities under this model.
-
-For example, a report showing that malicious contents written to a trusted Pi
-configuration file cause Pi to execute commands, load attacker-controlled tools,
-send credentials to an attacker-controlled endpoint, or otherwise change behavior
-is out of scope.
-
-When possible, include the exact affected path, package version or commit SHA,
-configuration, and a proof of concept against the latest release or latest
-`main`.  For dependency reports, include evidence that the shipped dependency is
-affected and that the issue is reachable through Pi.  For exposed-secret reports,
-include evidence that the credential is owned by Earendil or grants access to
-Earendil-operated infrastructure or services.
+- Affected commit SHA or image digest, platform, and sandbox driver/runtime configuration.
+- Minimal reproduction steps or proof of concept.
+- Which security boundary (`files` read gate, producer allowlist, `sandbox` guest/network/filesystem boundary, or Kubernetes RBAC/Pod isolation) is bypassed and the resulting impact.

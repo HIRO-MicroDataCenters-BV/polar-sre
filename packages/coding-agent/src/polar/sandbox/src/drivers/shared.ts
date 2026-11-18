@@ -65,6 +65,7 @@ export function launcher(language: SandboxLanguage, options: LauncherOptions = {
 			`init=$(( $(kb) * 1024 ))`,
 			`max=${max}`,
 			`mkfifo "$d/.w" 2>/dev/null`,
+			// Drain .o/.e via cat outside the interpreter pgrp: gVisor exec streams short-write at 64 KiB, so PYTHONUNBUFFERED=1 drops the tail unless cat loops.
 			`mkfifo "$d/.o" "$d/.e" || exit 1`,
 			`cat "$d/.o" &`,
 			`opid=$!`,
@@ -78,6 +79,7 @@ export function launcher(language: SandboxLanguage, options: LauncherOptions = {
 			`  exec 9<>"$d/.w"`,
 			`  rm -f "$d/.w"`,
 			`  while kill -0 "$pid" 2>/dev/null; do`,
+			// Pause 100 ms on an unlinked rw-FIFO between du -sk checks without spawning sleep on every iteration.
 			`    read -r -t 0.1 -u 9 || true`,
 			`    kill -0 "$pid" 2>/dev/null || exit 0`,
 			`    cur=$(( $(kb) * 1024 ))`,

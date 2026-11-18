@@ -212,6 +212,7 @@ export function ociSandboxArguments(
 	if (options.cpuDelegated) {
 		args.push("--cpus", String(limits.cpus));
 	}
+	// Under runsc (gVisor), cgroup --pids-limit counts internal Sentry threads, so launcher enforces ulimit -u instead.
 	if (options.gvisor !== true) {
 		args.push("--pids-limit", String(limits.processMax));
 	}

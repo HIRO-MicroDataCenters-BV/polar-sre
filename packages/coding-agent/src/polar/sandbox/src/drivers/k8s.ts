@@ -258,6 +258,7 @@ export function k8sPodName(name: string): string {
 	return name.toLowerCase().replaceAll(/[_.]/g, "-");
 }
 
+// Strip the "command terminated with exit code N\n" trailer appended by kubectl exec -i to stderr on non-zero exit.
 export function stripKubectlExecTrailer(stderr: Buffer, exitCode: number | null): Buffer {
 	if (exitCode === null || exitCode === 0) return stderr;
 	const trailer = Buffer.from(`command terminated with exit code ${exitCode}\n`, "utf8");
@@ -830,6 +831,7 @@ export class K8sDriver implements SandboxDriver {
 			[
 				"bash",
 				"-c",
+				// Run rm -rf first and fall back to chmod -R u+rwX + rm -rf only if the directory remains so trees shrink monotonically within 30s without pods/log RBAC.
 				'for s in "$@"; do target="/work-root/$s"; [ ! -e "$target" ] && continue; rm -rf -- "$target" 2>/dev/null; if [ -e "$target" ]; then chmod -R u+rwX "$target" 2>/dev/null || true; rm -rf -- "$target"; fi; done',
 				"polar-work-rm",
 				...sessionIds,

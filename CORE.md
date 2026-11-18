@@ -6,13 +6,19 @@
 
 Keep changes to the core minimal and localized so upstream diffs apply cleanly.
 
-Polar integrates into `packages/coding-agent` at:
+Polar integrates into the monorepo core at:
+- `packages/coding-agent/package.json` + `scripts/build-coding-agent-bundle.mjs`
+- `packages/coding-agent/src/config.ts`
 - `packages/coding-agent/src/extensions/index.ts` (`polarBuiltInExtensions`, `POLAR_DEFAULT_EXTENSION_SPECIFIERS`, `POLAR_EXCLUDED_BUILTIN_TOOLS`)
 - `packages/coding-agent/src/main.ts`
+- `packages/coding-agent/src/rpc-entry.ts`
+- `packages/coding-agent/src/cli/{args,auth-command,setup}.ts`
 - `packages/coding-agent/src/core/system-prompt.ts`
 - `packages/coding-agent/src/core/slash-commands.ts`
 - `packages/coding-agent/src/core/settings-manager.ts`
 - `packages/coding-agent/src/modes/interactive/interactive-mode.ts`
+- `packages/ai/src/utils/pi-user-agent.ts`
+- `packages/tui/src/tui-main-screen.ts`
 
 ## Core-Specific Rules & Testing
 

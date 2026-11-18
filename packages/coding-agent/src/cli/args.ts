@@ -281,7 +281,7 @@ export function printHelp(extensionFlags?: ExtensionFlag[]): void {
 					})
 					.join("\n")}\n`
 			: "";
-	console.log(`${chalk.bold(APP_NAME)} - AI coding assistant with read, bash, edit, write tools
+	console.log(`${chalk.bold(APP_NAME)} - Read-only SRE and incident investigation agent
 
 ${chalk.bold("Usage:")}
   ${APP_NAME} [options] [--] [@files...] [messages...]
@@ -294,7 +294,7 @@ ${chalk.bold("Options:")}
   --provider <name>              Provider to search for --model (requires --model)
   --model <pattern>              Model pattern or ID (supports "provider/id" and optional ":<thinking>")
   --api-key <key>                API key (defaults to env vars)
-  --system-prompt <text>         System prompt (default: coding assistant prompt)
+  --system-prompt <text>         System prompt (default: built-in Polar system prompt)
   --append-system-prompt <text>  Append text or file contents to the system prompt (can be used multiple times)
   --mode <mode>                  Output mode: text (default), json, or rpc
   --print, -p                    Non-interactive mode: process prompt and exit
@@ -392,17 +392,11 @@ ${chalk.bold("Examples:")}
   # Start with a specific thinking level
   ${APP_NAME} --thinking high "Solve this complex problem"
 
-  # Read-only mode (no file modifications possible)
-  ${APP_NAME} --tools read,grep,find,ls -p "Review the code in src/"
-
-  # Add codemode to the default tools
-  ${APP_NAME} --tools +codemode
-
-  # Codemode with only the tools of one MCP server
-  ${APP_NAME} --tools read,bash,codemode,'mcp__radius__*'
+  # Restrict active tools to specific names
+  ${APP_NAME} --tools read,list_files,run_code -p "Summarize saved session files"
 
   # Disable one tool while keeping the rest available
-  ${APP_NAME} --exclude-tools ask_question
+  ${APP_NAME} --exclude-tools run_code
 
   # Export a session file to HTML
   ${APP_NAME} --export ~/${CONFIG_DIR_NAME}/agent/sessions/--path--/session.jsonl
@@ -458,13 +452,13 @@ ${chalk.bold("Environment Variables:")}
   POLAR_OFFLINE                    - Disable startup network operations when set to 1/true/yes
 
 ${chalk.bold("Built-in Tool Names:")}
-  read       - Read file contents
-  bash       - Execute bash commands
-  powershell - Execute PowerShell commands on Windows
-  edit       - Edit files with find/replace
-  write      - Write files (creates/overwrites)
-  grep       - Search file contents (read-only, off by default)
-  find       - Find files by glob pattern (read-only, off by default)
-  ls         - List directory contents (read-only, off by default)
+  read         - Read session text files up to 16 MiB (gated by builtin:files)
+  list_files   - List saved session output files (builtin:files)
+  k8s_get      - List or inspect Kubernetes resources (builtin:k8s)
+  k8s_describe - Describe Kubernetes resources (builtin:k8s)
+  k8s_logs     - Read container logs from a Pod (builtin:k8s)
+  k8s_events   - List Kubernetes cluster events (builtin:k8s)
+  k8s_inspect  - Run fixed read-only container diagnostics (builtin:k8s)
+  run_code     - Execute Python or Bash in an isolated sandbox (builtin:sandbox)
 `);
 }
