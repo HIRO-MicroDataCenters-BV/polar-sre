@@ -19,7 +19,7 @@ function errorMessage(errorMessage: string): AssistantMessage {
 describe("InteractiveMode bug report hints", () => {
 	test("identifies extensions with frames in a crash stack", () => {
 		expect(formatCrashExtensionHint(["npm:pi-observational-memory"])).toBe(
-			"A stack frame came from loaded extension `npm:pi-observational-memory`, which may be involved. Try disabling it with `polar config`, or run `polar -ne` to confirm.",
+			"A stack frame came from loaded extension `npm:pi-observational-memory`, which may be involved. Try disabling it with `polar-sre config`, or run `polar-sre -ne` to confirm.",
 		);
 		expect(formatCrashExtensionHint(undefined)).toBeUndefined();
 	});

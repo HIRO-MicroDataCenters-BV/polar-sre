@@ -40,20 +40,20 @@ describe("ProjectTrustStore", () => {
 		const originalHome = process.env.HOME;
 		process.env.HOME = tempDir;
 		try {
-			mkdirSync(join(tempDir, ".polar", "agent"), { recursive: true });
+			mkdirSync(join(tempDir, ".polar-sre", "agent"), { recursive: true });
 			mkdirSync(join(tempDir, ".agents", "skills"), { recursive: true });
 			expect(hasTrustRequiringProjectResources(tempDir)).toBe(false);
 			expect(hasTrustRequiringProjectResources(cwd)).toBe(false);
 
-			writeFileSync(join(tempDir, ".polar", "settings.json"), "{}");
+			writeFileSync(join(tempDir, ".polar-sre", "settings.json"), "{}");
 			expect(hasTrustRequiringProjectResources(tempDir)).toBe(true);
-			rmSync(join(tempDir, ".polar", "settings.json"), { force: true });
+			rmSync(join(tempDir, ".polar-sre", "settings.json"), { force: true });
 
-			mkdirSync(join(cwd, ".polar"), { recursive: true });
-			writeFileSync(join(cwd, ".polar", "settings.json"), "{}");
+			mkdirSync(join(cwd, ".polar-sre"), { recursive: true });
+			writeFileSync(join(cwd, ".polar-sre", "settings.json"), "{}");
 			expect(hasTrustRequiringProjectResources(cwd)).toBe(true);
 
-			rmSync(join(cwd, ".polar"), { recursive: true, force: true });
+			rmSync(join(cwd, ".polar-sre"), { recursive: true, force: true });
 			mkdirSync(join(cwd, ".agents", "skills"), { recursive: true });
 			expect(hasTrustRequiringProjectResources(cwd)).toBe(true);
 		} finally {

@@ -190,7 +190,7 @@ Content`,
 		});
 
 		it("should resolve project paths relative to .pi", async () => {
-			const extDir = join(tempDir, ".polar", "extensions");
+			const extDir = join(tempDir, ".polar-sre", "extensions");
 			mkdirSync(extDir, { recursive: true });
 			const extPath = join(extDir, "project-ext.ts");
 			writeFileSync(extPath, "export default function() {}");
@@ -242,15 +242,15 @@ Content`,
 				writeFileSync(join(sharedThemesDir, "shared.json"), JSON.stringify({ name: "shared-theme" }));
 
 				mkdirSync(join(agentDir), { recursive: true });
-				mkdirSync(join(tempDir, ".polar"), { recursive: true });
+				mkdirSync(join(tempDir, ".polar-sre"), { recursive: true });
 				symlinkSync(sharedExtensionsDir, join(agentDir, "extensions"), "dir");
 				symlinkSync(sharedSkillsDir, join(agentDir, "skills"), "dir");
 				symlinkSync(sharedPromptsDir, join(agentDir, "prompts"), "dir");
 				symlinkSync(sharedThemesDir, join(agentDir, "themes"), "dir");
-				symlinkSync(sharedExtensionsDir, join(tempDir, ".polar", "extensions"), "dir");
-				symlinkSync(sharedSkillsDir, join(tempDir, ".polar", "skills"), "dir");
-				symlinkSync(sharedPromptsDir, join(tempDir, ".polar", "prompts"), "dir");
-				symlinkSync(sharedThemesDir, join(tempDir, ".polar", "themes"), "dir");
+				symlinkSync(sharedExtensionsDir, join(tempDir, ".polar-sre", "extensions"), "dir");
+				symlinkSync(sharedSkillsDir, join(tempDir, ".polar-sre", "skills"), "dir");
+				symlinkSync(sharedPromptsDir, join(tempDir, ".polar-sre", "prompts"), "dir");
+				symlinkSync(sharedThemesDir, join(tempDir, ".polar-sre", "themes"), "dir");
 
 				const result = await packageManager.resolve();
 
@@ -282,7 +282,7 @@ Content`,
 		});
 
 		it("should auto-discover project prompts with overrides", async () => {
-			const promptsDir = join(tempDir, ".polar", "prompts");
+			const promptsDir = join(tempDir, ".polar-sre", "prompts");
 			mkdirSync(promptsDir, { recursive: true });
 			const promptPath = join(promptsDir, "is.md");
 			writeFileSync(promptPath, "Is prompt");
@@ -343,7 +343,7 @@ Content`,
 		});
 
 		it("should use the project .pi dir as baseDir for project .pi skills", async () => {
-			const projectBaseDir = join(tempDir, ".polar");
+			const projectBaseDir = join(tempDir, ".polar-sre");
 			const skillPath = join(projectBaseDir, "skills", "project-pi", "SKILL.md");
 			mkdirSync(join(projectBaseDir, "skills", "project-pi"), { recursive: true });
 			writeFileSync(skillPath, "---\nname: project-pi\ndescription: project pi\n---\n");
@@ -505,7 +505,7 @@ Content`,
 
 			try {
 				const cwd = join(tempDir, "scratch", "nested");
-				const localAgentDir = join(tempDir, ".polar", "agent");
+				const localAgentDir = join(tempDir, ".polar-sre", "agent");
 				const localSettingsManager = SettingsManager.inMemory();
 				mkdirSync(cwd, { recursive: true });
 				mkdirSync(localAgentDir, { recursive: true });
@@ -535,7 +535,7 @@ Content`,
 			}
 		});
 
-		it("should dedupe user skill entries when ~/.polar/agent/skills is a symlink to ~/.agents/skills", async () => {
+		it("should dedupe user skill entries when ~/.polar-sre/agent/skills is a symlink to ~/.agents/skills", async () => {
 			const previousHome = process.env.HOME;
 			process.env.HOME = tempDir;
 
@@ -589,7 +589,7 @@ Content`,
 		it("should not apply parent .gitignore to .pi auto-discovery", async () => {
 			writeFileSync(join(tempDir, ".gitignore"), ".pi\n");
 
-			const skillDir = join(tempDir, ".polar", "skills", "auto-skill");
+			const skillDir = join(tempDir, ".polar-sre", "skills", "auto-skill");
 			mkdirSync(skillDir, { recursive: true });
 			const skillPath = join(skillDir, "SKILL.md");
 			writeFileSync(skillPath, "---\nname: auto-skill\ndescription: Auto\n---\nContent");
@@ -1005,7 +1005,7 @@ Content`,
 
 		it("should update git package dependencies without auto-installing peers", async () => {
 			const source = "git:github.com/user/repo";
-			const targetDir = join(tempDir, ".polar", "git", "github.com", "user", "repo");
+			const targetDir = join(tempDir, ".polar-sre", "git", "github.com", "user", "repo");
 			mkdirSync(targetDir, { recursive: true });
 			writeFileSync(join(targetDir, "package.json"), JSON.stringify({ name: "repo", version: "1.0.0" }));
 			settingsManager.setProjectPackages([source]);
@@ -1104,7 +1104,7 @@ Content`,
 			});
 
 			const source = "git:github.com/user/repo";
-			const targetDir = join(tempDir, ".polar", "git", "github.com", "user", "repo");
+			const targetDir = join(tempDir, ".polar-sre", "git", "github.com", "user", "repo");
 			mkdirSync(targetDir, { recursive: true });
 			writeFileSync(join(targetDir, "package.json"), JSON.stringify({ name: "repo", version: "1.0.0" }));
 			settingsManager.setProjectPackages([source]);
@@ -1441,7 +1441,7 @@ Content`,
 			expect(added).toBe(true);
 
 			const settings = settingsManager.getProjectSettings();
-			const rel = relative(join(tempDir, ".polar"), projectPkgDir);
+			const rel = relative(join(tempDir, ".polar-sre"), projectPkgDir);
 			const expected = rel.startsWith(".") ? rel : `./${rel}`;
 			expect(settings.packages?.[0]).toBe(expected);
 		});
@@ -1981,7 +1981,11 @@ Content`,
 			writeFileSync(join(pkgDir, "extensions", "bar.ts"), "export default function() {}");
 			writeFileSync(join(pkgDir, "skills", "foo", "SKILL.md"), "# Foo\n");
 			settingsManager.setProjectPackages([
-				{ source: relative(join(tempDir, ".polar"), pkgDir), autoload: false, extensions: ["+extensions/foo.ts"] },
+				{
+					source: relative(join(tempDir, ".polar-sre"), pkgDir),
+					autoload: false,
+					extensions: ["+extensions/foo.ts"],
+				},
 			]);
 
 			const result = await packageManager.resolve();
@@ -2377,7 +2381,7 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 
 	describe("offline mode and network timeouts", () => {
 		it("should update npm range packages using the configured spec", async () => {
-			const installedPath = join(tempDir, ".polar", "npm", "node_modules", "example");
+			const installedPath = join(tempDir, ".polar-sre", "npm", "node_modules", "example");
 			mkdirSync(installedPath, { recursive: true });
 			writeFileSync(join(installedPath, "package.json"), JSON.stringify({ name: "example", version: "1.0.0" }));
 			settingsManager.setProjectPackages(["npm:example@^1.0.0"]);
@@ -2396,13 +2400,13 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 			);
 			expect(runCommandSpy).toHaveBeenCalledWith(
 				"npm",
-				["install", "example@^1.0.0", "--prefix", join(tempDir, ".polar", "npm"), "--legacy-peer-deps"],
+				["install", "example@^1.0.0", "--prefix", join(tempDir, ".polar-sre", "npm"), "--legacy-peer-deps"],
 				undefined,
 			);
 		});
 
 		it("should skip project npm update when installed version matches latest", async () => {
-			const installedPath = join(tempDir, ".polar", "npm", "node_modules", "example");
+			const installedPath = join(tempDir, ".polar-sre", "npm", "node_modules", "example");
 			mkdirSync(installedPath, { recursive: true });
 			writeFileSync(join(installedPath, "package.json"), JSON.stringify({ name: "example", version: "1.3.1" }));
 			settingsManager.setProjectPackages(["npm:example@^1.0.0"]);
@@ -2423,7 +2427,7 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 		});
 
 		it("should skip npm updates when the installed version is newer than the registry version", async () => {
-			const installedPath = join(tempDir, ".polar", "npm", "node_modules", "example");
+			const installedPath = join(tempDir, ".polar-sre", "npm", "node_modules", "example");
 			mkdirSync(installedPath, { recursive: true });
 			writeFileSync(join(installedPath, "package.json"), JSON.stringify({ name: "example", version: "2.0.0" }));
 			settingsManager.setProjectPackages(["npm:example"]);
@@ -2483,8 +2487,8 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 			const userOldPath = join(agentDir, "npm", "node_modules", "user-old");
 			const userCurrentPath = join(agentDir, "npm", "node_modules", "user-current");
 			const userUnknownPath = join(agentDir, "npm", "node_modules", "user-unknown");
-			const projectOldPath = join(tempDir, ".polar", "npm", "node_modules", "project-old");
-			const projectCurrentPath = join(tempDir, ".polar", "npm", "node_modules", "project-current");
+			const projectOldPath = join(tempDir, ".polar-sre", "npm", "node_modules", "project-old");
+			const projectCurrentPath = join(tempDir, ".polar-sre", "npm", "node_modules", "project-current");
 			const installPaths = [userOldPath, userCurrentPath, userUnknownPath, projectOldPath, projectCurrentPath];
 			for (const installPath of installPaths) {
 				mkdirSync(installPath, { recursive: true });
@@ -2590,7 +2594,7 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 					"project-old@latest",
 					"project-missing@latest",
 					"--prefix",
-					join(tempDir, ".polar", "npm"),
+					join(tempDir, ".polar-sre", "npm"),
 					"--legacy-peer-deps",
 				],
 				undefined,
@@ -2675,7 +2679,7 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 
 		it("should not run npm view during resolve for installed unpinned packages", async () => {
 			process.env.PI_OFFLINE = "1";
-			const installedPath = join(tempDir, ".polar", "npm", "node_modules", "example");
+			const installedPath = join(tempDir, ".polar-sre", "npm", "node_modules", "example");
 			mkdirSync(join(installedPath, "extensions"), { recursive: true });
 			writeFileSync(join(installedPath, "package.json"), JSON.stringify({ name: "example", version: "1.0.0" }));
 			writeFileSync(join(installedPath, "extensions", "index.ts"), "export default function() {};");
@@ -2689,7 +2693,7 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 		});
 
 		it("should reinstall pinned npm packages when installed version does not match", async () => {
-			const installedPath = join(tempDir, ".polar", "npm", "node_modules", "example");
+			const installedPath = join(tempDir, ".polar-sre", "npm", "node_modules", "example");
 			mkdirSync(installedPath, { recursive: true });
 			writeFileSync(join(installedPath, "package.json"), JSON.stringify({ name: "example", version: "1.0.0" }));
 			settingsManager.setProjectPackages(["npm:example@2.0.0"]);
@@ -2712,7 +2716,7 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 		});
 
 		it("should report updates for installed unpinned npm packages", async () => {
-			const installedPath = join(tempDir, ".polar", "npm", "node_modules", "example");
+			const installedPath = join(tempDir, ".polar-sre", "npm", "node_modules", "example");
 			mkdirSync(installedPath, { recursive: true });
 			writeFileSync(join(installedPath, "package.json"), JSON.stringify({ name: "example", version: "1.0.0" }));
 			settingsManager.setProjectPackages(["npm:example"]);
@@ -2731,7 +2735,7 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 		});
 
 		it("should not report npm updates when the installed version is newer than the registry version", async () => {
-			const installedPath = join(tempDir, ".polar", "npm", "node_modules", "example");
+			const installedPath = join(tempDir, ".polar-sre", "npm", "node_modules", "example");
 			mkdirSync(installedPath, { recursive: true });
 			writeFileSync(join(installedPath, "package.json"), JSON.stringify({ name: "example", version: "2.0.0" }));
 			settingsManager.setProjectPackages(["npm:example"]);
@@ -2743,7 +2747,7 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 		});
 
 		it("should skip pinned packages when checking for updates", async () => {
-			const installedNpmPath = join(tempDir, ".polar", "npm", "node_modules", "example");
+			const installedNpmPath = join(tempDir, ".polar-sre", "npm", "node_modules", "example");
 			mkdirSync(installedNpmPath, { recursive: true });
 			writeFileSync(join(installedNpmPath, "package.json"), JSON.stringify({ name: "example", version: "1.0.0" }));
 			const parsedGitSource = (packageManager as any).parseSource("git:github.com/example/repo@v1");

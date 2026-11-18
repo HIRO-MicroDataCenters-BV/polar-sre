@@ -1,6 +1,6 @@
 # Polar Repository Rules
 
-This repository is the `polar-sre` monorepo (`bin: polar`, `piConfig: { name: "polar", configDir: ".polar" }`), forked from Pi `v1.1.0` (`earendil-works/pi`).
+This repository is the `polar-sre` monorepo (`bin: polar-sre`, `piConfig: { name: "polar-sre", configDir: ".polar-sre" }`), forked from Pi `v1.1.0` (`earendil-works/pi`).
 
 | Scope | Mandatory Reading Gate |
 |---|---|

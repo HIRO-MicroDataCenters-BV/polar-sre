@@ -13,7 +13,7 @@
     - If `--k8s-kubeconfig` resolves to a single file, acquires a session handle, creates `K8sRuntime`, registers the `k8s_*` tools, and sets footer status to `kubeconfig: <context>`.
     - If `--k8s-kubeconfig` is empty (`kubeconfig: no kubeconfig file specified, run /kubeconfig to select`) or lists multiple files (`kubeconfig: --k8s-kubeconfig lists multiple files, run /kubeconfig to select`), acquires no session handle (`lock` is not created), registers no tools, sets footer status to `kubeconfig: off, run /kubeconfig`, and notifies the operator with that warning.
   - When `--k8s-context` is not provided:
-    - Reads the saved `{ kubeconfigPath, context }` selection from `~/.polar/agent/k8s.json` (`join(getAgentDir(), "k8s.json")`).
+    - Reads the saved `{ kubeconfigPath, context }` selection from `~/.polar-sre/agent/k8s.json` (`join(getAgentDir(), "k8s.json")`).
     - If no saved selection exists, acquires no session handle, registers no tools, sets footer status to `kubeconfig: off, run /kubeconfig`, and notifies with warning `kubeconfig: no context selected, run /kubeconfig to select`.
     - If a saved selection exists, verifies via `discoverKubeContexts([saved.kubeconfigPath], ...)` that `saved.context` still exists in `saved.kubeconfigPath`. If the context is missing, deletes `k8s.json`, sets footer status to `kubeconfig: off, run /kubeconfig`, and notifies with warning `kubeconfig: saved context "<ctx>" was not found in <path>, run /kubeconfig to select`. If found, activates with the saved launch config and sets footer status to `kubeconfig: <context>`.
 - `/kubeconfig [query]` command:
@@ -21,7 +21,7 @@
   - Selects an exact match when `query` uniquely matches `item.context`, or opens the interactive fuzzy TUI picker (`selectKubeContext`).
   - **Cold activation:** if no runtime is active yet, acquires the session handle, creates `K8sRuntime`, registers the `k8s_*` tools, and sets footer status to `kubeconfig: <context>`.
   - **Live context switch:** if a runtime is already open, updates `runtime.launch` for subsequent tool calls while in-flight calls complete in their original context, and updates footer status to `kubeconfig: <context>`.
-  - Persists `{ kubeconfigPath, context }` to `~/.polar/agent/k8s.json` (`getAgentDir()`) and notifies with info `kubeconfig: context set to "<context>" (<kubeconfigPath>)`.
+  - Persists `{ kubeconfigPath, context }` to `~/.polar-sre/agent/k8s.json` (`getAgentDir()`) and notifies with info `kubeconfig: context set to "<context>" (<kubeconfigPath>)`.
 - On `session_shutdown`: marks the extension as shutting down, sends `SIGKILL` to active `kubectl` process groups (`-pid`), sets `runtime.state = "closing"`, and calls `releaseWhenIdle(runtime)`.
 
 ---

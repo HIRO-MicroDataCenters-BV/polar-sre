@@ -1,6 +1,6 @@
 # Polar (`polar-sre`)
 
-Polar is a read-only SRE and incident investigation agent (`bin: polar`, configuration directory `~/.polar`), built to collect evidence from production systems, inspect logs and resource state, and run local data analysis without mutating observed infrastructure.
+Polar is a read-only SRE and incident investigation agent (`bin: polar-sre`, configuration directory `~/.polar-sre`), built to collect evidence from production systems, inspect logs and resource state, and run local data analysis without mutating observed infrastructure.
 
 ## Architecture Overview
 
@@ -16,7 +16,7 @@ General-purpose host mutation and shell tools (`bash`, `powershell`, `edit`, `wr
 
 ```bash
 npm install -g polar-sre
-polar
+polar-sre
 ```
 
 The prerequisites below apply to the npm package as well.
@@ -61,7 +61,7 @@ For minimal extension development (`builtin:files` plus explicit `-e builtin:<na
 ### Provider and Cluster Setup
 
 1. **LLM provider:** Run `/login` inside the TUI or export a provider API key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, etc.).
-2. **Kubernetes context:** Run `/kubeconfig` inside the TUI to pick a context interactively (persisted in `~/.polar/agent/k8s.json`), or pass `--k8s-kubeconfig <path>` and `--k8s-context <context>` on startup.
+2. **Kubernetes context:** Run `/kubeconfig` inside the TUI to pick a context interactively (persisted in `~/.polar-sre/agent/k8s.json`), or pass `--k8s-kubeconfig <path>` and `--k8s-context <context>` on startup.
 
 ## Local Sandbox Setup
 

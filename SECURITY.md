@@ -24,7 +24,7 @@ Every invocation of the built-in `read` tool is intercepted by `packages/coding-
 
 ### 4. Analytics Sandbox (`builtin:sandbox` / `run_code`)
 
-`run_code` executes Python or Bash inside a read-only-rootfs Linux guest with no network, `2 GiB` RAM, `256` max processes, `300s` per-call timeout, and post-call scrubbing of user processes, `/tmp`, `/dev/shm`, `/dev/mqueue`, and SysV IPC objects. The guest runs as `1000:1000` on `apple-container`, rootless Podman, and `k8s`, and as `<hostUid>:<hostGid>` on standard Docker (`0:0` if `polar` itself is launched as `root`). The host working directory (`cwd`) is never mounted; only `session.outputDirectory` (`/data`, read-only) and the session workspace (`/work`, `4 GiB` read-write) are mounted.
+`run_code` executes Python or Bash inside a read-only-rootfs Linux guest with no network, `2 GiB` RAM, `256` max processes, `300s` per-call timeout, and post-call scrubbing of user processes, `/tmp`, `/dev/shm`, `/dev/mqueue`, and SysV IPC objects. The guest runs as `1000:1000` on `apple-container`, rootless Podman, and `k8s`, and as `<hostUid>:<hostGid>` on standard Docker (`0:0` if `polar-sre` itself is launched as `root`). The host working directory (`cwd`) is never mounted; only `session.outputDirectory` (`/data`, read-only) and the session workspace (`/work`, `4 GiB` read-write) are mounted.
 
 Kernel isolation depends on the selected driver and runtime:
 
@@ -37,9 +37,9 @@ Kernel isolation depends on the selected driver and runtime:
 
 ## Operator Trust Boundary and Out of Scope
 
-The `polar` process itself runs with the privileges of the local OS user (or Kubernetes `polar` Pod). The following are within the operator's trust boundary and are out of scope unless a vulnerability in Polar grants that access or crosses an enforced boundary above:
+The `polar-sre` process itself runs with the privileges of the local OS user (or Kubernetes `polar` Pod). The following are within the operator's trust boundary and are out of scope unless a vulnerability in Polar grants that access or crosses an enforced boundary above:
 
-- Prior write access to `~/.polar`, `$POLAR_ARTIFACTS_DIR`, kubeconfig files, shell startup files, or process environment variables.
+- Prior write access to `~/.polar-sre`, `$POLAR_ARTIFACTS_DIR`, kubeconfig files, shell startup files, or process environment variables.
 - Code loaded explicitly by the operator via `-e` / `--extension`, `--skill`, `--prompt-template`, `--theme`, or `--approve`.
 - RBAC over-provisioning on the observed Kubernetes kubeconfig supplied to `builtin:k8s` or missing CNI/RBAC enforcement after `session_start` in user-managed clusters.
 - Prompt injection via untrusted cluster logs, events, or resource annotations that does not bypass the `files` read gate, `k8s` command/flag restrictions, or `sandbox` isolation boundary.

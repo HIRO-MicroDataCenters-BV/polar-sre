@@ -1,14 +1,14 @@
 {
 	"name": "polar-sre",
-	"version": "0.1.1",
+	"version": "0.1.2",
 	"description": "Polar: read-only SRE and incident investigation agent",
 	"type": "module",
 	"piConfig": {
-		"name": "polar",
-		"configDir": ".polar"
+		"name": "polar-sre",
+		"configDir": ".polar-sre"
 	},
 	"bin": {
-		"polar": "dist/bundle/cli.js"
+		"polar-sre": "dist/bundle/cli.js"
 	},
 	"files": [
 		"dist/bundle",
