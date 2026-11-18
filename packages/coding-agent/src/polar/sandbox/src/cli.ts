@@ -1,5 +1,6 @@
 import { spawn } from "child_process";
 import { tmpdir } from "os";
+import { StringDecoder } from "string_decoder";
 import type { CleanupError, CommandOutcome, SandboxDriverContext } from "./types.ts";
 
 export const CLI_STOPPED = "sandbox is stopping; no command starts";
@@ -13,14 +14,43 @@ export interface ListedResource {
 	state?: string;
 }
 
+export interface CommandOptions {
+	timeoutMs?: number;
+	signal?: AbortSignal;
+	command?: string;
+	env?: NodeJS.ProcessEnv;
+	onLine?: (line: string) => void;
+}
+
 export function containerCommand(
 	runtime: SandboxDriverContext,
 	args: string[],
-	timeoutMs = runtime.limits.commandTimeoutMs,
+	options?: CommandOptions,
+): Promise<CommandOutcome>;
+export function containerCommand(
+	runtime: SandboxDriverContext,
+	args: string[],
+	timeoutMs?: number,
 	signal?: AbortSignal,
-	command = runtime.containerCommand,
-	env: NodeJS.ProcessEnv = runtime.environment,
+	command?: string,
+	env?: NodeJS.ProcessEnv,
+): Promise<CommandOutcome>;
+export function containerCommand(
+	runtime: SandboxDriverContext,
+	args: string[],
+	timeoutOrOptions?: number | CommandOptions,
+	positionalSignal?: AbortSignal,
+	positionalCommand?: string,
+	positionalEnv?: NodeJS.ProcessEnv,
 ): Promise<CommandOutcome> {
+	const options: CommandOptions =
+		typeof timeoutOrOptions === "object"
+			? timeoutOrOptions
+			: { timeoutMs: timeoutOrOptions, signal: positionalSignal, command: positionalCommand, env: positionalEnv };
+	const timeoutMs = options.timeoutMs ?? runtime.limits.commandTimeoutMs;
+	const signal = options.signal;
+	const command = options.command ?? runtime.containerCommand;
+	const env = options.env ?? runtime.environment;
 	if (runtime.cliStopped) return Promise.resolve({ code: null, stdout: "", stderr: CLI_STOPPED, timedOut: false });
 	if (signal?.aborted) return Promise.resolve({ code: null, stdout: "", stderr: "cancelled", timedOut: false });
 	return new Promise((resolve) => {
@@ -57,11 +87,21 @@ export function containerCommand(
 				timedOut,
 			});
 		};
-		child.stdout.on("data", (chunk: Buffer) => stdout.retain(chunk));
-		child.stderr.on("data", (chunk: Buffer) => stderr.retain(chunk));
+		const stdoutLines = options.onLine ? new LineSplitter(options.onLine) : undefined;
+		const stderrLines = options.onLine ? new LineSplitter(options.onLine) : undefined;
+		child.stdout.on("data", (chunk: Buffer) => {
+			stdout.retain(chunk);
+			stdoutLines?.write(chunk);
+		});
+		child.stderr.on("data", (chunk: Buffer) => {
+			stderr.retain(chunk);
+			stderrLines?.write(chunk);
+		});
 		child.once("error", (error) => settle(null, error));
 		child.once("close", (code) => {
 			runtime.children.delete(child);
+			stdoutLines?.end();
+			stderrLines?.end();
 			settle(code);
 		});
 	});
@@ -102,6 +142,32 @@ export function boundDiagnostic(text: string): string {
 
 export function describeCleanupErrors(errors: CleanupError[]): string {
 	return errors.map((error) => `${error.container} (${error.message})`).join(", ");
+}
+
+export class LineSplitter {
+	private readonly decoder = new StringDecoder("utf8");
+	private readonly onLine: (line: string) => void;
+	private partial = "";
+
+	constructor(onLine: (line: string) => void) {
+		this.onLine = onLine;
+	}
+
+	write(chunk: Buffer): void {
+		this.push(this.decoder.write(chunk));
+	}
+
+	end(): void {
+		this.push(`${this.decoder.end()}\n`);
+	}
+
+	private push(text: string): void {
+		const lines = (this.partial + text).split(/[\r\n]/);
+		this.partial = lines.pop() ?? "";
+		for (const line of lines) {
+			if (line !== "") this.onLine(line);
+		}
+	}
 }
 
 export class StreamCapture {

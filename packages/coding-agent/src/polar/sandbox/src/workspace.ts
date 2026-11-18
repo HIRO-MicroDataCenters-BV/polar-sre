@@ -6,7 +6,15 @@ import type { SessionShutdownEvent } from "../../../core/extensions/types.ts";
 import { type SessionLiveness, sessionLiveness } from "../../shared/session.ts";
 import { commandFailure, deadlineAfter, describeCleanupErrors, remainingMs } from "./cli.ts";
 import { artifactsRootOf, LEFTOVERS_STAYED, START_ENDED } from "./driver.ts";
-import type { ChildKind, CleanupError, OwnedResource, Readiness, SandboxRuntime, VolumeFailure } from "./types.ts";
+import type {
+	ChildKind,
+	CleanupError,
+	OwnedResource,
+	Readiness,
+	SandboxRuntime,
+	ShowImageOperation,
+	VolumeFailure,
+} from "./types.ts";
 
 export type Recovery = { clean: true } | { leftover: CleanupError[] } | { unknown: string };
 
@@ -64,7 +72,11 @@ function leftoverNotice(runtime: SandboxRuntime, errors: CleanupError[]): string
 	return `${describeCleanupErrors(errors)} could not be deleted; delete them with: ${runtime.driver.manualDeleteCommand(names)}`;
 }
 
-export async function checkReadiness(runtime: SandboxRuntime, selectImage?: SelectMissingImage): Promise<Readiness> {
+export async function checkReadiness(
+	runtime: SandboxRuntime,
+	selectImage?: SelectMissingImage,
+	showOperation?: ShowImageOperation,
+): Promise<Readiness> {
 	const status = await runtime.driver.checkRuntime(deadlineAfter(runtime));
 	if (!status.ready) return off(runtime, status.reason);
 	const candidates =
@@ -90,7 +102,10 @@ export async function checkReadiness(runtime: SandboxRuntime, selectImage?: Sele
 	const choice = await selectImage(`Sandbox image ${runtime.image} is not installed`, options);
 	if (runtime.state !== "unready") return off(runtime, START_ENDED);
 	if (choice === DOWNLOAD_IMAGE_OPTION && runtime.registryImage !== undefined) {
-		const pulled = await runtime.driver.pullImage(runtime.registryImage);
+		const operation = showOperation?.("download");
+		const pulled = await runtime.driver
+			.pullImage(runtime.registryImage, undefined, operation ? (line) => operation.output(line) : undefined)
+			.finally(() => operation?.end());
 		if (runtime.state !== "unready") return off(runtime, START_ENDED);
 		if (pulled.code !== 0) {
 			return off(runtime, `image pull ${runtime.registryImage} failed: ${commandFailure(pulled)}`);
@@ -99,7 +114,15 @@ export async function checkReadiness(runtime: SandboxRuntime, selectImage?: Sele
 		return { ready: true };
 	}
 	if (choice === BUILD_IMAGE_OPTION) {
-		const built = await runtime.driver.buildImage(runtime.image, getSandboxImageDir());
+		const operation = showOperation?.("build");
+		const built = await runtime.driver
+			.buildImage(
+				runtime.image,
+				getSandboxImageDir(),
+				undefined,
+				operation ? (line) => operation.output(line) : undefined,
+			)
+			.finally(() => operation?.end());
 		if (runtime.state !== "unready") return off(runtime, START_ENDED);
 		if (built.code !== 0) {
 			return off(runtime, `image build ${runtime.image} failed: ${commandFailure(built)}`);
@@ -113,8 +136,9 @@ export async function startRuntime(
 	runtime: SandboxRuntime,
 	warn: Warn,
 	selectImage?: SelectMissingImage,
+	showOperation?: ShowImageOperation,
 ): Promise<Readiness> {
-	const starting = performStart(runtime, warn, selectImage);
+	const starting = performStart(runtime, warn, selectImage, showOperation);
 	runtime.starting = starting;
 	try {
 		return await starting;
@@ -124,8 +148,13 @@ export async function startRuntime(
 	}
 }
 
-async function performStart(runtime: SandboxRuntime, warn: Warn, selectImage?: SelectMissingImage): Promise<Readiness> {
-	const readiness = await checkReadiness(runtime, selectImage);
+async function performStart(
+	runtime: SandboxRuntime,
+	warn: Warn,
+	selectImage?: SelectMissingImage,
+	showOperation?: ShowImageOperation,
+): Promise<Readiness> {
+	const readiness = await checkReadiness(runtime, selectImage, showOperation);
 	if (!readiness.ready) return readiness;
 	if (runtime.state !== "unready") return off(runtime, START_ENDED);
 	const recovery = await recoverLeftovers(runtime, warn);

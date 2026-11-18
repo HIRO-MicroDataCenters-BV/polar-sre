@@ -3,7 +3,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { acquireSession, type SessionHandle } from "../../shared/session.ts";
-import { commandFailure, containerCommand, deadlineAfter } from "../src/cli.ts";
+import { commandFailure, containerCommand, deadlineAfter, LineSplitter } from "../src/cli.ts";
 import { cleanupContainer, inspectionOf, parseContainers, parseVolumes } from "../src/driver.ts";
 import { cleanupOwned } from "../src/workspace.ts";
 import { type FakeState, fakeRuntime, fakeState } from "./fixtures.ts";
@@ -47,6 +47,49 @@ describe("cli", () => {
 		expect(timedOut("x".repeat(5000))).toBe(
 			`timedOut; stderr: ${"x".repeat(4096)} [904 more bytes not shown]`.replace("timedOut", "timed out"),
 		);
+	});
+
+	it("accepts CommandOptions and streams stdout/stderr lines via onLine", async () => {
+		const runtime = fakeRuntime(state, handle);
+		const lines: string[] = [];
+		const pulled = await containerCommand(runtime, ["image", "pull", "registry.example/image"], {
+			onLine: (line) => lines.push(line),
+		});
+		expect(pulled).toMatchObject({ code: 0, stdout: "pulled registry.example/image\n" });
+		expect(lines).toEqual(["pulled registry.example/image"]);
+
+		const failed = await containerCommand(fakeRuntime(state, handle, { PULL_FAIL: "1" }), ["image", "pull", "x"], {
+			onLine: (line) => lines.push(line),
+		});
+		expect(failed).toMatchObject({ code: 1, stderr: "Error: pull x failed\n" });
+		expect(lines.at(-1)).toBe("Error: pull x failed");
+
+		const hanging = fakeRuntime(state, handle, { DELETE_HANG: "1" });
+		const outcome = await containerCommand(hanging, ["delete", "--force", "polar-sandbox-current-1-deadbeef"], {
+			timeoutMs: 250,
+		});
+		expect(outcome).toMatchObject({ code: null, timedOut: true });
+
+		const cancelled = await containerCommand(runtime, ["system", "status"], { signal: AbortSignal.abort() });
+		expect(cancelled).toEqual({ code: null, stdout: "", stderr: "cancelled", timedOut: false });
+	});
+
+	it("splits stream output on CR and LF across arbitrary UTF-8 byte chunks", () => {
+		const lines: string[] = [];
+		const splitter = new LineSplitter((line) => lines.push(line));
+		const bytes = Buffer.from("[1/2] Fetching 10%\r[1/2] Fetching 20%\r\n\ncafé 日本語\nlast");
+		for (const byte of bytes) splitter.write(Buffer.from([byte]));
+		expect(lines).toEqual(["[1/2] Fetching 10%", "[1/2] Fetching 20%", "café 日本語"]);
+		splitter.end();
+		expect(lines).toEqual(["[1/2] Fetching 10%", "[1/2] Fetching 20%", "café 日本語", "last"]);
+
+		const mixed: string[] = [];
+		const output = new LineSplitter((line) => mixed.push(`out:${line}`));
+		const error = new LineSplitter((line) => mixed.push(`err:${line}`));
+		output.write(Buffer.from("layer: Pull"));
+		error.write(Buffer.from("[1/2] Fetching\n"));
+		output.write(Buffer.from(" complete\n"));
+		expect(mixed).toEqual(["err:[1/2] Fetching", "out:layer: Pull complete"]);
 	});
 
 	it("parses list, inspect, and volume JSON and does not take a failed or unreadable listing as an empty one", async () => {

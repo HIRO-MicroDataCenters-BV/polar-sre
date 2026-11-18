@@ -78,18 +78,26 @@ function shellWord(value: string): string {
 	return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-function fakeContext(options: { hasUI?: boolean; selectChoice?: string } = {}) {
+interface FakeContextOptions {
+	hasUI?: boolean;
+	selectChoice?: string;
+	mode?: string;
+}
+
+function fakeContext(options: FakeContextOptions = {}) {
 	const notices: [string, string | undefined][] = [];
 	const footer = new Map<string, string | undefined>();
 	const selects: [string, string[]][] = [];
+	const widgets: [string, "shown" | "removed"][] = [];
 	const hasUI = options.hasUI ?? true;
 	const context = {
-		mode: hasUI ? "tui" : "print",
+		mode: options.mode ?? (hasUI ? "tui" : "print"),
 		hasUI,
 		cwd: process.cwd(),
 		ui: {
 			notify: (message: string, type?: string) => notices.push([message, type]),
 			setStatus: (key: string, text: string | undefined) => footer.set(key, text),
+			setWidget: (key: string, content: unknown) => widgets.push([key, content === undefined ? "removed" : "shown"]),
 			select: async (title: string, items: string[]) => {
 				selects.push([title, items]);
 				return options.selectChoice;
@@ -98,15 +106,12 @@ function fakeContext(options: { hasUI?: boolean; selectChoice?: string } = {}) {
 		sessionManager: { getSessionId: () => SESSION_ID },
 		shutdown: () => {},
 	};
-	return { ctx: context as unknown as ExtensionContext, notices, footer, selects };
+	return { ctx: context as unknown as ExtensionContext, notices, footer, selects, widgets };
 }
 
-function loadExtension(
-	flagValues: Record<string, string> = {},
-	contextOptions: { hasUI?: boolean; selectChoice?: string } = {},
-) {
+function loadExtension(flagValues: Record<string, string> = {}, contextOptions: FakeContextOptions = {}) {
 	const flags: Record<string, string> = { "sandbox-driver": "apple-container", ...flagValues };
-	const { ctx, notices, footer, selects } = fakeContext(contextOptions);
+	const { ctx, notices, footer, selects, widgets } = fakeContext(contextOptions);
 	const tools: ToolDefinition<TObject>[] = [];
 	const flagDefaults = new Map<string, string | undefined>();
 	const handlers = new Map<string, EventHandler>();
@@ -137,6 +142,7 @@ function loadExtension(
 		notices,
 		footer,
 		selects,
+		widgets,
 		flagDefaults,
 		startSession: () => fire("session_start", { type: "session_start", reason: "startup" }),
 		shutdown: (reason: ShutdownReason = "quit") => fire("session_shutdown", { type: "session_shutdown", reason }),
@@ -355,6 +361,42 @@ describe("sandbox extension", () => {
 		]);
 		expect(pulled.tools.map((tool) => tool.name)).toEqual(["run_code"]);
 		await pulled.shutdown();
+	});
+
+	it("mounts the progress widget only in TUI mode and clears it when pull or build finishes", async () => {
+		await setKnobs({ IMAGE_MISSING: "1" });
+		const registry = "registry.example/polar-sandbox@sha256:abc";
+		const flags = { "sandbox-registry-image": registry };
+
+		const pulled = loadExtension(flags, { selectChoice: DOWNLOAD_IMAGE_OPTION });
+		await pulled.startSession();
+		expect(pulled.widgets).toEqual([
+			["sandbox-image", "shown"],
+			["sandbox-image", "removed"],
+		]);
+		await pulled.shutdown();
+
+		const built = loadExtension(flags, { selectChoice: BUILD_IMAGE_OPTION });
+		await built.startSession();
+		expect(built.widgets).toEqual([
+			["sandbox-image", "shown"],
+			["sandbox-image", "removed"],
+		]);
+		await built.shutdown();
+
+		await setKnobs({ IMAGE_MISSING: "1", PULL_FAIL: "1" });
+		const failed = loadExtension(flags, { selectChoice: DOWNLOAD_IMAGE_OPTION });
+		await failed.startSession();
+		expect(failed.tools).toEqual([]);
+		expect(failed.widgets.at(-1)).toEqual(["sandbox-image", "removed"]);
+		await failed.shutdown();
+
+		await setKnobs({ IMAGE_MISSING: "1" });
+		const rpc = loadExtension(flags, { mode: "rpc", selectChoice: DOWNLOAD_IMAGE_OPTION });
+		await rpc.startSession();
+		expect(rpc.tools.map((tool) => tool.name)).toEqual(["run_code"]);
+		expect(rpc.widgets).toEqual([]);
+		await rpc.shutdown();
 	});
 
 	it("rejects an empty or NUL program before any run", async () => {

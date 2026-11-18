@@ -129,6 +129,15 @@ export interface ToolReply {
 
 export type Readiness = { ready: true } | { ready: false; message: string; leftovers: CleanupError[] };
 
+export type ImageOperationKind = "download" | "build";
+
+export interface ImageOperation {
+	output(line: string): void;
+	end(): void;
+}
+
+export type ShowImageOperation = (kind: ImageOperationKind) => ImageOperation;
+
 export interface VolumeFailure {
 	reason: string;
 	leftover?: CleanupError;
@@ -159,8 +168,13 @@ export interface SandboxDriver {
 
 	checkRuntime(deadlineAt: number): Promise<{ ready: true } | { ready: false; reason: string }>;
 	inspectImage(image: string, deadlineAt: number): Promise<{ found: true } | { found: false; reason: string }>;
-	pullImage(image: string, signal?: AbortSignal): Promise<CommandOutcome>;
-	buildImage(image: string, contextDir: string, signal?: AbortSignal): Promise<CommandOutcome>;
+	pullImage(image: string, signal?: AbortSignal, onLine?: (line: string) => void): Promise<CommandOutcome>;
+	buildImage(
+		image: string,
+		contextDir: string,
+		signal?: AbortSignal,
+		onLine?: (line: string) => void,
+	): Promise<CommandOutcome>;
 
 	listSandboxes(root: string, deadlineAt: number): Promise<OwnedResource[]>;
 	deleteSandbox(name: string, deadlineAt: number): Promise<CleanupOutcome>;

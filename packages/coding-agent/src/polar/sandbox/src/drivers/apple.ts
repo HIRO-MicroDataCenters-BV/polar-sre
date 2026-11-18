@@ -335,16 +335,25 @@ export class AppleContainerDriver implements SandboxDriver {
 		return { found: false, reason: `container image inspect ${image} failed: ${commandFailure(inspected)}` };
 	}
 
-	pullImage(image: string, signal?: AbortSignal): Promise<CommandOutcome> {
-		return containerCommand(this.runtime, ["image", "pull", image], BUILD_TIMEOUT_MS, signal);
+	pullImage(image: string, signal?: AbortSignal, onLine?: (line: string) => void): Promise<CommandOutcome> {
+		// Limit pull to arm64; without --arch, container fetches and unpacks every platform in a multi-arch index.
+		return containerCommand(this.runtime, ["image", "pull", "--arch", "arm64", image], {
+			timeoutMs: BUILD_TIMEOUT_MS,
+			signal,
+			onLine,
+		});
 	}
 
-	buildImage(image: string, contextDir: string, signal?: AbortSignal): Promise<CommandOutcome> {
+	buildImage(
+		image: string,
+		contextDir: string,
+		signal?: AbortSignal,
+		onLine?: (line: string) => void,
+	): Promise<CommandOutcome> {
 		return containerCommand(
 			this.runtime,
 			["build", "--arch", "arm64", "--tag", image, "--file", join(contextDir, "Containerfile"), contextDir],
-			BUILD_TIMEOUT_MS,
-			signal,
+			{ timeoutMs: BUILD_TIMEOUT_MS, signal, onLine },
 		);
 	}
 

@@ -26,7 +26,8 @@ The `sandbox` extension (`builtin:sandbox`) registers the `run_code` tool, execu
     2. Otherwise, `REGISTRY_IMAGE` / `--sandbox-registry-image` is checked first (when configured), followed by the local tag `polar-sandbox:0.2`.
   - When the image is not found in local cache:
     - If `ctx.hasUI === false` (non-interactive / headless mode), no menu is shown and `sandbox` immediately disables itself (`sandbox is off: image ... is not installed (...)`).
-    - If `ctx.hasUI === true` (interactive TUI), `ctx.ui.select` offers `Download prebuilt image` (only when `REGISTRY_IMAGE` / `--sandbox-registry-image` is set, with a `10 min` timeout), `Build sandbox image locally (~2 min)` (builds from `getSandboxImageDir()` with a `10 min` timeout), and `Disable sandbox for this session`.
+    - If `ctx.hasUI === true` (interactive TUI or RPC), `ctx.ui.select` offers `Download prebuilt image` (only when `REGISTRY_IMAGE` / `--sandbox-registry-image` is set, `10 min` timeout; on `apple-container` passes `--arch arm64` so only the guest platform is fetched and unpacked), `Build sandbox image locally (~2 min)` (builds from `getSandboxImageDir()`, `10 min` timeout), and `Disable sandbox for this session`.
+    - In TUI mode (`ctx.mode === "tui"`), a transient single-line widget (`ctx.ui.setWidget("sandbox-image", ...)`) is displayed above the editor during pull/build and cleared on completion: fixed-width `<activity> <step>  <bar>  <amount>` when structured pull progress is parsed (`container image pull` bytes or `docker pull` layers), or `<title>  <latest line>  <elapsed>` for image builds and unstructured pulls (`podman pull`). Headless (`print`, `json`) and `rpc` modes do not mount the widget.
 - **Operator Output Quotas:** `fileMaxBytes` is `4 GiB` and `sessionMaxBytes` is `16 GiB`.
 - **Lazy Hot Sandbox VM / Container:**
   - The sandbox is started lazily on the first `run_code` call in the session (`driver.startSandbox`), not at `session_start`.
@@ -36,13 +37,13 @@ The `sandbox` extension (`builtin:sandbox`) registers the `run_code` tool, execu
   - After every completed call, `scrubAfterCall` runs an external `<engine> exec` that kills any remaining processes of the guest user, removes SysV IPC objects (`ipcrm --all`), resets permissions (`chmod -R u+rwX`), deletes all entries under `/tmp`, `/dev/shm`, and `/dev/mqueue`, and verifies that no user processes, temporary files, or SysV IPC objects remain.
   - On timeout, cancellation, output limit, OOM, stopped/missing/unknown container inspection, or `scrubAfterCall` returning `false`, the hot sandbox is destroyed (`hot.destroy`) and transparently recreated on the next call while preserving `/work`.
 - **Sequential Execution:** `executionMode: "sequential"` runs one call at a time per session.
-- **UI vs LLM Naming Contract:** No footer status (`ctx.ui.setStatus`) is set. User-facing notifications (`ctx.ui.notify`) refer to the runtime as `sandbox` (`sandbox is off: ...`, `sandbox: ...`), whereas the tool name, `promptGuidelines`, and model-facing replies use `run_code` (`[run_code <status>]`, `run_code-<n>.txt`, `run_code-stderr-<n>.txt`).
+- **UI vs LLM Naming Contract:** No footer status (`ctx.ui.setStatus`) is set; the only widget mounted is the transient `sandbox-image` progress line during image pull/build. User-facing notifications (`ctx.ui.notify`) refer to the runtime as `sandbox` (`sandbox is off: ...`, `sandbox: ...`), whereas the tool name, `promptGuidelines`, and model-facing replies use `run_code` (`[run_code <status>]`, `run_code-<n>.txt`, `run_code-stderr-<n>.txt`).
 
 ---
 
 ## 2. File Structure & Layers
 
-Each layer in `packages/coding-agent/src/polar/sandbox/src/` imports only from lower layers:
+Each numbered layer in `packages/coding-agent/src/polar/sandbox/src/` imports only from lower layers; `progress.ts` and `indicator.ts` sit alongside the core layers and are wired into Layer 3 via `ShowImageOperation` in `index.ts`:
 
 ```text
 packages/coding-agent/src/polar/sandbox/
@@ -63,11 +64,14 @@ packages/coding-agent/src/polar/sandbox/
 │   │   └── k8s.ts                   # K8sDriver & K8sHotSandbox (`kubectl` Pod)
 │   ├── workspace.ts                 # Layer 3: Readiness check, image lookup/pull/build UX, orphan GC, /work volume setup
 │   ├── runner.ts                    # Layer 4: Admission, lazy HotSandbox lifecycle, call supervision, OOM, work_limit & scrub
-│   └── reply.ts                     # Layer 5: Reply budget calculation, stdout/stderr store finalization, formatting
+│   ├── reply.ts                     # Layer 5: Reply budget calculation, stdout/stderr store finalization, formatting
+│   ├── progress.ts                  # CLI pull progress parser (`ProgressReader` -> `ImageProgress`)
+│   └── indicator.ts                 # TUI progress line widget (`showImageOperation`)
 └── test/
     ├── fake-container.mjs           # Stateful stand-in for the `container` CLI in tests
     ├── fake-oci.mjs                 # Stateful stand-in for the `podman` / `docker` CLI in tests
     ├── fake-kubectl.mjs             # Stateful stand-in for the `kubectl` CLI in tests
+    ├── fixtures/                    # Recorded non-TTY `container image pull` and `docker pull` output chunks
     ├── fixtures.ts
     └── *.test.ts
 ```
@@ -75,7 +79,7 @@ packages/coding-agent/src/polar/sandbox/
 ### Layer Responsibilities
 
 1. **`src/cli.ts` (Layer 1 — Stateless CLI & Diagnostic Primitives)**
-   - Spawns short runtime CLI commands with `commandTimeoutMs` (`30s`), optional `AbortSignal`, and optional child `env` override (`containerCommand`), tracking child processes in `runtime.children`.
+   - Spawns short runtime CLI commands with `commandTimeoutMs` (`30s`), optional `AbortSignal`, optional child `env` override, and optional per-line output streaming (`CommandOptions.onLine` via per-stream `LineSplitter`), tracking child processes in `runtime.children`.
    - Provides stream retention (`StreamCapture`), deadline helpers (`deadlineAfter`, `remainingMs`, `firstLine`), and bounded diagnostic formatting (`boundDiagnostic`: `4 KiB` / `64` lines, `commandFailure`, `describeCleanupErrors`).
 
 2. **`src/driver.ts` & `src/drivers/{shared,apple,oci,k8s}.ts` (Layer 2 — `SandboxDriver` & `HotSandbox`)**
@@ -86,7 +90,7 @@ packages/coding-agent/src/polar/sandbox/
    - `src/drivers/k8s.ts` (`K8sDriver` & `K8sHotSandbox`): Kubernetes Pod implementation via `kubectl` with an isolated ServiceAccount kubeconfig atomically written to `/tmp` and `KUBECONFIG` stripped from child process environments — verifies `POLAR_SANDBOX_K8S_*` and self-Pod UID in `checkRuntime`, runs the combined `/work` writability + `NetworkPolicy` deny-all probe Pod (`polar-netprobe-*`) in `ensureWorkVolume` (after `recoverLeftovers`), creates sandbox Pods under Pod Security `restricted` (`restartPolicy: Never`, `stdin: true` without `kubectl attach`, `ownerReferences`, `nodeSelector`, `polar-root-hash` label + `polar-root` annotation), deletes the Pod immediately on `kill()`, and performs two-step OOM detection on exit `137` or `128` (`state.terminated.reason === "OOMKilled"` with status-lag polling when the Pod is dead, or `/sys/fs/cgroup/memory.events` `oom_kill` delta when the Pod remains alive).
 
 3. **`src/workspace.ts` (Layer 3 — Session Workspace & Recovery)**
-   - `startRuntime` and `checkReadiness`: checks driver readiness, inspects image candidates (`--sandbox-image` -> `REGISTRY_IMAGE` -> `polar-sandbox:0.2`), runs the interactive `ctx.ui.select` flow (`Download prebuilt image` / `Build sandbox image locally (~2 min)` / `Disable sandbox for this session`) when `ctx.hasUI === true` or disables immediately when `ctx.hasUI === false`, recovers leftover resources under the same `polar-root`, and prepares `/work`.
+   - `startRuntime` and `checkReadiness`: checks driver readiness, inspects image candidates (`--sandbox-image` -> `REGISTRY_IMAGE` -> `polar-sandbox:0.2`), runs the interactive `ctx.ui.select` flow (`Download prebuilt image` / `Build sandbox image locally (~2 min)` / `Disable sandbox for this session`) when `ctx.hasUI === true` (forwarding CLI output lines to optional `ShowImageOperation`) or disables immediately when `ctx.hasUI === false`, recovers leftover resources under the same `polar-root`, and prepares `/work`.
    - `recoverLeftovers` and `cleanupOwned`: `recoverLeftovers` deletes containers belonging to the current session or to sessions whose `sessionLiveness` is `"ended"`, deletes volumes when the owning session's directory is absent (`ENOENT`), and preserves resources of `"alive"` and `"unknown"` sessions. `cleanupOwned(runtime, deadlineAt, exclude)` deletes owned containers through `runtime.driver.deleteSandbox`.
    - `shutdownRuntime`: closes admission, waits up to `shutdownBudgetMs` (`10s`) for in-flight operations to drain, destroys the active `HotSandbox` and cleans up owned containers, kills remaining CLI processes on `quit`, and releases the session handle when drained.
 
@@ -100,6 +104,10 @@ packages/coding-agent/src/polar/sandbox/
    - Finalizes `result.output` (`discardOutputFile` if a plain `ok` or if the full output fits the reply room; `finishOutputFile` otherwise) and saves oversized `stderr` via `saveBytes` as `run_code-stderr-<n>.txt`.
    - Formats the reply with status line `[run_code <status>] <language>: <first-line>`, `stdout` head excerpt, `[stderr]...[/stderr]` tail excerpt, and notices (`outputLimitNotice`, `cleanupNotice`, `inspectionNotice`, `statusMessage`).
    - Saved file notices point to `"read" tool` (when `<= 16 MiB`) and `"run_code" tool from /data/<file>`.
+
+6. **`src/progress.ts` & `src/indicator.ts` (UI Helpers — Image Progress Widget)**
+   - `src/progress.ts` (`ProgressReader`): pure parser (no TUI/theme imports) extracting step, completion fraction, and byte/layer counts from `container image pull` and non-TTY `docker pull` output lines, falling back to the latest sanitized text line.
+   - `src/indicator.ts` (`showImageOperation`): mounts and disposes the `sandbox-image` TUI widget above the editor, rendering either a fixed-column progress bar or a right-aligned elapsed-time status line.
 
 ---
 

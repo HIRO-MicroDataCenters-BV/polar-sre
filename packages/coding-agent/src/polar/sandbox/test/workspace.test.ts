@@ -181,7 +181,26 @@ describe("start", () => {
 		).toEqual({ ready: true });
 		expect(seenOptions).toEqual([DOWNLOAD_IMAGE_OPTION, BUILD_IMAGE_OPTION, DISABLE_SANDBOX_OPTION]);
 		expect(pullRuntime.image).toBe(registry);
-		expect((await callsOf("image")).at(-1)).toEqual(["image", "pull", registry]);
+		expect((await callsOf("image")).at(-1)).toEqual(["image", "pull", "--arch", "arm64", registry]);
+
+		// 5a. Forwards pull output lines to showOperation and calls end()
+		state = await fakeState();
+		const shownRuntime = startingRuntime(state, handle, { IMAGE_MISSING: "1" });
+		shownRuntime.image = local;
+		shownRuntime.registryImage = registry;
+		shownRuntime.customImage = false;
+		const shown: string[] = [];
+		expect(
+			await checkReadiness(
+				shownRuntime,
+				async () => DOWNLOAD_IMAGE_OPTION,
+				(kind) => {
+					shown.push(`start ${kind}`);
+					return { output: (line) => shown.push(line), end: () => shown.push("end") };
+				},
+			),
+		).toEqual({ ready: true });
+		expect(shown).toEqual(["start download", `pulled ${registry}`, "end"]);
 
 		// 6. Selecting Disable turns off sandbox
 		state = await fakeState();

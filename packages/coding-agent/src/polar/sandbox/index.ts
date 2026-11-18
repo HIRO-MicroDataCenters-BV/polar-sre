@@ -12,6 +12,7 @@ import {
 	UnsupportedSandboxDriver,
 	WORK_PATH,
 } from "./src/driver.ts";
+import { showImageOperation } from "./src/indicator.ts";
 import { buildReply } from "./src/reply.ts";
 import { admitCall, shutdownRefusal } from "./src/runner.ts";
 import {
@@ -25,6 +26,7 @@ import {
 	type SandboxLimits,
 	type SandboxRequest,
 	type SandboxRuntime,
+	type ShowImageOperation,
 	type ToolReply,
 } from "./src/types.ts";
 import { shutdownRuntime, startRuntime } from "./src/workspace.ts";
@@ -281,7 +283,10 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
 			ctx.hasUI && typeof ctx.ui.select === "function"
 				? (title: string, options: string[]) => ctx.ui.select(title, options)
 				: undefined;
-		const readiness = await startRuntime(runtime, warn, selectImage);
+		// RPC mode sets hasUI=true for select dialogs, but component widgets are supported only in TUI mode.
+		const showOperation: ShowImageOperation | undefined =
+			ctx.mode === "tui" ? (kind) => showImageOperation(ctx.ui, kind) : undefined;
+		const readiness = await startRuntime(runtime, warn, selectImage, showOperation);
 		if (runtime.state !== "unready") return;
 		if (!readiness.ready) {
 			warn(readiness.message);

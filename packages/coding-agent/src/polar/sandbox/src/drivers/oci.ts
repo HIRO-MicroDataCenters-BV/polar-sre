@@ -544,11 +544,20 @@ export class OciDriver implements SandboxDriver {
 		return { found: false, reason: `${this.engine} image inspect ${image} failed: ${commandFailure(inspected)}` };
 	}
 
-	pullImage(image: string, signal?: AbortSignal): Promise<CommandOutcome> {
-		return containerCommand(this.runtime, ["image", "pull", image], BUILD_TIMEOUT_MS, signal);
+	pullImage(image: string, signal?: AbortSignal, onLine?: (line: string) => void): Promise<CommandOutcome> {
+		return containerCommand(this.runtime, ["image", "pull", image], {
+			timeoutMs: BUILD_TIMEOUT_MS,
+			signal,
+			onLine,
+		});
 	}
 
-	buildImage(image: string, contextDir: string, signal?: AbortSignal): Promise<CommandOutcome> {
+	buildImage(
+		image: string,
+		contextDir: string,
+		signal?: AbortSignal,
+		onLine?: (line: string) => void,
+	): Promise<CommandOutcome> {
 		const arch = hostLinuxArch();
 		return containerCommand(
 			this.runtime,
@@ -562,8 +571,7 @@ export class OciDriver implements SandboxDriver {
 				join(contextDir, "Containerfile"),
 				contextDir,
 			],
-			BUILD_TIMEOUT_MS,
-			signal,
+			{ timeoutMs: BUILD_TIMEOUT_MS, signal, onLine },
 		);
 	}
 

@@ -1,8 +1,10 @@
+import { readFileSync } from "fs";
 import { mkdir, mkdtemp, readdir, readFile, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import { setTimeout as sleep } from "timers/promises";
 import { fileURLToPath } from "url";
+import { LineSplitter } from "../src/cli.ts";
 import {
 	AppleContainerDriver,
 	K8sDriver,
@@ -269,6 +271,24 @@ export function startingK8sRuntime(
 	const runtime = fakeK8sRuntime(state, handle, saDir, knobs, limits, driverOptions);
 	runtime.state = "unready";
 	return runtime;
+}
+
+export function recordedLines(name: string): string[] {
+	const lines: string[] = [];
+	const splitters = new Map<string, LineSplitter>();
+	const recording = readFileSync(fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url)), "utf8");
+	for (const entry of recording.split("\n").filter((line) => line !== "")) {
+		const chunk = JSON.parse(entry) as { stream?: string; text?: string };
+		if (chunk.stream === undefined || chunk.text === undefined) continue;
+		let splitter = splitters.get(chunk.stream);
+		if (!splitter) {
+			splitter = new LineSplitter((line) => lines.push(line));
+			splitters.set(chunk.stream, splitter);
+		}
+		splitter.write(Buffer.from(chunk.text));
+	}
+	for (const splitter of splitters.values()) splitter.end();
+	return lines;
 }
 
 export async function until(condition: () => boolean | Promise<boolean>, timeoutMs = 5000): Promise<void> {

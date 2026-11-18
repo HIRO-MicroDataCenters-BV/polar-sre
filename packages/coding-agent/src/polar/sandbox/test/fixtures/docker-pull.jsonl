@@ -1,0 +1,22 @@
+{"ms":1528,"stream":"stdout","text":"7.4-alpine: Pulling from library/redis\n"}
+{"ms":1889,"stream":"stdout","text":"fea5b91588ca: Pulling fs layer\nfb602ba0b128: Pulling fs layer\n8fe75981dbac: Pulling fs layer\n"}
+{"ms":1889,"stream":"stdout","text":"54abef31ddd9: Pulling fs layer\ne8978eba2bb2: Pulling fs layer\n54abef31ddd9: Waiting\n"}
+{"ms":1890,"stream":"stdout","text":"4f4fb700ef54: Pulling fs layer\n16cda2556898: Pulling fs layer\n4f4fb700ef54: Waiting\ne8978eba2bb2: Waiting\n"}
+{"ms":2278,"stream":"stdout","text":"fb602ba0b128: Verifying Checksum\nfb602ba0b128: Download complete\n"}
+{"ms":2300,"stream":"stdout","text":"8fe75981dbac: Verifying Checksum\n8fe75981dbac: Download complete\n"}
+{"ms":2655,"stream":"stdout","text":"fea5b91588ca: Verifying Checksum\nfea5b91588ca: Download complete\n"}
+{"ms":2683,"stream":"stdout","text":"e8978eba2bb2: Verifying Checksum\ne8978eba2bb2: Download complete\n"}
+{"ms":2779,"stream":"stdout","text":"fea5b91588ca: Pull complete\n"}
+{"ms":2816,"stream":"stdout","text":"fb602ba0b128: Pull complete\n"}
+{"ms":2888,"stream":"stdout","text":"54abef31ddd9: Verifying Checksum\n54abef31ddd9: Download complete\n"}
+{"ms":2929,"stream":"stdout","text":"8fe75981dbac: Pull complete\n"}
+{"ms":2989,"stream":"stdout","text":"4f4fb700ef54: Verifying Checksum\n4f4fb700ef54: Download complete\n"}
+{"ms":3019,"stream":"stdout","text":"16cda2556898: Verifying Checksum\n16cda2556898: Download complete\n"}
+{"ms":3095,"stream":"stdout","text":"54abef31ddd9: Pull complete\n"}
+{"ms":3122,"stream":"stdout","text":"e8978eba2bb2: Pull complete\n"}
+{"ms":3150,"stream":"stdout","text":"4f4fb700ef54: Pull complete\n"}
+{"ms":3175,"stream":"stdout","text":"16cda2556898: Pull complete\n"}
+{"ms":3196,"stream":"stdout","text":"Digest: sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe\n"}
+{"ms":3202,"stream":"stdout","text":"Status: Downloaded newer image for redis:7.4-alpine\n"}
+{"ms":3210,"stream":"stdout","text":"docker.io/library/redis:7.4-alpine\n"}
+{"ms":3212,"exit":0}

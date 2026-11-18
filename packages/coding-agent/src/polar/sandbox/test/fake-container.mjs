@@ -265,7 +265,8 @@ async function main() {
 			process.exit(Number(knob("STATUS_EXIT", 0)));
 			break;
 		case "image": {
-			const [sub, img] = args;
+			const sub = args[0];
+			const img = args.at(-1);
 			if (sub === "pull") {
 				if (knob("PULL_FAIL") === "1") fail(`pull ${img} failed`);
 				process.stdout.write(`pulled ${img}\n`);

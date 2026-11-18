@@ -127,7 +127,9 @@ packages/coding-agent/src/polar/
 │   │   │   └── k8s.ts               # K8sDriver & K8sHotSandbox (`kubectl` Pod)
 │   │   ├── workspace.ts             # Layer 3: Readiness check, image lookup/pull/build UX, orphan GC, /work volume setup
 │   │   ├── runner.ts                # Layer 4: Lazy hot VM lifecycle, `spawnCall` supervision, OOM delta & work_limit check, scrub
-│   │   └── reply.ts                 # Layer 5: Sandbox reply formatting (with OOM, work_limit, inspection, and cleanup notices)
+│   │   ├── reply.ts                 # Layer 5: Sandbox reply formatting (with OOM, work_limit, inspection, and cleanup notices)
+│   │   ├── progress.ts              # CLI pull progress parser (`container` and `docker` output)
+│   │   └── indicator.ts             # TUI single-line progress widget for image pull and build
 │   └── test/
 │
 └── test/                            # Cross-extension architectural tests
