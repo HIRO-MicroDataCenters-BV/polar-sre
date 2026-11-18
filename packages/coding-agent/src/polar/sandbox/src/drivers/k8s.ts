@@ -817,20 +817,22 @@ export class K8sDriver implements SandboxDriver {
 		return undefined;
 	}
 
-	async deleteWorkVolume(_name: string, ownerSessionId: string, deadlineAt: number): Promise<void> {
+	async deleteWorkVolumes(volumes: OwnedResource[], deadlineAt: number): Promise<void> {
 		if (remainingMs(deadlineAt) === 0 || this.runtime.cliStopped) return;
-		if (!VALID_K8S_SESSION_ID.test(ownerSessionId)) return;
-		const podName = `polar-work-rm-${k8sPodName(ownerSessionId)}-${randomBytes(4).toString("hex")}`;
+		const sessionIds = volumes.map((v) => v.sessionId).filter((id) => VALID_K8S_SESSION_ID.test(id));
+		if (sessionIds.length === 0) return;
+		const session = this.runtime.handle.paths;
+		const podName = `polar-work-rm-${k8sPodName(session.sessionId)}-${randomBytes(4).toString("hex")}`;
 		this.runtime.owned.add(podName);
 		const manifest = this.helperPodManifest(
 			podName,
-			this.runtime.handle.paths,
+			session,
 			[
 				"bash",
 				"-c",
-				'target="/work-root/$1"; [ ! -e "$target" ] && exit 0; chmod -R u+rwX "$target" 2>/dev/null || true; rm -rf -- "$target"',
+				'for s in "$@"; do target="/work-root/$s"; [ ! -e "$target" ] && continue; rm -rf -- "$target" 2>/dev/null; if [ -e "$target" ]; then chmod -R u+rwX "$target" 2>/dev/null || true; rm -rf -- "$target"; fi; done',
 				"polar-work-rm",
-				ownerSessionId,
+				...sessionIds,
 			],
 			{ mountWorkRootWritable: true },
 		);

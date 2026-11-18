@@ -171,10 +171,14 @@ export async function recoverLeftovers(runtime: SandboxRuntime, warn: Warn): Pro
 async function removeVolumesOfGoneSessions(runtime: SandboxRuntime, root: string, deadlineAt: number): Promise<void> {
 	const own = runtime.handle.paths.sessionId;
 	const volumes = await runtime.driver.listWorkVolumes(root, deadlineAt);
+	const gone: OwnedResource[] = [];
 	for (const volume of volumes) {
 		const owner = volume.sessionId;
 		if (owner === own || !(await directoryMissing(root, owner))) continue;
-		await runtime.driver.deleteWorkVolume(volume.name, owner, deadlineAt);
+		gone.push(volume);
+	}
+	if (gone.length > 0) {
+		await runtime.driver.deleteWorkVolumes(gone, deadlineAt);
 	}
 }
 

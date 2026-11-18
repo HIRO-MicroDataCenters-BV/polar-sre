@@ -168,7 +168,7 @@ export interface SandboxDriver {
 
 	listWorkVolumes(root: string, deadlineAt: number): Promise<OwnedResource[]>;
 	ensureWorkVolume(session: SessionPaths, deadlineAt: number): Promise<VolumeFailure | undefined>;
-	deleteWorkVolume(name: string, ownerSessionId: string, deadlineAt: number): Promise<void>;
+	deleteWorkVolumes(volumes: OwnedResource[], deadlineAt: number): Promise<void>;
 
 	startSandbox(
 		name: string,

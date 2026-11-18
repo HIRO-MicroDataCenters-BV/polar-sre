@@ -69,6 +69,7 @@ async function timed<T>(step: string, work: () => Promise<T>): Promise<T> {
 async function startedRuntime(sessionHandle: SessionHandle) {
 	const started = createRuntime(IMAGE, process.env, sessionHandle, {
 		ociEngine: TEST_OCI_ENGINE,
+		ociRuntime: process.env.SANDBOX_TEST_OCI_RUNTIME,
 	});
 	started.limits = { ...limits };
 	const readiness = await timed(`start ${sessionHandle.paths.sessionId}`, () =>
@@ -200,9 +201,8 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 	afterAll(async () => {
 		if (runtime !== undefined) {
 			await shutdownRuntime(runtime, "reload", warn);
-			await runtime.driver.deleteWorkVolume(
-				workVolumeName(session.sessionId),
-				session.sessionId,
+			await runtime.driver.deleteWorkVolumes(
+				[{ name: workVolumeName(session.sessionId), sessionId: session.sessionId }],
 				Date.now() + 30_000,
 			);
 		}
@@ -263,7 +263,7 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 		expect(readOnly.result.status).toBe("failed");
 		expect(readOnly.reply.text).toContain("Read-only file system");
 		const net = await call(
-			"import os, socket\nprint('lo' in os.listdir('/sys/class/net'))\ntry:\n    socket.create_connection(('1.1.1.1', 53), 3)\n    print('connected')\nexcept OSError as error:\n    print('refused:', error.errno)",
+			"import os, socket\nprint('lo' in [name for _, name in socket.if_nameindex()])\ntry:\n    socket.create_connection(('1.1.1.1', 53), 3)\n    print('connected')\nexcept OSError as error:\n    print('refused:', error.errno)",
 		);
 		expect(net.reply.text).toBe("True\nrefused: 101\n");
 		const stdin = await call('cat\necho AFTER\nread -r line; echo "[$line]"\nhead -c 10; echo END', "bash");
@@ -319,8 +319,13 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 	it("detects OOM by delta so an OOM in call N never marks call N+1 as OOM", async () => {
 		const alloc = "b = [bytearray(16 * 2**20) for _ in range(128)]";
 		const caught = await call(`{ python3 -c "${alloc}"; } 2>/dev/null || echo caught`, "bash");
-		expect(caught.result.status).toBe("ok");
-		expect(caught.reply.text).toBe("caught\n");
+		if (runtime.driver.name === "oci" && (runtime.driver as OciDriver).runOptions.gvisor) {
+			expect(caught.result.status).toBe("out_of_memory");
+			expect(caught.result.oomEvidence).toMatch(/OOMKilled/);
+		} else {
+			expect(caught.result.status).toBe("ok");
+			expect(caught.reply.text).toBe("caught\n");
+		}
 
 		const killedAfterSubOom = await call("kill -9 $$", "bash");
 		expect(killedAfterSubOom.result.status).toBe("failed");
@@ -371,7 +376,7 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 		if (runtime.driver.name === "apple-container") {
 			expect(bootAfter).not.toBe(bootBefore);
 		} else {
-			expect(nsAfter).not.toBe(nsBefore);
+			expect([nsAfter, bootAfter]).not.toEqual([nsBefore, bootBefore]);
 		}
 
 		const controller = new AbortController();
@@ -562,7 +567,10 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 			expect(parsedVol?.[0].labels).toMatchObject({ "polar-root": "/elsewhere" });
 			expect(await containersOf(foreignHandle.paths.sessionId)).toEqual([]);
 		} finally {
-			await runtime.driver.deleteWorkVolume(volume, foreignHandle.paths.sessionId, Date.now() + 30_000);
+			await runtime.driver.deleteWorkVolumes(
+				[{ name: volume, sessionId: foreignHandle.paths.sessionId }],
+				Date.now() + 30_000,
+			);
 			await foreignHandle.release();
 		}
 	}, 120_000);
@@ -598,7 +606,10 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 			expect(closing.state).toBe("closed");
 			expect(await exists(join(paths.outputDirectory, "lock"))).toBe(false);
 		} finally {
-			await runtime.driver.deleteWorkVolume(workVolumeName(paths.sessionId), paths.sessionId, Date.now() + 30_000);
+			await runtime.driver.deleteWorkVolumes(
+				[{ name: workVolumeName(paths.sessionId), sessionId: paths.sessionId }],
+				Date.now() + 30_000,
+			);
 			await ownHandle.release();
 		}
 	}, 120_000);

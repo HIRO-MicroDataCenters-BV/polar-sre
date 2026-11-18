@@ -1,6 +1,6 @@
 import { spawnSync } from "child_process";
 import { createHash } from "crypto";
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { basename, join } from "path";
 import { fileURLToPath } from "url";
@@ -503,6 +503,7 @@ describe("K8sDriver pod specification, DNS-1123 naming, and GC", () => {
 		await state.addVolume("polar-work-ended", { "polar-session": "ended" });
 		await state.addVolume("polar-work-crashed-self", { "polar-session": "crashed-self" });
 		await state.addVolume("polar-work-gone", { "polar-session": "gone" });
+		await state.addVolume("polar-work-gone-locked", { "polar-session": "gone-locked" });
 
 		const runtime = startingK8sRuntime(state, handle, saDir);
 		expect(await startRuntime(runtime, warn)).toEqual({ ready: true });
@@ -518,7 +519,7 @@ describe("K8sDriver pod specification, DNS-1123 naming, and GC", () => {
 		expect(calls.some((call) => call.includes("logs"))).toBe(false);
 
 		// Verify helper pod manifests (polar-work-ls, polar-work-rm, polar-netprobe):
-		// polar-sandbox label, runtimeClassName, writable work mount on rm pod, and host/port + /work mount on probe pod
+		// polar-sandbox label, runtimeClassName, single batched rm pod with rm -rf before chmod -R, and host/port + /work mount on probe pod
 		interface HelperManifest {
 			metadata: { name: string; labels: Record<string, string> };
 			spec: {
@@ -530,12 +531,15 @@ describe("K8sDriver pod specification, DNS-1123 naming, and GC", () => {
 			};
 		}
 		const manifests = (await state.manifests()) as unknown as HelperManifest[];
-		const lsPod = manifests.find((m) => m.metadata.name.startsWith("polar-work-ls-"));
-		const rmPod = manifests.find((m) => m.metadata.name.startsWith("polar-work-rm-"));
-		const netprobePod = manifests.find((m) => m.metadata.name.startsWith("polar-netprobe-"));
-		expect(lsPod).toBeDefined();
-		expect(rmPod).toBeDefined();
-		expect(netprobePod).toBeDefined();
+		const lsPods = manifests.filter((m) => m.metadata.name.startsWith("polar-work-ls-"));
+		const rmPods = manifests.filter((m) => m.metadata.name.startsWith("polar-work-rm-"));
+		const netprobePods = manifests.filter((m) => m.metadata.name.startsWith("polar-netprobe-"));
+		expect(lsPods).toHaveLength(1);
+		expect(rmPods).toHaveLength(1);
+		expect(netprobePods).toHaveLength(1);
+		const [lsPod] = lsPods;
+		const [rmPod] = rmPods;
+		const [netprobePod] = netprobePods;
 		for (const helper of [lsPod, rmPod, netprobePod]) {
 			expect(helper?.metadata.labels["polar-sandbox"]).toBe("true");
 			expect(helper?.spec.runtimeClassName).toBe("gvisor");
@@ -551,7 +555,34 @@ describe("K8sDriver pod specification, DNS-1123 naming, and GC", () => {
 			mountPath: "/work-root",
 			subPath: "work",
 		});
-		expect(rmPod?.spec.containers[0].command.slice(3)).toEqual(["polar-work-rm", "gone"]);
+		const rmScript = rmPod?.spec.containers[0].command[2] ?? "";
+		expect(rmScript.indexOf("rm -rf")).toBeGreaterThan(0);
+		expect(rmScript.indexOf("rm -rf")).toBeLessThan(rmScript.indexOf("chmod -R"));
+		expect(rmPod?.spec.containers[0].command[3]).toBe("polar-work-rm");
+		expect(rmPod?.spec.containers[0].command.slice(4).sort()).toEqual(["gone", "gone-locked"]);
+
+		// Execute the exact polar-work-rm script on a real directory tree with normal files and a 000 subdirectory
+		const workRoot = await mkdtemp(join(tmpdir(), "sandbox-k8s-work-rm-"));
+		try {
+			await mkdir(join(workRoot, "gone", "sub"), { recursive: true });
+			await writeFile(join(workRoot, "gone", "sub", "a.txt"), "normal\n");
+			await mkdir(join(workRoot, "gone-locked", "locked"), { recursive: true });
+			await writeFile(join(workRoot, "gone-locked", "locked", "secret.txt"), "locked\n");
+			await chmod(join(workRoot, "gone-locked", "locked"), 0o000);
+			await mkdir(join(workRoot, "live"), { recursive: true });
+			await writeFile(join(workRoot, "live", "keep.txt"), "keep\n");
+
+			const localScript = rmScript.replaceAll("/work-root", workRoot);
+			const ran = spawnSync("bash", ["-c", localScript, "polar-work-rm", "gone", "gone-locked", "missing"], {
+				encoding: "utf8",
+			});
+			expect(ran.status).toBe(0);
+			expect(await readdir(workRoot)).toEqual(["live"]);
+		} finally {
+			await chmod(join(workRoot, "gone-locked", "locked"), 0o700).catch(() => undefined);
+			await rm(workRoot, { recursive: true, force: true });
+		}
+
 		expect(netprobePod?.spec.containers[0].volumeMounts).toContainEqual({
 			name: "shared",
 			mountPath: "/work",

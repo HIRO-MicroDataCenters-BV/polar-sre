@@ -61,6 +61,7 @@ export interface OciRunOptions {
 	guestUser: string;
 	cpuDelegated: boolean;
 	ociRuntime?: string;
+	gvisor?: boolean;
 }
 
 export interface OciDriverOptions {
@@ -211,9 +212,10 @@ export function ociSandboxArguments(
 	if (options.cpuDelegated) {
 		args.push("--cpus", String(limits.cpus));
 	}
+	if (options.gvisor !== true) {
+		args.push("--pids-limit", String(limits.processMax));
+	}
 	args.push(
-		"--pids-limit",
-		String(limits.processMax),
 		"--volume",
 		`${session.outputDirectory}:${DATA_PATH}:ro`,
 		"--volume",
@@ -241,6 +243,7 @@ export function ociExecArguments(
 	language: SandboxLanguage,
 	guestUser: string,
 	workMaxBytes: number,
+	processMax?: number,
 ): string[] {
 	return [
 		"exec",
@@ -256,7 +259,7 @@ export function ociExecArguments(
 		name,
 		"bash",
 		"-c",
-		launcher(language, { workMaxBytes }),
+		launcher(language, { workMaxBytes, processMax }),
 	];
 }
 
@@ -284,12 +287,17 @@ function hostLinuxArch(): "arm64" | "amd64" {
 	return process.arch === "x64" ? "amd64" : "arm64";
 }
 
+function isRunsc(value: unknown): boolean {
+	return typeof value === "string" && (value === "runsc" || value.endsWith("/runsc"));
+}
+
 export class OciHotSandbox implements HotSandbox {
 	readonly name: string;
 	private readonly runtime: SandboxDriverContext;
 	private readonly guestUser: string;
 	private readonly keepalive: RunProcess;
 	private readonly keepaliveClosed: Promise<number | null>;
+	private readonly gvisor: boolean;
 	private keepaliveExited = false;
 	private oomBaseline = 0;
 	private tainted = false;
@@ -302,11 +310,13 @@ export class OciHotSandbox implements HotSandbox {
 		guestUser: string,
 		keepalive: RunProcess,
 		keepaliveClosed: Promise<number | null>,
+		gvisor = false,
 	) {
 		this.name = name;
 		this.runtime = runtime;
 		this.guestUser = guestUser;
 		this.keepalive = keepalive;
+		this.gvisor = gvisor;
 		this.keepaliveClosed = keepaliveClosed.then((code) => {
 			this.keepaliveExited = true;
 			return code;
@@ -343,7 +353,13 @@ export class OciHotSandbox implements HotSandbox {
 		if (this.destroyed || this.keepaliveExited || this.keepalive.exitCode !== null) {
 			return { gone: "sandbox is not running" };
 		}
-		const args = ociExecArguments(this.name, language, this.guestUser, this.runtime.limits.workMaxBytes);
+		const args = ociExecArguments(
+			this.name,
+			language,
+			this.guestUser,
+			this.runtime.limits.workMaxBytes,
+			this.gvisor ? this.runtime.limits.processMax : undefined,
+		);
 		const child = spawn(this.runtime.containerCommand, args, {
 			cwd: tmpdir(),
 			env: this.runtime.environment,
@@ -447,6 +463,7 @@ export class OciDriver implements SandboxDriver {
 	private rootless: boolean;
 	private cpuDelegated = true;
 	private detectedRuntime: string;
+	private gvisor: boolean;
 
 	constructor(runtime: SandboxDriverContext, options: OciDriverOptions = {}) {
 		this.runtime = runtime;
@@ -457,6 +474,7 @@ export class OciDriver implements SandboxDriver {
 		this.engine = this.engineChoice === "docker" ? "docker" : "podman";
 		this.rootless = this.engine === "podman";
 		this.detectedRuntime = this.ociRuntime ?? (this.engine === "podman" ? "crun" : "runc");
+		this.gvisor = isRunsc(this.ociRuntime);
 		this.customCommand =
 			runtime.containerCommand !== "podman" &&
 			runtime.containerCommand !== "docker" &&
@@ -467,7 +485,7 @@ export class OciDriver implements SandboxDriver {
 
 	get boundaryDescription(): string {
 		const rt = this.ociRuntime ?? this.detectedRuntime;
-		const isolated = rt === "krun" || rt === "runsc" || rt === "kata";
+		const isolated = this.gvisor || isRunsc(rt) || rt === "krun" || rt === "kata";
 		return isolated ? `oci (${this.engine}/${rt})` : `oci (${this.engine}/${rt}, shared kernel)`;
 	}
 
@@ -476,11 +494,13 @@ export class OciDriver implements SandboxDriver {
 	}
 
 	get runOptions(): OciRunOptions {
+		const rt = this.ociRuntime ?? this.detectedRuntime;
 		return {
 			rootless: this.rootless,
 			guestUser: this.guestUser,
 			cpuDelegated: this.cpuDelegated,
 			ociRuntime: this.ociRuntime,
+			gvisor: this.gvisor || isRunsc(rt),
 		};
 	}
 
@@ -619,9 +639,11 @@ export class OciDriver implements SandboxDriver {
 		return failure;
 	}
 
-	async deleteWorkVolume(name: string, _ownerSessionId: string, deadlineAt: number): Promise<void> {
-		if (remainingMs(deadlineAt) === 0) return;
-		await containerCommand(this.runtime, ["volume", "rm", name], remainingMs(deadlineAt));
+	async deleteWorkVolumes(volumes: OwnedResource[], deadlineAt: number): Promise<void> {
+		for (const volume of volumes) {
+			if (remainingMs(deadlineAt) === 0) return;
+			await containerCommand(this.runtime, ["volume", "rm", volume.name], remainingMs(deadlineAt));
+		}
 	}
 
 	async startSandbox(
@@ -688,7 +710,16 @@ export class OciDriver implements SandboxDriver {
 			child.once("close", onClose);
 		});
 		if (startup.ready) {
-			return { started: new OciHotSandbox(name, this.runtime, this.guestUser, child, keepaliveClosed) };
+			return {
+				started: new OciHotSandbox(
+					name,
+					this.runtime,
+					this.guestUser,
+					child,
+					keepaliveClosed,
+					this.runOptions.gvisor,
+				),
+			};
 		}
 		child.stdin.end();
 		child.kill("SIGKILL");
@@ -724,10 +755,17 @@ export class OciDriver implements SandboxDriver {
 			if (this.ociRuntime !== undefined && isObject(parsed.Runtimes) && !(this.ociRuntime in parsed.Runtimes)) {
 				return { ready: false, reason: `OCI runtime ${this.ociRuntime} is not available in docker` };
 			}
+			const defaultRuntime =
+				typeof parsed.DefaultRuntime === "string" && parsed.DefaultRuntime !== "" ? parsed.DefaultRuntime : "runc";
+			const activeRuntime = this.ociRuntime ?? defaultRuntime;
+			const runtimeEntry =
+				isObject(parsed.Runtimes) && isObject(parsed.Runtimes[activeRuntime])
+					? parsed.Runtimes[activeRuntime]
+					: undefined;
 			this.rootless = false;
 			this.cpuDelegated = true;
-			this.detectedRuntime =
-				typeof parsed.DefaultRuntime === "string" && parsed.DefaultRuntime !== "" ? parsed.DefaultRuntime : "runc";
+			this.detectedRuntime = defaultRuntime;
+			this.gvisor = isRunsc(activeRuntime) || isRunsc(runtimeEntry?.path);
 			return { ready: true };
 		}
 
@@ -746,8 +784,11 @@ export class OciDriver implements SandboxDriver {
 		this.rootless = isRootless;
 		this.cpuDelegated = controllers === undefined || controllers.includes("cpu");
 		const ociRuntimeObj = isObject(host.ociRuntime) ? host.ociRuntime : {};
-		this.detectedRuntime =
+		const defaultRuntime =
 			typeof ociRuntimeObj.name === "string" && ociRuntimeObj.name !== "" ? ociRuntimeObj.name : "crun";
+		const activeRuntime = this.ociRuntime ?? defaultRuntime;
+		this.detectedRuntime = defaultRuntime;
+		this.gvisor = isRunsc(activeRuntime) || (this.ociRuntime === undefined && isRunsc(ociRuntimeObj.path));
 		return { ready: true };
 	}
 

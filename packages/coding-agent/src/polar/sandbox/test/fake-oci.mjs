@@ -163,13 +163,14 @@ function handleInfo() {
 	const cpuDelegated = knob("CPU_DELEGATED", "1") !== "0";
 	const controllers = cpuDelegated ? ["cpu", "memory", "pids"] : ["memory", "pids"];
 	const ociRuntime = knob("OCI_RUNTIME", "crun");
+	const ociRuntimePath = knob("OCI_RUNTIME_PATH", `/usr/bin/${ociRuntime}`);
 	const version = knob("PODMAN_VERSION", "5.4.0");
 	process.stdout.write(
 		`${JSON.stringify({
 			host: {
 				security: { rootless },
 				cgroupControllers: controllers,
-				ociRuntime: { name: ociRuntime },
+				ociRuntime: { name: ociRuntime, path: ociRuntimePath },
 			},
 			version: { Version: version },
 		})}\n`,
@@ -319,6 +320,17 @@ async function execCommand(args) {
 				exitCode = 137;
 				break;
 			}
+			case "oom_gvisor_128": {
+				if (existsSync(containerPath(id))) {
+					const current = readJson(containerPath(id));
+					current.state = "exited";
+					current.oomKilled = true;
+					writeContainer(current);
+					signalPid(current.pid, "SIGKILL");
+				}
+				exitCode = 128;
+				break;
+			}
 			case "oom_survived": {
 				if (existsSync(containerPath(id))) {
 					const current = readJson(containerPath(id));
@@ -333,6 +345,9 @@ async function execCommand(args) {
 				break;
 			case "exit137":
 				exitCode = 137;
+				break;
+			case "exit128":
+				exitCode = 128;
 				break;
 			case "vanish": {
 				if (existsSync(containerPath(id))) {

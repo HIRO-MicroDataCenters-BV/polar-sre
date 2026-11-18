@@ -197,7 +197,7 @@ export class UnsupportedSandboxDriver implements SandboxDriver {
 		return { reason: this.reason };
 	}
 
-	async deleteWorkVolume(): Promise<void> {}
+	async deleteWorkVolumes(): Promise<void> {}
 
 	async startSandbox(): Promise<SandboxStartOutcome> {
 		return { failed: this.reason };

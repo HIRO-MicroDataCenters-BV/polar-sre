@@ -320,12 +320,16 @@ async function handleCreate(args, namespace) {
 
 	// Check if this is the work cleanup pod (polar-work-rm)
 	if (command[3] === "polar-work-rm") {
-		const targetSessionId = command[4];
+		const targetSessionIds = command.slice(4);
 		const workRootMount = (container.volumeMounts ?? []).find(
 			(m) => m.mountPath === "/work-root" && m.subPath === "work" && m.readOnly !== true,
 		);
-		if (targetSessionId && workRootMount) {
-			rmSync(volumePath(`polar-work-${targetSessionId}`), { force: true });
+		if (workRootMount) {
+			for (const targetSessionId of targetSessionIds) {
+				if (targetSessionId) {
+					rmSync(volumePath(`polar-work-${targetSessionId}`), { force: true });
+				}
+			}
 		}
 		writeContainer({
 			id,

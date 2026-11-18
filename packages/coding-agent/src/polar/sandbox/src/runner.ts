@@ -27,7 +27,7 @@ type Stop =
 
 const SHUTTING_DOWN = "run_code is shutting down; no program starts.";
 const SIGKILL_EXIT_CODE = 137;
-const K8S_OOM_EXIT_CODE = 128;
+const GVISOR_OOM_EXIT_CODE = 128;
 const NO_STDERR = Buffer.alloc(0);
 
 export function containerName(sessionId: string, outputName: string): string {
@@ -381,7 +381,7 @@ export class SandboxRun implements RunningCall {
 		}
 		if (
 			this.exitCode === SIGKILL_EXIT_CODE ||
-			(this.exitCode === K8S_OOM_EXIT_CODE && this.runtime.driver.name === "k8s")
+			(this.exitCode === GVISOR_OOM_EXIT_CODE && this.runtime.driver.name !== "apple-container")
 		) {
 			const oomEvidence = await this.hot.checkOom(deadlineAfter(this.runtime));
 			if (oomEvidence !== undefined) return { status: "out_of_memory", oomEvidence };

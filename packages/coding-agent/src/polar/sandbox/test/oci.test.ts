@@ -152,6 +152,34 @@ describe("OciDriver readiness & engine discovery", () => {
 		);
 		expect(await checkReadiness(runscRuntime)).toEqual({ ready: true });
 		expect(runscRuntime.driver.boundaryDescription).toBe("oci (docker/runsc)");
+		expect((runscRuntime.driver as OciDriver).runOptions.gvisor).toBe(true);
+
+		// 4. Custom Docker runtime name backed by /usr/local/bin/runsc in Runtimes map is detected as gVisor
+		const customAliasRuntime = startingOciRuntime(
+			state,
+			handle,
+			{
+				ENGINE: "docker",
+				DOCKER_RUNTIMES_JSON: '{"runc":{"path":"runc"},"gvisor-custom":{"path":"/usr/local/bin/runsc"}}',
+			},
+			{},
+			{ engine: "docker", ociRuntime: "gvisor-custom" },
+		);
+		expect(await checkReadiness(customAliasRuntime)).toEqual({ ready: true });
+		expect(customAliasRuntime.driver.boundaryDescription).toBe("oci (docker/gvisor-custom)");
+		expect((customAliasRuntime.driver as OciDriver).runOptions.gvisor).toBe(true);
+
+		// 5. Podman default runtime backed by /usr/bin/runsc path is detected as gVisor
+		const podmanAliasRuntime = startingOciRuntime(
+			state,
+			handle,
+			{ ENGINE: "podman", OCI_RUNTIME: "gvisor-podman", OCI_RUNTIME_PATH: "/usr/bin/runsc" },
+			{},
+			{ engine: "podman" },
+		);
+		expect(await checkReadiness(podmanAliasRuntime)).toEqual({ ready: true });
+		expect(podmanAliasRuntime.driver.boundaryDescription).toBe("oci (podman/gvisor-podman)");
+		expect((podmanAliasRuntime.driver as OciDriver).runOptions.gvisor).toBe(true);
 	});
 
 	it("refuses rootless Docker and rootless Podman < 4.3 with clear reasons", async () => {
@@ -327,6 +355,50 @@ describe("OciDriver arguments, volumes, and leftovers", () => {
 		} finally {
 			await dockerHandle.release();
 		}
+
+		// 4. gVisor (runsc or custom runtime name with /runsc path) omits --pids-limit in run and sets ulimit -u in exec
+		state = await fakeState();
+		const gvisorHandle = await acquireSession("gvisor", root, artifactsRoot());
+		try {
+			const gvisorRuntime = startingOciRuntime(
+				state,
+				gvisorHandle,
+				{
+					ENGINE: "docker",
+					DOCKER_RUNTIMES_JSON: '{"runc":{"path":"runc"},"gvisor":{"path":"/usr/bin/runsc"}}',
+				},
+				{},
+				{ engine: "docker", ociRuntime: "gvisor", hostUid: 1000, hostGid: 1000 },
+			);
+			expect(await startRuntime(gvisorRuntime, warn)).toEqual({ ready: true });
+			gvisorRuntime.state = "open";
+			const gvisorDriver = gvisorRuntime.driver as OciDriver;
+			expect(gvisorDriver.runOptions.gvisor).toBe(true);
+
+			const gvisorEcho = JSON.parse((await run("echo_argv", gvisorRuntime)).stdout) as {
+				argv: string[];
+				runArgv: string[];
+			};
+			expect(gvisorEcho.runArgv).not.toContain("--pids-limit");
+			expect(gvisorEcho.runArgv[gvisorEcho.runArgv.indexOf("--runtime") + 1]).toBe("gvisor");
+			const gvisorName = gvisorEcho.runArgv[gvisorEcho.runArgv.indexOf("--name") + 1];
+			expect(gvisorEcho.runArgv).toEqual(
+				ociSandboxArguments(gvisorRuntime, gvisorName, gvisorDriver.runOptions, gvisorHandle.paths),
+			);
+			expect(gvisorEcho.argv).toEqual(
+				ociExecArguments(
+					gvisorName,
+					"python",
+					"1000:1000",
+					gvisorRuntime.limits.workMaxBytes,
+					gvisorRuntime.limits.processMax,
+				),
+			);
+			expect(gvisorEcho.argv.at(-1)?.startsWith(`ulimit -u ${gvisorRuntime.limits.processMax}\n`)).toBe(true);
+			await shutdownRuntime(gvisorRuntime, "reload", warn);
+		} finally {
+			await gvisorHandle.release();
+		}
 	});
 
 	it("recovers leftovers via ps -a + inspect and cleans up volumes of gone sessions", async () => {
@@ -448,11 +520,30 @@ describe("OciHotSandbox execution, OOM, and work_limit", () => {
 		expect(runtime.activeSandbox.current).toBeUndefined();
 		expect(await state.containers()).toEqual([]);
 
-		// 5. Next call on fresh container is clean
+		// 5. Next call on fresh container is clean, and plain exit 128 without OOM is reported as failed: exit 128
 		const clean = await run("stdout:ok\nexit:0", runtime);
 		expect(clean).toMatchObject({ status: "ok", exitCode: 0, stdout: "ok\n" });
 		const calls = await state.calls();
 		expect(calls.at(-1)?.slice(-3)).toEqual(["bash", "-c", SCRUB_SCRIPT]);
+
+		const notOom128 = await run("stderr:custom 128\nexit128", runtime);
+		expect(notOom128).toMatchObject({
+			status: "failed",
+			exitCode: 128,
+			inspection: { state: "present" },
+		});
+		expect(notOom128.oomEvidence).toBeUndefined();
+
+		// 6. gVisor container dying from OOM with exit code 128 is reported as out_of_memory via State.OOMKilled
+		const gvisorOom128 = await run("stdout:before128\noom_gvisor_128", runtime);
+		expect(gvisorOom128).toMatchObject({
+			status: "out_of_memory",
+			exitCode: 128,
+			stdout: "before128\n",
+			oomEvidence: "container State.OOMKilled is true",
+		});
+		expect(runtime.activeSandbox.current).toBeUndefined();
+		expect(await state.containers()).toEqual([]);
 	});
 
 	it("reports work_limit from runner and reply when the launcher exits with 199", async () => {

@@ -419,9 +419,11 @@ export class AppleContainerDriver implements SandboxDriver {
 		return failure;
 	}
 
-	async deleteWorkVolume(name: string, _ownerSessionId: string, deadlineAt: number): Promise<void> {
-		if (remainingMs(deadlineAt) === 0) return;
-		await containerCommand(this.runtime, ["volume", "delete", name], remainingMs(deadlineAt));
+	async deleteWorkVolumes(volumes: OwnedResource[], deadlineAt: number): Promise<void> {
+		for (const volume of volumes) {
+			if (remainingMs(deadlineAt) === 0) return;
+			await containerCommand(this.runtime, ["volume", "delete", volume.name], remainingMs(deadlineAt));
+		}
 	}
 
 	async startSandbox(
