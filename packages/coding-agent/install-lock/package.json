@@ -1,10 +1,10 @@
 {
 	"name": "@earendil-works/pi-coding-agent-install",
-	"version": "1.1.0",
+	"version": "0.1.0",
 	"private": true,
 	"description": "Lockfile root used by the Pi installer and updater.",
 	"dependencies": {
-		"polar-sre": "1.1.0"
+		"polar-sre": "0.1.0"
 	},
 	"overrides": {
 		"protobufjs": "7.6.6"

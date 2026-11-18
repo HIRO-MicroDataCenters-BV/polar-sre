@@ -12,6 +12,15 @@ Polar separates telemetry collection from file inspection and code execution acr
 
 General-purpose host mutation and shell tools (`bash`, `powershell`, `edit`, `write`, `grep`, `find`, `ls`) are disabled by default.
 
+## Installing from npm
+
+```bash
+npm install -g polar-sre
+polar
+```
+
+The prerequisites below apply to the npm package as well.
+
 ## Building and Running from Source
 
 ### Prerequisites

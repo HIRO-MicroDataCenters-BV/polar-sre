@@ -4,7 +4,14 @@
 
 ## Quick Start
 
-Build from the monorepo root (`Node.js >= 22.19.0`):
+Install from npm (`Node.js >= 22.19.0`):
+
+```bash
+npm install -g polar-sre
+polar --help
+```
+
+Or build from the monorepo root:
 
 ```bash
 npm ci --ignore-scripts
