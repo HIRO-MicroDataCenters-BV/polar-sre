@@ -47,7 +47,8 @@ const LIMITS: SandboxLimits = {
 };
 
 export const DEFAULT_IMAGE = "polar-sandbox:0.2";
-export const REGISTRY_IMAGE: string | undefined = undefined;
+export const REGISTRY_IMAGE: string | undefined =
+	"ghcr.io/hiro-microdatacenters-bv/polar-sandbox@sha256:85b9ef4c8d91fdb57a8d531a62a1b67621c0c1a38cea28257b9ce986d1869ff1";
 const PYTHON_KIT =
 	"duckdb, polars, pandas, numpy, orjson, ijson, pyyaml, jmespath, python-dateutil, ciso8601, regex, tabulate, drain3";
 const CLI_KIT = "bash, coreutils, gawk, ripgrep, jq, yq, duckdb, miller";

@@ -67,5 +67,8 @@ RUN { \
 	echo "yq: MIT. duckdb: MIT."; \
 	} > /README.md
 
+LABEL org.opencontainers.image.source="https://github.com/HIRO-MicroDataCenters-BV/polar-sre" \
+	org.opencontainers.image.description="Guest image of the Polar run_code sandbox"
+
 USER 1000:1000
 WORKDIR /work

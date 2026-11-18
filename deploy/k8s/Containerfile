@@ -55,6 +55,9 @@ RUN ln -s /app/packages/coding-agent/dist/bundle/cli.js /usr/local/bin/polar \
 	&& mkdir -p /artifacts /sessions /home/polar \
 	&& chown -R 1000:1000 /artifacts /sessions /home/polar
 
+LABEL org.opencontainers.image.source="https://github.com/HIRO-MicroDataCenters-BV/polar-sre" \
+	org.opencontainers.image.description="Polar read-only SRE and incident investigation agent (--mode rpc)"
+
 USER 1000:1000
 WORKDIR /home/polar
 ENTRYPOINT ["polar"]

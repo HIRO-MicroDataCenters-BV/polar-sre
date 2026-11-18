@@ -28,7 +28,7 @@ spec:
           type: RuntimeDefault
       initContainers:
         - name: warm-sandbox-image
-          image: polar-sandbox:0.2
+          image: ghcr.io/hiro-microdatacenters-bv/polar-sandbox@sha256:85b9ef4c8d91fdb57a8d531a62a1b67621c0c1a38cea28257b9ce986d1869ff1
           command: ["true"]
           resources:
             requests:
@@ -49,7 +49,7 @@ spec:
               type: RuntimeDefault
       containers:
         - name: polar
-          image: polar:0.2
+          image: ghcr.io/hiro-microdatacenters-bv/polar@sha256:730a7724495e99ea71a15233054358a47c121680af50d19f65c6423294b28747
           command: ["polar"]
           args: ["--mode", "rpc", "--session-dir", "/sessions"]
           stdin: true
@@ -71,7 +71,7 @@ spec:
             - name: POLAR_SANDBOX_K8S_RUNTIME_CLASS
               value: gvisor
             - name: POLAR_SANDBOX_K8S_IMAGE
-              value: polar-sandbox:0.2
+              value: ghcr.io/hiro-microdatacenters-bv/polar-sandbox@sha256:85b9ef4c8d91fdb57a8d531a62a1b67621c0c1a38cea28257b9ce986d1869ff1
             - name: POLAR_SANDBOX_K8S_POD_NAME
               valueFrom:
                 fieldRef:

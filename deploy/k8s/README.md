@@ -44,7 +44,7 @@ If `builtin:k8s` inside `polar` should inspect external or local Kubernetes clus
 | `POLAR_SESSION_TTL_MS` | `86400000` | Retention window (`24h`) before ended session artifact directories are garbage-collected |
 | `POLAR_SANDBOX_K8S_PVC` | `polar-shared` | Selects `K8sDriver` when `--sandbox-driver=auto` and names the shared PVC |
 | `POLAR_SANDBOX_K8S_RUNTIME_CLASS` | `gvisor` | `runtimeClassName` set on sandbox and helper Pods |
-| `POLAR_SANDBOX_K8S_IMAGE` | `polar-sandbox:0.2` (pin to `@sha256` in production) | Guest image for sandbox and helper Pods; keep identical to `initContainers[0].image` (`warm-sandbox-image`) |
+| `POLAR_SANDBOX_K8S_IMAGE` | `ghcr.io/hiro-microdatacenters-bv/polar-sandbox@sha256:<SANDBOX_SHA>` | Guest image for sandbox and helper Pods; keep identical to `initContainers[0].image` (`warm-sandbox-image`) |
 | `POLAR_SANDBOX_K8S_POD_NAME` | `metadata.name` (Downward API) | Verified via `kubectl get pod` at startup; used in sandbox `ownerReferences` |
 | `POLAR_SANDBOX_K8S_POD_UID` | `metadata.uid` (Downward API) | Verified against the live Pod UID at startup; used in sandbox `ownerReferences` |
 | `POLAR_SANDBOX_K8S_NODE_NAME` | `spec.nodeName` (Downward API) | Node hostname used in `nodeSelector` so sandbox Pods co-locate with the `ReadWriteOnce` PVC |
@@ -52,6 +52,8 @@ If `builtin:k8s` inside `polar` should inspect external or local Kubernetes clus
 ## Building Multi-Arch Images and Pinning `@sha256`
 
 Build and publish `polar-sandbox` **before** `polar`, because `deploy/k8s/Containerfile` compiles the repository (including `REGISTRY_IMAGE` in `packages/coding-agent/src/polar/sandbox/index.ts`). Always record the multi-arch manifest-list digest (`@sha256:...`), not a single-architecture digest.
+
+The default `docker` build driver rejects multi-platform builds unless the containerd image store is enabled. Create a `docker-container` builder once: `docker buildx create --name polar-multi --driver docker-container --use`.
 
 1. **Build and push `polar-sandbox` (`linux/arm64`, `linux/amd64`):**
    ```bash

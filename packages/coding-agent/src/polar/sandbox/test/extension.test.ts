@@ -333,7 +333,10 @@ describe("sandbox extension", () => {
 		const built = loadExtension({}, { hasUI: true, selectChoice: BUILD_IMAGE_OPTION });
 		await built.startSession();
 		expect(built.selects).toEqual([
-			[`Sandbox image ${DEFAULT_IMAGE} is not installed`, [BUILD_IMAGE_OPTION, DISABLE_SANDBOX_OPTION]],
+			[
+				`Sandbox image ${DEFAULT_IMAGE} is not installed`,
+				[DOWNLOAD_IMAGE_OPTION, BUILD_IMAGE_OPTION, DISABLE_SANDBOX_OPTION],
+			],
 		]);
 		expect(built.tools.map((tool) => tool.name)).toEqual(["run_code"]);
 		await built.shutdown();
