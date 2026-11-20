@@ -655,10 +655,6 @@ export class K8sDriver implements SandboxDriver {
 		for (const [key, value] of required) {
 			if (value === "") return { ready: false, reason: `${key} is not set` };
 		}
-		const sessionId = this.runtime.handle.paths.sessionId;
-		if (!VALID_K8S_SESSION_ID.test(sessionId)) {
-			return { ready: false, reason: `invalid sessionId "${sessionId}" for k8s sandbox` };
-		}
 		const kc = await this.ensureKubeconfig();
 		if (!kc.ok) return { ready: false, reason: kc.reason };
 
@@ -734,9 +730,10 @@ export class K8sDriver implements SandboxDriver {
 		return `kubectl -n ${this.namespace} delete pod --wait=true ${names.join(" ")}`;
 	}
 
-	async listWorkVolumes(_root: string, deadlineAt: number): Promise<OwnedResource[]> {
+	async listWorkVolumes(session: SessionPaths, deadlineAt: number): Promise<OwnedResource[]> {
 		if (remainingMs(deadlineAt) === 0 || this.runtime.cliStopped) return [];
-		const session = this.runtime.handle.paths;
+		// The listing Pod carries the session id in its name and labels; ensureWorkVolume reports an invalid id.
+		if (!VALID_K8S_SESSION_ID.test(session.sessionId)) return [];
 		const podName = `polar-work-ls-${k8sPodName(session.sessionId)}-${randomBytes(4).toString("hex")}`;
 		this.runtime.owned.add(podName);
 		const manifest = this.helperPodManifest(podName, session, ["bash", "-c", KEEPALIVE_COMMAND], {
@@ -818,11 +815,10 @@ export class K8sDriver implements SandboxDriver {
 		return undefined;
 	}
 
-	async deleteWorkVolumes(volumes: OwnedResource[], deadlineAt: number): Promise<void> {
+	async deleteWorkVolumes(volumes: OwnedResource[], session: SessionPaths, deadlineAt: number): Promise<void> {
 		if (remainingMs(deadlineAt) === 0 || this.runtime.cliStopped) return;
 		const sessionIds = volumes.map((v) => v.sessionId).filter((id) => VALID_K8S_SESSION_ID.test(id));
 		if (sessionIds.length === 0) return;
-		const session = this.runtime.handle.paths;
 		const podName = `polar-work-rm-${k8sPodName(session.sessionId)}-${randomBytes(4).toString("hex")}`;
 		this.runtime.owned.add(podName);
 		const manifest = this.helperPodManifest(

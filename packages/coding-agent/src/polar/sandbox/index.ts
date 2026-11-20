@@ -1,9 +1,9 @@
 import { type Static, Type } from "typebox";
 import { type AgentToolResult, defineTool, type ExtensionAPI } from "../../core/extensions/types.ts";
-import { acquireSession, type SessionHandle } from "../shared/session.ts";
 import { describeBytes, READ_MAX_BYTES } from "../shared/store.ts";
 import { nulCharacterError } from "../shared/validation.ts";
 import { describeCleanupErrors } from "./src/cli.ts";
+import { SandboxController } from "./src/controller.ts";
 import {
 	AppleContainerDriver,
 	K8sDriver,
@@ -18,18 +18,17 @@ import { admitCall, shutdownRefusal } from "./src/runner.ts";
 import {
 	DATA_PATH,
 	type OciEngineChoice,
-	type RunningCall,
 	type SandboxDriver,
 	type SandboxDriverChoice,
 	type SandboxDriverContext,
 	type SandboxDriverName,
+	type SandboxHost,
 	type SandboxLimits,
 	type SandboxRequest,
 	type SandboxRuntime,
 	type ShowImageOperation,
 	type ToolReply,
 } from "./src/types.ts";
-import { shutdownRuntime, startRuntime } from "./src/workspace.ts";
 
 const LIMITS: SandboxLimits = {
 	timeoutMs: 300_000,
@@ -141,12 +140,11 @@ function createDriver(
 	return new K8sDriver(context, options.k8sOptions);
 }
 
-export function createRuntime(
+export function createHost(
 	image: string,
 	environment: NodeJS.ProcessEnv,
-	handle: SessionHandle,
 	options: RuntimeImageOptions = {},
-): SandboxRuntime {
+): SandboxHost {
 	const env: NodeJS.ProcessEnv = { ...environment };
 	if (options.k8sPvc !== undefined && options.k8sPvc !== "") {
 		env.POLAR_SANDBOX_K8S_PVC = options.k8sPvc;
@@ -158,19 +156,12 @@ export function createRuntime(
 		customImage: options.customImage ?? image !== DEFAULT_IMAGE,
 		limits: LIMITS,
 		environment: env,
-		handle,
 		state: "unready",
 		owned: new Set(),
 		children: new Map(),
 		cliStopped: false,
 	};
-	const driver = createDriver(context, context.environment, options);
-	return Object.assign(context, {
-		inFlight: new Set<string>(),
-		running: new Set<RunningCall>(),
-		driver,
-		activeSandbox: {},
-	});
+	return Object.assign(context, { driver: createDriver(context, context.environment, options) });
 }
 
 function validate(params: RunCodeParams): string | undefined {
@@ -221,7 +212,7 @@ export function createRunCodeTool(runtime: SandboxRuntime) {
 }
 
 export default function sandboxExtension(pi: ExtensionAPI): void {
-	let current: SandboxRuntime | undefined;
+	let current: SandboxController | undefined;
 
 	pi.registerFlag("sandbox-driver", {
 		description: 'Sandbox driver: "auto", "apple-container", "oci", or "k8s" (default: auto)',
@@ -252,7 +243,6 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
-		const warn = (message: string) => ctx.ui.notify(message, "warning");
 		const flag = pi.getFlag("sandbox-image");
 		const image = typeof flag === "string" && flag !== "" ? flag : DEFAULT_IMAGE;
 		const customImage =
@@ -269,8 +259,7 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
 		const ociRuntime = typeof ociRuntimeFlag === "string" && ociRuntimeFlag !== "" ? ociRuntimeFlag : undefined;
 		const k8sPvcFlag = pi.getFlag("sandbox-k8s-pvc");
 		const k8sPvc = typeof k8sPvcFlag === "string" && k8sPvcFlag !== "" ? k8sPvcFlag : undefined;
-		const handle = await acquireSession(ctx.sessionManager.getSessionId(), ctx.cwd);
-		const runtime = createRuntime(image, process.env, handle, {
+		const host = createHost(image, process.env, {
 			registryImage,
 			customImage,
 			driver,
@@ -278,7 +267,8 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
 			ociRuntime,
 			k8sPvc,
 		});
-		current = runtime;
+		const controller = new SandboxController(host, (runtime) => pi.registerTool(createRunCodeTool(runtime)));
+		current = controller;
 		const selectImage =
 			ctx.hasUI && typeof ctx.ui.select === "function"
 				? (title: string, options: string[]) => ctx.ui.select(title, options)
@@ -286,23 +276,13 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
 		// RPC mode sets hasUI=true for select dialogs, but component widgets are supported only in TUI mode.
 		const showOperation: ShowImageOperation | undefined =
 			ctx.mode === "tui" ? (kind) => showImageOperation(ctx.ui, kind) : undefined;
-		const readiness = await startRuntime(runtime, warn, selectImage, showOperation);
-		if (runtime.state !== "unready") return;
-		if (!readiness.ready) {
-			warn(readiness.message);
-			return;
-		}
-		runtime.state = "open";
-		if (runtime.driver.name === "oci" || runtime.driver.name === "k8s") {
-			ctx.ui.notify(`sandbox: ${runtime.driver.boundaryDescription}`, "info");
-		}
-		pi.registerTool(createRunCodeTool(runtime));
+		await controller.start(ctx, selectImage, showOperation);
 	});
 
 	pi.on("session_shutdown", async (event, ctx) => {
 		if (current === undefined) return;
-		const runtime = current;
+		const controller = current;
 		current = undefined;
-		await shutdownRuntime(runtime, event.reason, (message) => ctx.ui.notify(message, "warning"));
+		await controller.shutdown(event.reason, ctx);
 	});
 }

@@ -9,6 +9,7 @@ import { containerCommand } from "../src/cli.ts";
 import { admitCall } from "../src/runner.ts";
 import type { SandboxRuntime, SessionPaths } from "../src/types.ts";
 import {
+	activateRuntime,
 	BUILD_IMAGE_OPTION,
 	checkReadiness,
 	closeAdmission,
@@ -16,10 +17,10 @@ import {
 	DOWNLOAD_IMAGE_OPTION,
 	ensureWorkVolume,
 	recoverLeftovers,
+	shutdownHost,
 	shutdownRuntime,
-	startRuntime,
 } from "../src/workspace.ts";
-import { type FakeState, fakeRuntime, fakeState, startingRuntime, until } from "./fixtures.ts";
+import { type FakeState, fakeHost, fakeRuntime, fakeState, processExists, startingRuntime, until } from "./fixtures.ts";
 
 let root: string;
 let handle: SessionHandle;
@@ -44,6 +45,10 @@ afterEach(async () => {
 
 function artifactsRoot(): string {
 	return join(root, "artifacts");
+}
+
+function ownHandle(sessionId = "current"): Promise<SessionHandle> {
+	return acquireSession(sessionId, root, artifactsRoot());
 }
 
 function ownLabels(sessionId: string, rootPath = artifactsRoot()): Record<string, string> {
@@ -92,13 +97,13 @@ function runChildren(runtime: SandboxRuntime) {
 
 describe("start", () => {
 	it("offers run_code only with a running runtime and the image", async () => {
-		expect(await checkReadiness(fakeRuntime(state, handle))).toEqual({ ready: true });
-		expect(await checkReadiness(fakeRuntime(state, handle, { STATUS_EXIT: "1" }))).toEqual({
+		expect(await checkReadiness(fakeHost(state))).toEqual({ ready: true, image: "polar-sandbox:test" });
+		expect(await checkReadiness(fakeHost(state, { STATUS_EXIT: "1" }))).toEqual({
 			ready: false,
 			message: "sandbox is off: container system status failed: exit 1",
 			leftovers: [],
 		});
-		expect(await checkReadiness(fakeRuntime(state, handle, { IMAGE_MISSING: "1" }))).toEqual({
+		expect(await checkReadiness(fakeHost(state, { IMAGE_MISSING: "1" }))).toEqual({
 			ready: false,
 			message:
 				"sandbox is off: image polar-sandbox:test is not installed (container image inspect polar-sandbox:test failed: Error: image polar-sandbox:test not found)",
@@ -111,27 +116,25 @@ describe("start", () => {
 		const local = "polar-sandbox:0.2";
 
 		// 1. Explicit custom image is checked alone even if registryImage is set
-		const custom = startingRuntime(state, handle, { IMAGE_PRESENT: "custom:1" });
+		const custom = fakeHost(state, { IMAGE_PRESENT: "custom:1" });
 		custom.image = "custom:1";
 		custom.registryImage = registry;
 		custom.customImage = true;
-		expect(await checkReadiness(custom)).toEqual({ ready: true });
-		expect(custom.image).toBe("custom:1");
+		expect(await checkReadiness(custom)).toEqual({ ready: true, image: "custom:1" });
 		expect(await callsOf("image")).toEqual([["image", "inspect", "custom:1"]]);
 
 		// 2. Default image with registryImage present in cache uses registryImage without checking local tag
 		state = await fakeState();
-		const cachedRegistry = startingRuntime(state, handle, { IMAGE_PRESENT: registry });
+		const cachedRegistry = fakeHost(state, { IMAGE_PRESENT: registry });
 		cachedRegistry.image = local;
 		cachedRegistry.registryImage = registry;
 		cachedRegistry.customImage = false;
-		expect(await checkReadiness(cachedRegistry)).toEqual({ ready: true });
-		expect(cachedRegistry.image).toBe(registry);
+		expect(await checkReadiness(cachedRegistry)).toEqual({ ready: true, image: registry });
 		expect(await callsOf("image")).toEqual([["image", "inspect", registry]]);
 
 		// 3. Default image with registryImage absent falls back to local tag in cache without prompting
 		state = await fakeState();
-		const cachedLocal = startingRuntime(state, handle, { IMAGE_PRESENT: local });
+		const cachedLocal = fakeHost(state, { IMAGE_PRESENT: local });
 		cachedLocal.image = local;
 		cachedLocal.registryImage = registry;
 		cachedLocal.customImage = false;
@@ -141,9 +144,8 @@ describe("start", () => {
 				prompted = true;
 				return undefined;
 			}),
-		).toEqual({ ready: true });
+		).toEqual({ ready: true, image: local });
 		expect(prompted).toBe(false);
-		expect(cachedLocal.image).toBe(local);
 		expect(await callsOf("image")).toEqual([
 			["image", "inspect", registry],
 			["image", "inspect", local],
@@ -151,16 +153,16 @@ describe("start", () => {
 
 		// 4. Missing image with UI and no registryImage offers Build and Disable (no Download)
 		state = await fakeState();
-		const buildRuntime = startingRuntime(state, handle, { IMAGE_MISSING: "1" });
-		buildRuntime.image = local;
-		buildRuntime.customImage = false;
+		const buildHost = fakeHost(state, { IMAGE_MISSING: "1" });
+		buildHost.image = local;
+		buildHost.customImage = false;
 		let seenOptions: string[] = [];
 		expect(
-			await checkReadiness(buildRuntime, async (_title, options) => {
+			await checkReadiness(buildHost, async (_title, options) => {
 				seenOptions = options;
 				return BUILD_IMAGE_OPTION;
 			}),
-		).toEqual({ ready: true });
+		).toEqual({ ready: true, image: local });
 		expect(seenOptions).toEqual([BUILD_IMAGE_OPTION, DISABLE_SANDBOX_OPTION]);
 		const imageDir = getSandboxImageDir();
 		expect(await callsOf("build")).toEqual([
@@ -169,42 +171,42 @@ describe("start", () => {
 
 		// 5. Missing image with UI and registryImage offers Download, Build, and Disable
 		state = await fakeState();
-		const pullRuntime = startingRuntime(state, handle, { IMAGE_MISSING: "1" });
-		pullRuntime.image = local;
-		pullRuntime.registryImage = registry;
-		pullRuntime.customImage = false;
+		const pullHost = fakeHost(state, { IMAGE_MISSING: "1" });
+		pullHost.image = local;
+		pullHost.registryImage = registry;
+		pullHost.customImage = false;
 		expect(
-			await checkReadiness(pullRuntime, async (_title, options) => {
+			await checkReadiness(pullHost, async (_title, options) => {
 				seenOptions = options;
 				return DOWNLOAD_IMAGE_OPTION;
 			}),
-		).toEqual({ ready: true });
+		).toEqual({ ready: true, image: registry });
 		expect(seenOptions).toEqual([DOWNLOAD_IMAGE_OPTION, BUILD_IMAGE_OPTION, DISABLE_SANDBOX_OPTION]);
-		expect(pullRuntime.image).toBe(registry);
+		expect(pullHost.image).toBe(local);
 		expect((await callsOf("image")).at(-1)).toEqual(["image", "pull", "--arch", "arm64", registry]);
 
 		// 5a. Forwards pull output lines to showOperation and calls end()
 		state = await fakeState();
-		const shownRuntime = startingRuntime(state, handle, { IMAGE_MISSING: "1" });
-		shownRuntime.image = local;
-		shownRuntime.registryImage = registry;
-		shownRuntime.customImage = false;
+		const shownHost = fakeHost(state, { IMAGE_MISSING: "1" });
+		shownHost.image = local;
+		shownHost.registryImage = registry;
+		shownHost.customImage = false;
 		const shown: string[] = [];
 		expect(
 			await checkReadiness(
-				shownRuntime,
+				shownHost,
 				async () => DOWNLOAD_IMAGE_OPTION,
 				(kind) => {
 					shown.push(`start ${kind}`);
 					return { output: (line) => shown.push(line), end: () => shown.push("end") };
 				},
 			),
-		).toEqual({ ready: true });
+		).toEqual({ ready: true, image: registry });
 		expect(shown).toEqual(["start download", `pulled ${registry}`, "end"]);
 
 		// 6. Selecting Disable turns off sandbox
 		state = await fakeState();
-		const disabled = startingRuntime(state, handle, { IMAGE_MISSING: "1" });
+		const disabled = fakeHost(state, { IMAGE_MISSING: "1" });
 		disabled.image = local;
 		disabled.customImage = false;
 		expect(await checkReadiness(disabled, async () => DISABLE_SANDBOX_OPTION)).toEqual({
@@ -225,14 +227,14 @@ describe("start", () => {
 			["LIST_JSON", "{}", "unreadable listing"],
 		];
 		for (const [knob, value, said] of forms) {
-			const runtime = startingRuntime(state, handle, { [knob]: value });
-			expect(await startRuntime(runtime, warn), `${knob}=${value}`).toEqual({
+			const host = fakeHost(state, { [knob]: value });
+			expect(await activateRuntime(host, await ownHandle(), host.image, warn), `${knob}=${value}`).toEqual({
 				ready: false,
 				message: `sandbox is off: runtime state could not be established: ${said}`,
 				leftovers: [],
 			});
-			expect(runtime.state).toBe("unready");
-			expect(runtime.owned.size).toBe(0);
+			expect(host.state).toBe("unready");
+			expect(host.owned.size).toBe(0);
 		}
 		expect(await callsOf("delete", "run", "volume")).toEqual([]);
 		expect(await state.containers()).toEqual(["polar-sandbox-current-3-aaaaaaaa"]);
@@ -314,8 +316,8 @@ describe("start", () => {
 		];
 		for (const [labels, actual] of cases) {
 			await state.addVolume("polar-work-current", labels);
-			const runtime = startingRuntime(state, handle);
-			expect(await startRuntime(runtime, warn)).toEqual({
+			const host = fakeHost(state);
+			expect(await activateRuntime(host, await ownHandle(), host.image, warn)).toEqual({
 				ready: false,
 				message: `sandbox is off: the volume polar-work-current is not this session's: its polar-root label is ${actual}, expected ${artifactsRoot()}`,
 				leftovers: [],
@@ -388,8 +390,8 @@ describe("start", () => {
 			[{ VOLUME_INSPECT_GARBAGE: "1" }, "unreadable answer"],
 		];
 		for (const [knobs, said] of answers) {
-			const runtime = startingRuntime(state, handle, knobs);
-			expect(await startRuntime(runtime, warn)).toEqual({
+			const host = fakeHost(state, knobs);
+			expect(await activateRuntime(host, await ownHandle(), host.image, warn)).toEqual({
 				ready: false,
 				message: `sandbox is off: the /work volume could not be inspected: ${said}`,
 				leftovers: [],
@@ -401,11 +403,11 @@ describe("start", () => {
 		expect(await state.volumes()).toEqual([]);
 	});
 
-	it("keeps a leftover owned and offers no tool when it cannot be deleted at start", async () => {
+	it("keeps a leftover owned when it cannot be deleted at start and deletes it at shutdown", async () => {
 		await state.addContainer("polar-sandbox-current-2-ffffffff", ownLabels("current"));
-		const runtime = startingRuntime(state, handle, { DELETE_FAIL: "1" });
+		const host = fakeHost(state, { DELETE_FAIL: "1" });
 
-		expect(await startRuntime(runtime, warn)).toEqual({
+		expect(await activateRuntime(host, await ownHandle(), host.image, warn)).toEqual({
 			ready: false,
 			message:
 				"sandbox is off: leftovers of sandbox stayed; polar-sandbox-current-2-ffffffff (delete: Error: runtime temporarily unavailable; still listed) could not be deleted; delete them with: container delete --force polar-sandbox-current-2-ffffffff",
@@ -416,9 +418,15 @@ describe("start", () => {
 				},
 			],
 		});
-		expect(runtime.owned).toEqual(new Set(["polar-sandbox-current-2-ffffffff"]));
-		expect(runtime.state).toBe("unready");
+		expect(host.owned).toEqual(new Set(["polar-sandbox-current-2-ffffffff"]));
+		expect(host.state).toBe("unready");
 		expect(await volumeCalls("inspect")).toEqual([]);
+
+		delete host.environment.FAKE_CONTAINER_DELETE_FAIL;
+		await shutdownHost(host, () => false, "reload", warn);
+		expect(await state.containers()).toEqual([]);
+		expect(host.owned.size).toBe(0);
+		expect(notices).toEqual([]);
 	});
 
 	it("reports the preparation failure and the container that stayed together", async () => {
@@ -429,18 +437,18 @@ describe("start", () => {
 		for (const [knobs, reason] of cases) {
 			await rm(join(state.directory, "containers"), { recursive: true, force: true });
 			await rm(join(state.directory, "volumes"), { recursive: true, force: true });
-			const runtime = startingRuntime(state, handle, knobs);
-			const readiness = await startRuntime(runtime, warn);
+			const host = fakeHost(state, knobs);
+			const activation = await activateRuntime(host, await ownHandle(), host.image, warn);
 			const [prep] = await state.containers();
 			expect(prep, reason).toMatch(/^polar-prep-current-[0-9a-f]{8}$/);
 			const cleanup = "delete: Error: runtime temporarily unavailable; still listed";
-			expect(readiness, reason).toEqual({
+			expect(activation, reason).toEqual({
 				ready: false,
 				message: `sandbox is off: ${reason}; ${prep} (${cleanup}) could not be deleted; delete them with: container delete --force ${prep}`,
 				leftovers: [{ container: prep, message: cleanup }],
 			});
-			expect(runtime.owned, reason).toEqual(new Set([prep]));
-			expect(runtime.state, reason).toBe("unready");
+			expect(host.owned, reason).toEqual(new Set([prep]));
+			expect(host.state, reason).toBe("unready");
 		}
 		expect(notices).toEqual([]);
 	});
@@ -531,17 +539,23 @@ describe("shutdown", () => {
 		expect(await exists(lockOf(session))).toBe(false);
 	});
 
-	it("stops every CLI at quit", async () => {
+	it("stops the program and every CLI command with its child process at quit", async () => {
 		const runtime = fakeRuntime(
 			state,
 			handle,
-			{ RUN_IGNORES_KILL: "1", DELETE_HANG: "1" },
+			{ RUN_IGNORES_KILL: "1" },
 			{ killGraceMs: 5000, shutdownBudgetMs: 300, commandTimeoutMs: 10_000 },
 		);
 		const finished = startCall(runtime, "hang");
 		await until(() => runtime.running.size === 1);
-		const hanging = containerCommand(runtime, ["delete", "--force", "polar-sandbox-current-9-99999999"]);
-		await until(async () => (await callsOf("delete")).length === 1);
+		let helperPid = 0;
+		const hanging = containerCommand(runtime, ["-c", "sleep 30 & echo $!; wait"], {
+			command: "sh",
+			onLine: (line) => {
+				helperPid = Number(line);
+			},
+		});
+		await until(() => helperPid > 0);
 		const before = [...runtime.children];
 		expect(new Set(before.map(([, kind]) => kind))).toEqual(new Set(["run", "service"]));
 
@@ -551,7 +565,7 @@ describe("shutdown", () => {
 		expect(performance.now() - started).toBeLessThan(1500);
 		expect(notices).toEqual(["sandbox: 1 program(s) still stopping"]);
 		expect(runtime.cliStopped).toBe(true);
-		for (const [child] of [...before, ...runtime.children]) expect(child.killed).toBe(true);
+		await until(() => !processExists(helperPid), 2000);
 		expect(await hanging).toMatchObject({ code: null, timedOut: false });
 		const recorded = (await state.calls()).length;
 		expect(await containerCommand(runtime, ["system", "status"])).toEqual({
@@ -566,6 +580,8 @@ describe("shutdown", () => {
 		expect(result.cleanupError?.message).toBe(
 			"delete: sandbox is stopping; no command starts; list: sandbox is stopping; no command starts",
 		);
+		for (const [child] of before) expect(child.signalCode).toBe("SIGKILL");
+		expect(runtime.children.size).toBe(0);
 		expect(runtime.state).toBe("closed");
 	});
 
@@ -576,41 +592,34 @@ describe("shutdown", () => {
 		expect(performance.now() - started).toBeLessThan(500);
 		expect(open.state).toBe("closed");
 		expect(await exists(lockOf(session))).toBe(false);
-
-		const offHandle = await acquireSession("off", root, artifactsRoot());
-		const off = startingRuntime(state, offHandle, { STATUS_EXIT: "1" });
-		expect((await startRuntime(off, warn)).ready).toBe(false);
-		expect(await exists(lockOf(offHandle.paths))).toBe(true);
-		await shutdownRuntime(off, "new", warn);
-		expect(off.state).toBe("closed");
-		expect(await exists(lockOf(offHandle.paths))).toBe(false);
 		expect(notices).toEqual([]);
 	});
 
-	it("returns at the budget during a hanging start and releases the handle when the start ends", async () => {
-		await state.addContainer("polar-sandbox-current-1-aaaaaaaa", ownLabels("current"));
-		const runtime = startingRuntime(state, handle, { DELETE_DELAY_MS: "700" }, { shutdownBudgetMs: 200 });
-		const starting = startRuntime(runtime, warn);
+	it("returns at the budget during a hanging activation, which releases the handle when it ends", async () => {
+		await state.addContainer("polar-sandbox-starting-1-aaaaaaaa", ownLabels("starting"));
+		const startingHandle = await ownHandle("starting");
+		const host = fakeHost(state, { DELETE_DELAY_MS: "700" }, { shutdownBudgetMs: 200 });
+		let activating = true;
+		const activation = activateRuntime(host, startingHandle, host.image, warn).finally(() => {
+			activating = false;
+		});
 		await until(async () => (await callsOf("delete")).length === 1);
 
 		const started = performance.now();
-		await shutdownRuntime(runtime, "reload", warn);
+		await shutdownHost(host, () => activating, "reload", warn);
 		const elapsed = performance.now() - started;
 
 		expect(elapsed).toBeGreaterThanOrEqual(180);
 		expect(notices).toEqual([]);
-		expect(runtime.state).toBe("closing");
-		expect(runtime.starting).toBeDefined();
-		expect(await exists(lockOf(session))).toBe(true);
+		expect(host.state).toBe("closing");
+		expect(activating).toBe(true);
+		expect(await exists(lockOf(startingHandle.paths))).toBe(true);
 
-		const readiness = await starting;
-		expect(readiness).toEqual({
+		expect(await activation).toEqual({
 			ready: false,
 			message: "sandbox is off: the session is shutting down",
 			leftovers: [],
 		});
-		expect(runtime.starting).toBeUndefined();
-		expect(runtime.state).toBe("closed");
-		expect(await exists(lockOf(session))).toBe(false);
+		expect(await exists(lockOf(startingHandle.paths))).toBe(false);
 	});
 });

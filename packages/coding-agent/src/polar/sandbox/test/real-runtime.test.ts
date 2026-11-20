@@ -7,7 +7,7 @@ import { setTimeout as sleep } from "timers/promises";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { acquireSession, type SessionHandle } from "../../shared/session.ts";
 import { readManifest } from "../../shared/store.ts";
-import { createRuntime, DEFAULT_IMAGE } from "../index.ts";
+import { createHost, DEFAULT_IMAGE } from "../index.ts";
 import { containerCommand } from "../src/cli.ts";
 import {
 	inspectionOf,
@@ -25,8 +25,21 @@ import {
 } from "../src/driver.ts";
 import { buildReply } from "../src/reply.ts";
 import { admitCall } from "../src/runner.ts";
-import type { OciEngineChoice, SandboxLimits, SandboxRequest, SandboxRuntime, SessionPaths } from "../src/types.ts";
-import { BUILD_IMAGE_OPTION, recoverLeftovers, shutdownRuntime, startRuntime } from "../src/workspace.ts";
+import type {
+	Activation,
+	OciEngineChoice,
+	SandboxLimits,
+	SandboxRequest,
+	SandboxRuntime,
+	SessionPaths,
+} from "../src/types.ts";
+import {
+	activateRuntime,
+	BUILD_IMAGE_OPTION,
+	checkReadiness,
+	recoverLeftovers,
+	shutdownRuntime,
+} from "../src/workspace.ts";
 
 const REAL = process.env.SANDBOX_REAL_RUNTIME === "1";
 const IMAGE = process.env.POLAR_SANDBOX_IMAGE ?? DEFAULT_IMAGE;
@@ -66,17 +79,19 @@ async function timed<T>(step: string, work: () => Promise<T>): Promise<T> {
 	}
 }
 
-async function startedRuntime(sessionHandle: SessionHandle) {
-	const started = createRuntime(IMAGE, process.env, sessionHandle, {
+function start(sessionHandle: SessionHandle): Promise<Activation> {
+	const host = createHost(IMAGE, process.env, {
 		ociEngine: TEST_OCI_ENGINE,
 		ociRuntime: process.env.SANDBOX_TEST_OCI_RUNTIME,
 	});
-	started.limits = { ...limits };
-	const readiness = await timed(`start ${sessionHandle.paths.sessionId}`, () =>
-		startRuntime(started, warn, async () => BUILD_IMAGE_OPTION),
-	);
-	if (readiness.ready) started.state = "open";
-	return { runtime: started, readiness };
+	host.limits = { ...limits };
+	return timed(`start ${sessionHandle.paths.sessionId}`, async () => {
+		const readiness = await checkReadiness(host, async () => BUILD_IMAGE_OPTION);
+		if (!readiness.ready) return readiness;
+		const activation = await activateRuntime(host, sessionHandle, readiness.image, warn);
+		if (activation.ready) activation.runtime.state = "open";
+		return activation;
+	});
 }
 
 async function call(
@@ -191,9 +206,9 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 			);
 		}
 		await writeFile(join(session.outputDirectory, "k8s_logs-1.txt"), `${lines.join("\n")}\n`);
-		const started = await startedRuntime(handle);
+		const started = await start(handle);
+		if (!started.ready) throw new Error(started.message);
 		runtime = started.runtime;
-		expect(started.readiness).toEqual({ ready: true });
 		expect(runtime.state).toBe("open");
 		expect(runtime.owned.size).toBe(0);
 	}, 600_000);
@@ -203,6 +218,7 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 			await shutdownRuntime(runtime, "reload", warn);
 			await runtime.driver.deleteWorkVolumes(
 				[{ name: workVolumeName(session.sessionId), sessionId: session.sessionId }],
+				session,
 				Date.now() + 30_000,
 			);
 		}
@@ -396,8 +412,8 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 		const name = `polar-sandbox-kill9-${session.sessionId}`;
 		const args =
 			runtime.driver.name === "apple-container"
-				? sandboxArguments(runtime, name)
-				: ociSandboxArguments(runtime, name, (runtime.driver as OciDriver).runOptions);
+				? sandboxArguments(runtime, name, session)
+				: ociSandboxArguments(runtime, name, (runtime.driver as OciDriver).runOptions, session);
 		const parent = spawn(
 			process.execPath,
 			[
@@ -495,7 +511,7 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 			name: workVolumeName(session.sessionId),
 			labels: { "polar-session": session.sessionId, "polar-root": root },
 		});
-		const volumes = await runtime.driver.listWorkVolumes(root, Date.now() + 30_000);
+		const volumes = await runtime.driver.listWorkVolumes(session, Date.now() + 30_000);
 		expect(volumes).toContainEqual({ name: workVolumeName(session.sessionId), sessionId: session.sessionId });
 		expect((await runtime.driver.deleteSandbox(name, Date.now() + 30_000)).removed).toBe(true);
 	}, 60_000);
@@ -551,13 +567,11 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 						];
 			const created = await containerCommand(runtime, createArgs);
 			expect(created.code, created.stderr).toBe(0);
-			const { runtime: refused, readiness } = await startedRuntime(foreignHandle);
-			expect(readiness).toEqual({
+			expect(await start(foreignHandle)).toEqual({
 				ready: false,
 				message: `sandbox is off: the volume ${volume} is not this session's: its polar-root label is /elsewhere, expected ${root}`,
 				leftovers: [],
 			});
-			expect(refused.state).toBe("unready");
 			const inspected = await containerCommand(runtime, ["volume", "inspect", volume]);
 			expect(inspected.code).toBe(0);
 			const parsedVol =
@@ -569,6 +583,7 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 		} finally {
 			await runtime.driver.deleteWorkVolumes(
 				[{ name: volume, sessionId: foreignHandle.paths.sessionId }],
+				session,
 				Date.now() + 30_000,
 			);
 			await foreignHandle.release();
@@ -578,9 +593,10 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 	it("deletes the container and closes the file at shutdown with a running program", async () => {
 		const ownHandle = await acquireSession(`real-shutdown-${randomUUID().slice(0, 8)}`, root, root);
 		const paths = ownHandle.paths;
-		const { runtime: closing, readiness } = await startedRuntime(ownHandle);
+		const started = await start(ownHandle);
 		try {
-			expect(readiness).toEqual({ ready: true });
+			if (!started.ready) throw new Error(started.message);
+			const closing = started.runtime;
 			const request: SandboxRequest = { language: "bash", code: "echo started; sleep 60" };
 			const admitted = admitCall(closing, request, undefined, "call-1");
 			if (admitted === undefined) throw new Error("the call was not admitted");
@@ -608,6 +624,7 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 		} finally {
 			await runtime.driver.deleteWorkVolumes(
 				[{ name: workVolumeName(paths.sessionId), sessionId: paths.sessionId }],
+				session,
 				Date.now() + 30_000,
 			);
 			await ownHandle.release();

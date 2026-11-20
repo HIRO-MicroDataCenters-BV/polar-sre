@@ -229,6 +229,47 @@ describe("sandbox extension", () => {
 		expect(await readFile(lockPath(), "utf8")).toBe(`${process.pid}\n`);
 	});
 
+	it("holds the session lock only while the sandbox is active", async () => {
+		await setKnobs({ STATUS_EXIT: "1" });
+		const notReady = loadExtension();
+		await notReady.startSession();
+		expect(notReady.tools).toEqual([]);
+		expect(await exists(join(root, SESSION_ID))).toBe(false);
+		await notReady.shutdown();
+
+		await setKnobs({ LIST_GARBAGE: "1" });
+		const failed = loadExtension();
+		await failed.startSession();
+		expect(failed.tools).toEqual([]);
+		expect(failed.notices).toEqual([
+			["sandbox is off: runtime state could not be established: unreadable listing", "warning"],
+		]);
+		expect(await exists(lockPath())).toBe(false);
+		await failed.shutdown();
+
+		await setKnobs();
+		const active = loadExtension();
+		await active.startSession();
+		expect(active.tools.map((tool) => tool.name)).toEqual(["run_code"]);
+		expect(await readFile(lockPath(), "utf8")).toBe(`${process.pid}\n`);
+		await active.shutdown();
+		expect(await exists(lockPath())).toBe(false);
+	});
+
+	it("releases the lock and offers no tool when the session ends while the sandbox starts", async () => {
+		await setKnobs({ DELETE_DELAY_MS: "700" });
+		const pi = loadExtension();
+		const starting = pi.startSession();
+		await until(async () => (await state.calls()).some((call) => call[0] === "delete"));
+
+		await pi.shutdown("reload");
+		await starting;
+
+		expect(pi.tools).toEqual([]);
+		expect(pi.notices).toEqual([]);
+		expect(await exists(lockPath())).toBe(false);
+	});
+
 	it("notifies the operator of the OCI driver and isolation boundary on start", async () => {
 		const podmanWrapper = join(bin, "podman");
 		await writeFile(

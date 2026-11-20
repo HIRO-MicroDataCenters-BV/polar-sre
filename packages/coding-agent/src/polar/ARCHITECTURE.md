@@ -111,23 +111,24 @@ packages/coding-agent/src/polar/
 │
 ├── sandbox/                         # Isolated local VM / container sandbox extension (`run_code`)
 │   ├── ARCHITECTURE.md              # Sandbox architecture and internal layer boundaries
-│   ├── index.ts                     # --sandbox-driver / --sandbox-image / --sandbox-registry-image / --sandbox-oci-* / --sandbox-k8s-pvc flags, startup readiness, shutdown, tool registration
+│   ├── index.ts                     # --sandbox-driver / --sandbox-image / --sandbox-registry-image / --sandbox-oci-* / --sandbox-k8s-pvc flags, session_start/shutdown wiring, run_code tool definition
 │   ├── image/
 │   │   ├── Containerfile
 │   │   ├── requirements.in
 │   │   └── requirements.txt
 │   ├── src/
 │   │   ├── types.ts                 # Domain types and `SandboxDriver` / `HotSandbox` contracts
-│   │   ├── cli.ts                   # Layer 1: Stateless CLI execution and diagnostic primitives
+│   │   ├── cli.ts                   # Layer 1: Stateless CLI execution in a process group and diagnostic primitives
 │   │   ├── driver.ts                # Layer 2: Driver barrel exports
 │   │   ├── drivers/
 │   │   │   ├── shared.ts            # Shared guest constants, launcher, and UnsupportedSandboxDriver
 │   │   │   ├── apple.ts             # AppleContainerDriver & AppleHotSandbox (`container` microVM)
 │   │   │   ├── oci.ts               # OciDriver & OciHotSandbox (`podman` / `docker`)
 │   │   │   └── k8s.ts               # K8sDriver & K8sHotSandbox (`kubectl` Pod)
-│   │   ├── workspace.ts             # Layer 3: Readiness check, image lookup/pull/build UX, orphan GC, /work volume setup
+│   │   ├── workspace.ts             # Layer 3: Readiness check, image lookup/pull/build UX, session activation (orphan GC, /work volume setup), shutdown
 │   │   ├── runner.ts                # Layer 4: Lazy hot VM lifecycle, `spawnCall` supervision, OOM delta & work_limit check, scrub
 │   │   ├── reply.ts                 # Layer 5: Sandbox reply formatting (with OOM, work_limit, inspection, and cleanup notices)
+│   │   ├── controller.ts            # Sandbox state of the session: start, activation under the session lock, run_code registration, shutdown
 │   │   ├── progress.ts              # CLI pull progress parser (`container` and `docker` output)
 │   │   └── indicator.ts             # TUI single-line progress widget for image pull and build
 │   └── test/

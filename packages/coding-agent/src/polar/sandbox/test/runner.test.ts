@@ -212,7 +212,7 @@ describe("SandboxCall", () => {
 		expect(echo.runArgv).toContain("--interactive");
 		expect(echo.runArgv.slice(-4)).toEqual(["polar-sandbox:test", "bash", "-c", KEEPALIVE_COMMAND]);
 		expect(echo.runArgv[0]).toBe("run");
-		expect(sandboxArguments(runtime, name)).toEqual(echo.runArgv);
+		expect(sandboxArguments(runtime, name, session)).toEqual(echo.runArgv);
 		expect(echo.argv).toEqual(execArguments(name, "python"));
 
 		const bash = await run("echo_argv", runtime, "bash");

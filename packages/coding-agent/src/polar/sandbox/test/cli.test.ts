@@ -5,8 +5,9 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { acquireSession, type SessionHandle } from "../../shared/session.ts";
 import { commandFailure, containerCommand, deadlineAfter, LineSplitter } from "../src/cli.ts";
 import { cleanupContainer, inspectionOf, parseContainers, parseVolumes } from "../src/driver.ts";
+import type { CommandOutcome } from "../src/types.ts";
 import { cleanupOwned } from "../src/workspace.ts";
-import { type FakeState, fakeRuntime, fakeState } from "./fixtures.ts";
+import { type FakeState, fakeRuntime, fakeState, processExists, until } from "./fixtures.ts";
 
 let root: string;
 let handle: SessionHandle;
@@ -72,6 +73,89 @@ describe("cli", () => {
 
 		const cancelled = await containerCommand(runtime, ["system", "status"], { signal: AbortSignal.abort() });
 		expect(cancelled).toEqual({ code: null, stdout: "", stderr: "cancelled", timedOut: false });
+	});
+
+	it("reports the error code of a command that could not start", async () => {
+		const runtime = fakeRuntime(state, handle);
+		const missing = await containerCommand(runtime, ["system", "status"], { command: "/nonexistent/bin/container" });
+		expect(missing).toMatchObject({ code: null, timedOut: false, spawnError: "ENOENT" });
+		expect(missing.stderr).toContain("ENOENT");
+		expect(runtime.children.size).toBe(0);
+
+		const started = await containerCommand(runtime, ["system", "status"]);
+		expect(started.code).toBe(0);
+		expect(started.spawnError).toBeUndefined();
+	});
+
+	it("returns from a cancelled command and stops its whole process group", async () => {
+		const runtime = fakeRuntime(state, handle);
+		const cancel = new AbortController();
+		let helperPid = 0;
+		let outcome: CommandOutcome | undefined;
+		void containerCommand(runtime, ["-c", "sleep 30 & echo $!; wait"], {
+			command: "sh",
+			signal: cancel.signal,
+			onLine: (line) => {
+				helperPid = Number(line);
+			},
+		}).then((result) => {
+			outcome = result;
+		});
+		await until(() => helperPid > 0);
+		cancel.abort();
+		await until(() => outcome !== undefined, 2000);
+		expect(outcome).toMatchObject({ code: null, timedOut: false });
+		await until(() => !processExists(helperPid), 2000);
+		expect(runtime.children.size).toBe(0);
+	});
+
+	it("returns from a cancelled command after the kill grace when a process outside its group holds the output", async () => {
+		const runtime = fakeRuntime(state, handle);
+		const cancel = new AbortController();
+		const holder = `setTimeout(() => {}, 30000)`;
+		const script = [
+			`const { spawn } = require("child_process");`,
+			`const options = { detached: true, stdio: ["ignore", "inherit", "inherit"] };`,
+			`console.log(spawn(process.execPath, ["-e", ${JSON.stringify(holder)}], options).pid);`,
+			holder,
+		].join("\n");
+		let holderPid = 0;
+		let outcome: CommandOutcome | undefined;
+		void containerCommand(runtime, ["-e", script], {
+			command: process.execPath,
+			signal: cancel.signal,
+			onLine: (line) => {
+				holderPid = Number(line);
+			},
+		}).then((result) => {
+			outcome = result;
+		});
+		await until(() => holderPid > 0);
+		try {
+			const cancelledAt = performance.now();
+			cancel.abort();
+			await until(() => outcome !== undefined, 2000);
+			expect(performance.now() - cancelledAt).toBeGreaterThanOrEqual(runtime.limits.killGraceMs - 20);
+			expect(outcome).toMatchObject({ code: null, timedOut: false });
+			expect(processExists(holderPid)).toBe(true);
+			expect(runtime.children.size).toBe(0);
+		} finally {
+			if (processExists(holderPid)) process.kill(holderPid, "SIGKILL");
+		}
+	});
+
+	it("returns the whole output of a command that ends normally, including what arrives after its exit", async () => {
+		const runtime = fakeRuntime(state, handle);
+		const bytes = 4 * 1024 * 1024;
+		const printed = await containerCommand(
+			runtime,
+			["-c", `(sleep 0.2; head -c ${bytes} /dev/zero | tr "\\0" x) & echo first`],
+			{ command: "sh" },
+		);
+		expect(printed.code).toBe(0);
+		expect(printed.stdout.length).toBe("first\n".length + bytes);
+		expect(printed.stdout.startsWith("first\nxxx")).toBe(true);
+		expect(runtime.children.size).toBe(0);
 	});
 
 	it("splits stream output on CR and LF across arbitrary UTF-8 byte chunks", () => {

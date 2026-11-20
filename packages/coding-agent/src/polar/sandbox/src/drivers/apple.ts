@@ -114,11 +114,7 @@ export async function cleanupContainer(
 	return { removed: false, error: { container: name, message } };
 }
 
-export function sandboxArguments(
-	runtime: SandboxDriverContext,
-	name: string,
-	session: SessionPaths = runtime.handle.paths,
-): string[] {
+export function sandboxArguments(runtime: SandboxDriverContext, name: string, session: SessionPaths): string[] {
 	const { limits } = runtime;
 	return [
 		"run",
@@ -378,7 +374,7 @@ export class AppleContainerDriver implements SandboxDriver {
 		return `container delete --force ${names.join(" ")}`;
 	}
 
-	async listWorkVolumes(root: string, deadlineAt: number): Promise<OwnedResource[]> {
+	async listWorkVolumes(session: SessionPaths, deadlineAt: number): Promise<OwnedResource[]> {
 		if (remainingMs(deadlineAt) === 0) return [];
 		const listed = await containerCommand(
 			this.runtime,
@@ -386,7 +382,7 @@ export class AppleContainerDriver implements SandboxDriver {
 			remainingMs(deadlineAt),
 		);
 		const volumes = listed.code === 0 ? parseVolumes(listed.stdout) : undefined;
-		return ownedInRoot(volumes ?? [], root);
+		return ownedInRoot(volumes ?? [], artifactsRootOf(session));
 	}
 
 	async ensureWorkVolume(session: SessionPaths, deadlineAt: number): Promise<VolumeFailure | undefined> {
@@ -428,7 +424,7 @@ export class AppleContainerDriver implements SandboxDriver {
 		return failure;
 	}
 
-	async deleteWorkVolumes(volumes: OwnedResource[], deadlineAt: number): Promise<void> {
+	async deleteWorkVolumes(volumes: OwnedResource[], _session: SessionPaths, deadlineAt: number): Promise<void> {
 		for (const volume of volumes) {
 			if (remainingMs(deadlineAt) === 0) return;
 			await containerCommand(this.runtime, ["volume", "delete", volume.name], remainingMs(deadlineAt));

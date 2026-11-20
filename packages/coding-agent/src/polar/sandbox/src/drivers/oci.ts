@@ -181,7 +181,7 @@ export function ociSandboxArguments(
 	runtime: SandboxDriverContext,
 	name: string,
 	options: OciRunOptions,
-	session: SessionPaths = runtime.handle.paths,
+	session: SessionPaths,
 ): string[] {
 	const { limits } = runtime;
 	const mem = `${limitMebibytes(limits.memoryBytes)}m`;
@@ -601,8 +601,9 @@ export class OciDriver implements SandboxDriver {
 		return `${this.engine} rm --force ${names.join(" ")}`;
 	}
 
-	async listWorkVolumes(root: string, deadlineAt: number): Promise<OwnedResource[]> {
+	async listWorkVolumes(session: SessionPaths, deadlineAt: number): Promise<OwnedResource[]> {
 		if (remainingMs(deadlineAt) === 0) return [];
+		const root = artifactsRootOf(session);
 		const listed = await containerCommand(
 			this.runtime,
 			["volume", "ls", "--filter", `label=${ROOT_LABEL}=${root}`, "--format", "{{.Name}}"],
@@ -648,7 +649,7 @@ export class OciDriver implements SandboxDriver {
 		return failure;
 	}
 
-	async deleteWorkVolumes(volumes: OwnedResource[], deadlineAt: number): Promise<void> {
+	async deleteWorkVolumes(volumes: OwnedResource[], _session: SessionPaths, deadlineAt: number): Promise<void> {
 		for (const volume of volumes) {
 			if (remainingMs(deadlineAt) === 0) return;
 			await containerCommand(this.runtime, ["volume", "rm", volume.name], remainingMs(deadlineAt));

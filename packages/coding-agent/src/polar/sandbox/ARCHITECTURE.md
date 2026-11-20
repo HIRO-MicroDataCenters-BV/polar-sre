@@ -43,28 +43,29 @@ The `sandbox` extension (`builtin:sandbox`) registers the `run_code` tool, execu
 
 ## 2. File Structure & Layers
 
-Each numbered layer in `packages/coding-agent/src/polar/sandbox/src/` imports only from lower layers; `progress.ts` and `indicator.ts` sit alongside the core layers and are wired into Layer 3 via `ShowImageOperation` in `index.ts`:
+Each numbered layer in `packages/coding-agent/src/polar/sandbox/src/` imports only from lower layers; `controller.ts` imports Layer 3 and is wired to the session events in `index.ts`; `progress.ts` and `indicator.ts` sit alongside the core layers and are wired into Layer 3 via `ShowImageOperation` in `index.ts`:
 
 ```text
 packages/coding-agent/src/polar/sandbox/
 ├── ARCHITECTURE.md                  # VM sandbox architecture and layer boundaries
-├── index.ts                         # --sandbox-driver / --sandbox-image / --sandbox-registry-image / --sandbox-oci-* / --sandbox-k8s-pvc flags, session_start/shutdown wiring, tool registration
+├── index.ts                         # --sandbox-driver / --sandbox-image / --sandbox-registry-image / --sandbox-oci-* / --sandbox-k8s-pvc flags, session_start/shutdown wiring, run_code tool definition
 ├── image/
 │   ├── Containerfile                # Multi-arch guest image definition (default tag: polar-sandbox:0.2)
 │   ├── requirements.in
 │   └── requirements.txt
 ├── src/
 │   ├── types.ts                     # Domain data structures, state types, SandboxDriver & HotSandbox contracts
-│   ├── cli.ts                       # Layer 1: Stateless CLI execution and diagnostic primitives
+│   ├── cli.ts                       # Layer 1: Stateless CLI execution in a process group and diagnostic primitives
 │   ├── driver.ts                    # Layer 2: Driver barrel exports
 │   ├── drivers/
 │   │   ├── shared.ts                # Shared guest constants, launcher, and UnsupportedSandboxDriver
 │   │   ├── apple.ts                 # AppleContainerDriver & AppleHotSandbox (`container` microVM)
 │   │   ├── oci.ts                   # OciDriver & OciHotSandbox (`podman` / `docker`)
 │   │   └── k8s.ts                   # K8sDriver & K8sHotSandbox (`kubectl` Pod)
-│   ├── workspace.ts                 # Layer 3: Readiness check, image lookup/pull/build UX, orphan GC, /work volume setup
+│   ├── workspace.ts                 # Layer 3: Readiness check, image lookup/pull/build UX, session activation (orphan GC, /work volume setup), shutdown
 │   ├── runner.ts                    # Layer 4: Admission, lazy HotSandbox lifecycle, call supervision, OOM, work_limit & scrub
 │   ├── reply.ts                     # Layer 5: Reply budget calculation, stdout/stderr store finalization, formatting
+│   ├── controller.ts                # Sandbox state of the session: start, activation under the session lock, run_code registration, shutdown
 │   ├── progress.ts                  # CLI pull progress parser (`ProgressReader` -> `ImageProgress`)
 │   └── indicator.ts                 # TUI progress line widget (`showImageOperation`)
 └── test/
@@ -79,20 +80,25 @@ packages/coding-agent/src/polar/sandbox/
 ### Layer Responsibilities
 
 1. **`src/cli.ts` (Layer 1 — Stateless CLI & Diagnostic Primitives)**
-   - Spawns short runtime CLI commands with `commandTimeoutMs` (`30s`), optional `AbortSignal`, optional child `env` override, and optional per-line output streaming (`CommandOptions.onLine` via per-stream `LineSplitter`), tracking child processes in `runtime.children`.
+   - Spawns short runtime CLI commands with `commandTimeoutMs` (`30s`), optional `AbortSignal`, optional child `env` override, and optional per-line output streaming (`CommandOptions.onLine` via per-stream `LineSplitter`), tracking child processes in `runtime.children` as kind `service`.
+   - Each command runs as the leader of its own process group. A command that ends on its own returns on `close`, after all of its output is read. On timeout or abort the whole group receives `SIGTERM` and, after `killGraceMs`, `SIGKILL`; the command then returns without waiting for a process outside the group that still holds its output.
+   - A command that could not be spawned reports the error code in `CommandOutcome.spawnError` (for example `ENOENT`).
    - Provides stream retention (`StreamCapture`), deadline helpers (`deadlineAfter`, `remainingMs`, `firstLine`), and bounded diagnostic formatting (`boundDiagnostic`: `4 KiB` / `64` lines, `commandFailure`, `describeCleanupErrors`).
 
 2. **`src/driver.ts` & `src/drivers/{shared,apple,oci,k8s}.ts` (Layer 2 — `SandboxDriver` & `HotSandbox`)**
+   - A driver is built over a `SandboxDriverContext`, which holds no session. Methods that act for a session (`listWorkVolumes`, `ensureWorkVolume`, `deleteWorkVolumes`, `startSandbox`) receive its `SessionPaths` as an argument.
    - `src/drivers/shared.ts`: shared guest constants, the guest script `launcher`, volume/label helpers, and `UnsupportedSandboxDriver`.
    - `src/driver.ts`: barrel module re-exporting the concrete drivers and shared helpers.
    - `src/drivers/apple.ts` (`AppleContainerDriver` & `AppleHotSandbox`): macOS microVM implementation via `container` — runtime and image checks, `/work` volume lifecycle (`-s 4096M`), container force-deletion with post-delete verification, and boot-log OOM delta detection (`logs --boot`).
    - `src/drivers/oci.ts` (`OciDriver` & `OciHotSandbox`): Linux OCI implementation via `podman` or `docker` — discovers the engine (`podman` then `docker` in `auto` mode), rejects rootless Docker and rootless Podman `< 4.3`, checks `cpu` cgroup delegation in Podman, detects gVisor (`runsc`) to switch process limiting from `--pids-limit` to `launcher` `ulimit -u`, prepares `/work` (`:nocopy`) with `chown`, enforces the soft `work_limit` (`exit 199`), and detects OOM by `oom_kill` delta in `/sys/fs/cgroup/memory.events` or container `State.OOMKilled`.
-   - `src/drivers/k8s.ts` (`K8sDriver` & `K8sHotSandbox`): Kubernetes Pod implementation via `kubectl` with an isolated ServiceAccount kubeconfig atomically written to `/tmp` and `KUBECONFIG` stripped from child process environments — verifies `POLAR_SANDBOX_K8S_*` and self-Pod UID in `checkRuntime`, runs the combined `/work` writability + `NetworkPolicy` deny-all probe Pod (`polar-netprobe-*`) in `ensureWorkVolume` (after `recoverLeftovers`), creates sandbox Pods under Pod Security `restricted` (`restartPolicy: Never`, `stdin: true` without `kubectl attach`, `ownerReferences`, `nodeSelector`, `polar-root-hash` label + `polar-root` annotation), deletes the Pod immediately on `kill()`, and performs two-step OOM detection on exit `137` or `128` (`state.terminated.reason === "OOMKilled"` with status-lag polling when the Pod is dead, or `/sys/fs/cgroup/memory.events` `oom_kill` delta when the Pod remains alive).
+   - `src/drivers/k8s.ts` (`K8sDriver` & `K8sHotSandbox`): Kubernetes Pod implementation via `kubectl` with an isolated ServiceAccount kubeconfig atomically written to `/tmp` and `KUBECONFIG` stripped from child process environments — verifies `POLAR_SANDBOX_K8S_*` and self-Pod UID in `checkRuntime`, refuses a `sessionId` that cannot name a Pod in `ensureWorkVolume` and `startSandbox` (and starts no `polar-work-ls-*` Pod for it in `listWorkVolumes`), runs the combined `/work` writability + `NetworkPolicy` deny-all probe Pod (`polar-netprobe-*`) in `ensureWorkVolume` (after `recoverLeftovers`), creates sandbox Pods under Pod Security `restricted` (`restartPolicy: Never`, `stdin: true` without `kubectl attach`, `ownerReferences`, `nodeSelector`, `polar-root-hash` label + `polar-root` annotation), deletes the Pod immediately on `kill()`, and performs two-step OOM detection on exit `137` or `128` (`state.terminated.reason === "OOMKilled"` with status-lag polling when the Pod is dead, or `/sys/fs/cgroup/memory.events` `oom_kill` delta when the Pod remains alive).
 
 3. **`src/workspace.ts` (Layer 3 — Session Workspace & Recovery)**
-   - `startRuntime` and `checkReadiness`: checks driver readiness, inspects image candidates (`--sandbox-image` -> `REGISTRY_IMAGE` -> `polar-sandbox:0.2`), runs the interactive `ctx.ui.select` flow (`Download prebuilt image` / `Build sandbox image locally (~2 min)` / `Disable sandbox for this session`) when `ctx.hasUI === true` (forwarding CLI output lines to optional `ShowImageOperation`) or disables immediately when `ctx.hasUI === false`, recovers leftover resources under the same `polar-root`, and prepares `/work`.
-   - `recoverLeftovers` and `cleanupOwned`: `recoverLeftovers` deletes containers belonging to the current session or to sessions whose `sessionLiveness` is `"ended"`, deletes volumes when the owning session's directory is absent (`ENOENT`), and preserves resources of `"alive"` and `"unknown"` sessions. `cleanupOwned(runtime, deadlineAt, exclude)` deletes owned containers through `runtime.driver.deleteSandbox`.
-   - `shutdownRuntime`: closes admission, waits up to `shutdownBudgetMs` (`10s`) for in-flight operations to drain, destroys the active `HotSandbox` and cleans up owned containers, kills remaining CLI processes on `quit`, and releases the session handle when drained.
+   - `checkReadiness`: works on a `SandboxHost` (the driver context with its driver, no session). Checks driver readiness, inspects image candidates (`--sandbox-image` -> `REGISTRY_IMAGE` -> `polar-sandbox:0.2`), runs the interactive `ctx.ui.select` flow (`Download prebuilt image` / `Build sandbox image locally (~2 min)` / `Disable sandbox for this session`) when `ctx.hasUI === true` (forwarding CLI output lines to optional `ShowImageOperation`) or disables immediately when `ctx.hasUI === false`, and returns the image to run.
+   - `activateRuntime`: attaches an acquired session handle and the call bookkeeping to the host, which makes it a `SandboxRuntime`, records the image, recovers leftover resources under the same `polar-root`, and prepares `/work`. It takes over the handle: a failed activation releases it before returning.
+   - `recoverLeftovers` and `cleanupOwned`: `recoverLeftovers` deletes containers belonging to the current session or to sessions whose `sessionLiveness` is `"ended"`, deletes volumes when the owning session's directory is absent (`ENOENT`), and preserves resources of `"alive"` and `"unknown"` sessions. `cleanupOwned(host, deadlineAt, exclude)` deletes owned containers through `host.driver.deleteSandbox`.
+   - `shutdownRuntime`: closes admission, waits up to `shutdownBudgetMs` (`10s`) for in-flight operations to drain, destroys the active `HotSandbox` and cleans up owned containers, kills remaining CLI processes on `quit` (a CLI command with its process group, a program of a call alone), and releases the session handle when drained.
+   - `shutdownHost`: shuts down a host without an active session. Marks it closing so that a start in progress ends at its next step, waits for that start within `shutdownBudgetMs`, deletes the containers a failed activation left owned, and kills remaining CLI processes on `quit`.
 
 4. **`src/runner.ts` (Layer 4 — Call Admission & Hot Sandbox Supervision)**
    - `admitCall`: admits a call when `runtime.state === "open"` and records `toolCallId` in `runtime.inFlight`.
@@ -105,7 +111,13 @@ packages/coding-agent/src/polar/sandbox/
    - Formats the reply with status line `[run_code <status>] <language>: <first-line>`, `stdout` head excerpt, `[stderr]...[/stderr]` tail excerpt, and notices (`outputLimitNotice`, `cleanupNotice`, `inspectionNotice`, `statusMessage`).
    - Saved file notices point to `"read" tool` (when `<= 16 MiB`) and `"run_code" tool from /data/<file>`.
 
-6. **`src/progress.ts` & `src/indicator.ts` (UI Helpers — Image Progress Widget)**
+6. **`src/controller.ts` (Session Controller)**
+   - `SandboxController` holds the sandbox state of one session: `off` → `activating` → `active` → `closing` → `closed`. It is created at `session_start` over a `SandboxHost` and owns the `SandboxRuntime` once the session is active.
+   - Start: runs `checkReadiness` on the host; a host that is not ready stays `off` with a warning and no session lock. A ready host is activated: the controller acquires the session lock (`acquireSession`), calls `activateRuntime` with the image from the readiness check, then opens the runtime and registers `run_code`. A failed activation returns the state to `off` with a warning.
+   - The session lock is taken when an activation begins. A failed activation releases it at once; a successful one holds it until the runtime shuts down. When the session begins to shut down during an activation, the controller registers nothing and releases the lock.
+   - Shutdown: moves to `closing` and calls `shutdownRuntime` for an active session or `shutdownHost` otherwise.
+
+7. **`src/progress.ts` & `src/indicator.ts` (UI Helpers — Image Progress Widget)**
    - `src/progress.ts` (`ProgressReader`): pure parser (no TUI/theme imports) extracting step, completion fraction, and byte/layer counts from `container image pull` and non-TTY `docker pull` output lines, falling back to the latest sanitized text line.
    - `src/indicator.ts` (`showImageOperation`): mounts and disposes the `sandbox-image` TUI widget above the editor, rendering either a fixed-column progress bar or a right-aligned elapsed-time status line.
 

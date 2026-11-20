@@ -56,18 +56,20 @@ export interface SandboxDriverContext {
 	customImage?: boolean;
 	limits: SandboxLimits;
 	environment: NodeJS.ProcessEnv;
-	handle: SessionHandle;
 	state: RuntimeState;
 	owned: Set<string>;
 	children: Map<ChildProcess, ChildKind>;
 	cliStopped: boolean;
 }
 
-export interface SandboxRuntime extends SandboxDriverContext {
-	starting?: Promise<Readiness>;
+export interface SandboxHost extends SandboxDriverContext {
+	driver: SandboxDriver;
+}
+
+export interface SandboxRuntime extends SandboxHost {
+	handle: SessionHandle;
 	inFlight: Set<string>;
 	running: Set<RunningCall>;
-	driver: SandboxDriver;
 	activeSandbox: ActiveSandboxHolder;
 }
 
@@ -127,7 +129,11 @@ export interface ToolReply {
 	isError: boolean;
 }
 
-export type Readiness = { ready: true } | { ready: false; message: string; leftovers: CleanupError[] };
+export type NotReady = { ready: false; message: string; leftovers: CleanupError[] };
+
+export type Readiness = { ready: true; image: string } | NotReady;
+
+export type Activation = { ready: true; runtime: SandboxRuntime } | NotReady;
 
 export type ImageOperationKind = "download" | "build";
 
@@ -148,6 +154,7 @@ export interface CommandOutcome {
 	stdout: string;
 	stderr: string;
 	timedOut: boolean;
+	spawnError?: string;
 }
 
 export interface SandboxProcess {
@@ -180,9 +187,9 @@ export interface SandboxDriver {
 	deleteSandbox(name: string, deadlineAt: number): Promise<CleanupOutcome>;
 	manualDeleteCommand(names: string[]): string;
 
-	listWorkVolumes(root: string, deadlineAt: number): Promise<OwnedResource[]>;
+	listWorkVolumes(session: SessionPaths, deadlineAt: number): Promise<OwnedResource[]>;
 	ensureWorkVolume(session: SessionPaths, deadlineAt: number): Promise<VolumeFailure | undefined>;
-	deleteWorkVolumes(volumes: OwnedResource[], deadlineAt: number): Promise<void>;
+	deleteWorkVolumes(volumes: OwnedResource[], session: SessionPaths, deadlineAt: number): Promise<void>;
 
 	startSandbox(
 		name: string,

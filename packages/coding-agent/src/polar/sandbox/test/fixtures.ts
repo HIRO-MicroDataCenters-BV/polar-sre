@@ -12,7 +12,16 @@ import {
 	OciDriver,
 	type OciDriverOptions,
 } from "../src/driver.ts";
-import type { RunningCall, SandboxDriverContext, SandboxLimits, SandboxRuntime, SessionHandle } from "../src/types.ts";
+import type {
+	Activation,
+	RunningCall,
+	SandboxDriverContext,
+	SandboxHost,
+	SandboxLimits,
+	SandboxRuntime,
+	SessionHandle,
+} from "../src/types.ts";
+import { activateRuntime, checkReadiness, type Warn } from "../src/workspace.ts";
 
 export const FAKE_CONTAINER = fileURLToPath(new URL("./fake-container.mjs", import.meta.url));
 export const FAKE_OCI = fileURLToPath(new URL("./fake-oci.mjs", import.meta.url));
@@ -112,29 +121,59 @@ export function fakeEnvironment(state: FakeState, knobs: Record<string, string> 
 	return environment;
 }
 
+function openRuntime(host: SandboxHost, handle: SessionHandle): SandboxRuntime {
+	host.state = "open";
+	return Object.assign(host, {
+		handle,
+		inFlight: new Set<string>(),
+		running: new Set<RunningCall>(),
+		activeSandbox: {},
+	});
+}
+
+/** Checks readiness and activates the session on the host, as a session start does. */
+export async function startHost(host: SandboxHost, handle: SessionHandle, warn: Warn = () => {}): Promise<Activation> {
+	const readiness = await checkReadiness(host);
+	if (!readiness.ready) return readiness;
+	return activateRuntime(host, handle, readiness.image, warn);
+}
+
+export async function startedRuntime(
+	host: SandboxHost,
+	handle: SessionHandle,
+	warn: Warn = () => {},
+): Promise<SandboxRuntime> {
+	const started = await startHost(host, handle, warn);
+	if (!started.ready) throw new Error(started.message);
+	started.runtime.state = "open";
+	return started.runtime;
+}
+
+export function fakeHost(
+	state: FakeState,
+	knobs: Record<string, string> = {},
+	limits: Partial<SandboxLimits> = {},
+): SandboxHost {
+	const context: SandboxDriverContext = {
+		containerCommand: FAKE_CONTAINER,
+		image: "polar-sandbox:test",
+		limits: { ...testLimits, ...limits },
+		environment: fakeEnvironment(state, knobs),
+		state: "unready",
+		owned: new Set(),
+		children: new Map(),
+		cliStopped: false,
+	};
+	return Object.assign(context, { driver: new AppleContainerDriver(context) });
+}
+
 export function fakeRuntime(
 	state: FakeState,
 	handle: SessionHandle,
 	knobs: Record<string, string> = {},
 	limits: Partial<SandboxLimits> = {},
 ): SandboxRuntime {
-	const context: SandboxDriverContext = {
-		containerCommand: FAKE_CONTAINER,
-		image: "polar-sandbox:test",
-		limits: { ...testLimits, ...limits },
-		environment: fakeEnvironment(state, knobs),
-		handle,
-		state: "open",
-		owned: new Set(),
-		children: new Map(),
-		cliStopped: false,
-	};
-	return Object.assign(context, {
-		inFlight: new Set<string>(),
-		running: new Set<RunningCall>(),
-		driver: new AppleContainerDriver(context),
-		activeSandbox: {},
-	});
+	return openRuntime(fakeHost(state, knobs, limits), handle);
 }
 
 export function startingRuntime(
@@ -156,6 +195,25 @@ export function fakeOciEnvironment(state: FakeState, knobs: Record<string, strin
 	return environment;
 }
 
+export function fakeOciHost(
+	state: FakeState,
+	knobs: Record<string, string> = {},
+	limits: Partial<SandboxLimits> = {},
+	driverOptions: OciDriverOptions = {},
+): SandboxHost {
+	const context: SandboxDriverContext = {
+		containerCommand: FAKE_OCI,
+		image: "polar-sandbox:test",
+		limits: { ...testLimits, ...limits },
+		environment: fakeOciEnvironment(state, knobs),
+		state: "unready",
+		owned: new Set(),
+		children: new Map(),
+		cliStopped: false,
+	};
+	return Object.assign(context, { driver: new OciDriver(context, driverOptions) });
+}
+
 export function fakeOciRuntime(
 	state: FakeState,
 	handle: SessionHandle,
@@ -163,23 +221,7 @@ export function fakeOciRuntime(
 	limits: Partial<SandboxLimits> = {},
 	driverOptions: OciDriverOptions = {},
 ): SandboxRuntime {
-	const context: SandboxDriverContext = {
-		containerCommand: FAKE_OCI,
-		image: "polar-sandbox:test",
-		limits: { ...testLimits, ...limits },
-		environment: fakeOciEnvironment(state, knobs),
-		handle,
-		state: "open",
-		owned: new Set(),
-		children: new Map(),
-		cliStopped: false,
-	};
-	return Object.assign(context, {
-		inFlight: new Set<string>(),
-		running: new Set<RunningCall>(),
-		driver: new OciDriver(context, driverOptions),
-		activeSandbox: {},
-	});
+	return openRuntime(fakeOciHost(state, knobs, limits, driverOptions), handle);
 }
 
 export function startingOciRuntime(
@@ -232,6 +274,27 @@ export function fakeK8sEnvironment(state: FakeState, knobs: Record<string, strin
 	return environment;
 }
 
+export function fakeK8sHost(
+	state: FakeState,
+	saDir: string,
+	knobs: Record<string, string> = {},
+	limits: Partial<SandboxLimits> = {},
+	driverOptions: K8sDriverOptions = {},
+): SandboxHost {
+	const environment = fakeK8sEnvironment(state, knobs);
+	const context: SandboxDriverContext = {
+		containerCommand: FAKE_KUBECTL,
+		image: environment.POLAR_SANDBOX_K8S_IMAGE || "polar-sandbox:test",
+		limits: { ...testLimits, ...limits },
+		environment,
+		state: "unready",
+		owned: new Set(),
+		children: new Map(),
+		cliStopped: false,
+	};
+	return Object.assign(context, { driver: new K8sDriver(context, { serviceAccountDir: saDir, ...driverOptions }) });
+}
+
 export function fakeK8sRuntime(
 	state: FakeState,
 	handle: SessionHandle,
@@ -240,37 +303,7 @@ export function fakeK8sRuntime(
 	limits: Partial<SandboxLimits> = {},
 	driverOptions: K8sDriverOptions = {},
 ): SandboxRuntime {
-	const environment = fakeK8sEnvironment(state, knobs);
-	const context: SandboxDriverContext = {
-		containerCommand: FAKE_KUBECTL,
-		image: environment.POLAR_SANDBOX_K8S_IMAGE || "polar-sandbox:test",
-		limits: { ...testLimits, ...limits },
-		environment,
-		handle,
-		state: "open",
-		owned: new Set(),
-		children: new Map(),
-		cliStopped: false,
-	};
-	return Object.assign(context, {
-		inFlight: new Set<string>(),
-		running: new Set<RunningCall>(),
-		driver: new K8sDriver(context, { serviceAccountDir: saDir, ...driverOptions }),
-		activeSandbox: {},
-	});
-}
-
-export function startingK8sRuntime(
-	state: FakeState,
-	handle: SessionHandle,
-	saDir: string,
-	knobs: Record<string, string> = {},
-	limits: Partial<SandboxLimits> = {},
-	driverOptions: K8sDriverOptions = {},
-): SandboxRuntime {
-	const runtime = fakeK8sRuntime(state, handle, saDir, knobs, limits, driverOptions);
-	runtime.state = "unready";
-	return runtime;
+	return openRuntime(fakeK8sHost(state, saDir, knobs, limits, driverOptions), handle);
 }
 
 export function recordedLines(name: string): string[] {
@@ -289,6 +322,15 @@ export function recordedLines(name: string): string[] {
 	}
 	for (const splitter of splitters.values()) splitter.end();
 	return lines;
+}
+
+export function processExists(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 export async function until(condition: () => boolean | Promise<boolean>, timeoutMs = 5000): Promise<void> {
