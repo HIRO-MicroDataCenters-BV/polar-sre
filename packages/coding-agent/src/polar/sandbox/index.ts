@@ -17,6 +17,7 @@ import { buildReply } from "./src/reply.ts";
 import { admitCall, shutdownRefusal } from "./src/runner.ts";
 import {
 	DATA_PATH,
+	type ImageSpec,
 	type OciEngineChoice,
 	type SandboxDriver,
 	type SandboxDriverChoice,
@@ -96,48 +97,34 @@ export interface RuntimeImageOptions {
 	platform?: NodeJS.Platform;
 }
 
-function createDriver(
-	context: SandboxDriverContext,
+function resolveDriverChoice(
 	environment: NodeJS.ProcessEnv,
 	options: RuntimeImageOptions,
-): SandboxDriver {
+): { name: SandboxDriverName } | { unsupported: string } {
 	const choice = options.driver ?? "auto";
 	const platform = options.platform ?? process.platform;
-	let driverName: SandboxDriverName | undefined;
 	if (choice === "auto") {
 		if (typeof environment.POLAR_SANDBOX_K8S_PVC === "string" && environment.POLAR_SANDBOX_K8S_PVC !== "") {
-			driverName = "k8s";
-		} else if (platform === "darwin") {
-			driverName = "apple-container";
-		} else if (platform === "linux") {
-			driverName = "oci";
-		} else {
-			return new UnsupportedSandboxDriver("oci", `unsupported platform "${platform}" for --sandbox-driver=auto`);
+			return { name: "k8s" };
 		}
-	} else if (choice === "apple-container" || choice === "oci" || choice === "k8s") {
-		driverName = choice;
-	} else {
-		return new UnsupportedSandboxDriver(
-			"oci",
-			`invalid --sandbox-driver "${String(choice)}"; expected auto, apple-container, oci, or k8s`,
-		);
+		if (platform === "darwin") return { name: "apple-container" };
+		if (platform === "linux") return { name: "oci" };
+		return { unsupported: `unsupported platform "${platform}" for --sandbox-driver=auto` };
 	}
-	if (driverName === "apple-container") {
-		context.containerCommand = "container";
-		return new AppleContainerDriver(context);
+	if (choice === "apple-container" || choice === "oci" || choice === "k8s") {
+		return { name: choice };
 	}
-	if (driverName === "oci") {
-		const engine = options.ociEngine ?? "auto";
-		context.containerCommand = engine === "docker" ? "docker" : "podman";
-		return new OciDriver(context, { engine, ociRuntime: options.ociRuntime });
-	}
-	context.containerCommand = "kubectl";
-	const k8sImage = (environment.POLAR_SANDBOX_K8S_IMAGE ?? "").trim();
-	if (!context.customImage && k8sImage !== "") {
-		context.image = k8sImage;
-	}
-	context.registryImage = undefined;
-	return new K8sDriver(context, options.k8sOptions);
+	return {
+		unsupported: `invalid --sandbox-driver "${String(choice)}"; expected auto, apple-container, oci, or k8s`,
+	};
+}
+
+function buildImageSpec(image: string, registryImage: string | undefined, customImage: boolean): ImageSpec {
+	const candidates =
+		!customImage && registryImage !== undefined && registryImage !== image ? [registryImage, image] : [image];
+	return registryImage === undefined
+		? { candidates, build: image }
+		: { candidates, pull: registryImage, build: image };
 }
 
 export function createHost(
@@ -149,19 +136,42 @@ export function createHost(
 	if (options.k8sPvc !== undefined && options.k8sPvc !== "") {
 		env.POLAR_SANDBOX_K8S_PVC = options.k8sPvc;
 	}
+	const resolved = resolveDriverChoice(env, options);
+	const customImage = options.customImage ?? image !== DEFAULT_IMAGE;
+	let containerCommand: string;
+	let effectiveImage = image;
+	let registryImage: string | undefined = options.registryImage ?? REGISTRY_IMAGE;
+	let createDriver: (context: SandboxDriverContext) => SandboxDriver;
+	if ("unsupported" in resolved) {
+		containerCommand = "container";
+		createDriver = () => new UnsupportedSandboxDriver("oci", resolved.unsupported);
+	} else if (resolved.name === "apple-container") {
+		containerCommand = "container";
+		createDriver = (context) => new AppleContainerDriver(context);
+	} else if (resolved.name === "oci") {
+		containerCommand = options.ociEngine === "docker" ? "docker" : "podman";
+		createDriver = (context) =>
+			new OciDriver(context, { engine: options.ociEngine ?? "auto", ociRuntime: options.ociRuntime });
+	} else {
+		const k8sImage = (env.POLAR_SANDBOX_K8S_IMAGE ?? "").trim();
+		containerCommand = "kubectl";
+		effectiveImage = !customImage && k8sImage !== "" ? k8sImage : image;
+		registryImage = undefined;
+		createDriver = (context) => new K8sDriver(context, { ...options.k8sOptions, customImage });
+	}
 	const context: SandboxDriverContext = {
-		containerCommand: "container",
-		image,
-		registryImage: options.registryImage ?? REGISTRY_IMAGE,
-		customImage: options.customImage ?? image !== DEFAULT_IMAGE,
+		containerCommand,
+		image: effectiveImage,
+		imageSpec: buildImageSpec(effectiveImage, registryImage, customImage),
 		limits: LIMITS,
 		environment: env,
 		state: "unready",
 		owned: new Set(),
-		children: new Map(),
+		children: new Set(),
 		cliStopped: false,
 	};
-	return Object.assign(context, { driver: createDriver(context, context.environment, options) });
+	const driver = createDriver(context);
+	return Object.assign(context, { driver });
 }
 
 function validate(params: RunCodeParams): string | undefined {

@@ -5,7 +5,6 @@ import { homedir } from "os";
 import { join } from "path";
 import { setTimeout as sleep } from "timers/promises";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { acquireSession, type SessionHandle } from "../../shared/session.ts";
 import { readManifest } from "../../shared/store.ts";
 import { createHost, DEFAULT_IMAGE } from "../index.ts";
 import { containerCommand } from "../src/cli.ts";
@@ -63,7 +62,6 @@ const limits: SandboxLimits = {
 };
 
 let root: string;
-let handle: SessionHandle;
 let session: SessionPaths;
 let runtime: SandboxRuntime;
 const timings: { step: string; ms: number }[] = [];
@@ -79,16 +77,16 @@ async function timed<T>(step: string, work: () => Promise<T>): Promise<T> {
 	}
 }
 
-function start(sessionHandle: SessionHandle): Promise<Activation> {
+function start(sessionId: string): Promise<Activation> {
 	const host = createHost(IMAGE, process.env, {
 		ociEngine: TEST_OCI_ENGINE,
 		ociRuntime: process.env.SANDBOX_TEST_OCI_RUNTIME,
 	});
 	host.limits = { ...limits };
-	return timed(`start ${sessionHandle.paths.sessionId}`, async () => {
+	return timed(`start ${sessionId}`, async () => {
 		const readiness = await checkReadiness(host, async () => BUILD_IMAGE_OPTION);
 		if (!readiness.ready) return readiness;
-		const activation = await activateRuntime(host, sessionHandle, readiness.image, warn);
+		const activation = await activateRuntime(host, sessionId, root, readiness.image, warn, root);
 		if (activation.ready) activation.runtime.state = "open";
 		return activation;
 	});
@@ -196,8 +194,10 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 	beforeAll(async () => {
 		await mkdir(join(homedir(), ".cache"), { recursive: true });
 		root = await mkdtemp(join(homedir(), ".cache", "polar-sandbox-real-"));
-		handle = await acquireSession(`real-${randomUUID().slice(0, 8)}`, root, root);
-		session = handle.paths;
+		const started = await start(`real-${randomUUID().slice(0, 8)}`);
+		if (!started.ready) throw new Error(started.message);
+		runtime = started.runtime;
+		session = runtime.handle.paths;
 		const lines: string[] = [];
 		for (let index = 0; index < 200_000; index += 1) {
 			const status = index % 7 === 0 ? 503 : 200;
@@ -206,9 +206,6 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 			);
 		}
 		await writeFile(join(session.outputDirectory, "k8s_logs-1.txt"), `${lines.join("\n")}\n`);
-		const started = await start(handle);
-		if (!started.ready) throw new Error(started.message);
-		runtime = started.runtime;
 		expect(runtime.state).toBe("open");
 		expect(runtime.owned.size).toBe(0);
 	}, 600_000);
@@ -222,7 +219,6 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 				Date.now() + 30_000,
 			);
 		}
-		if (handle !== undefined) await handle.release();
 		if (root !== undefined) await rm(root, { recursive: true, force: true });
 		console.table(timings);
 	});
@@ -535,13 +531,13 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 		const name = `polar-sandbox-${session.sessionId}-999`;
 		await sleeper(name);
 		expect(await containersOf(session.sessionId)).toEqual([name]);
-		expect(await timed("recovery", () => recoverLeftovers(runtime, warn))).toEqual({ clean: true });
+		expect(await timed("recovery", () => recoverLeftovers(runtime, session, warn))).toEqual({ clean: true });
 		expect(await containersOf(session.sessionId)).toEqual([]);
 	}, 60_000);
 
 	it("refuses to mount a volume with a foreign root label", async () => {
-		const foreignHandle = await acquireSession(`real-foreign-${randomUUID().slice(0, 8)}`, root, root);
-		const volume = workVolumeName(foreignHandle.paths.sessionId);
+		const foreignSessionId = `real-foreign-${randomUUID().slice(0, 8)}`;
+		const volume = workVolumeName(foreignSessionId);
 		try {
 			const createArgs =
 				runtime.driver.name === "apple-container"
@@ -551,7 +547,7 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 							"-s",
 							"64M",
 							"--label",
-							`polar-session=${foreignHandle.paths.sessionId}`,
+							`polar-session=${foreignSessionId}`,
 							"--label",
 							"polar-root=/elsewhere",
 							volume,
@@ -560,18 +556,19 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 							"volume",
 							"create",
 							"--label",
-							`polar-session=${foreignHandle.paths.sessionId}`,
+							`polar-session=${foreignSessionId}`,
 							"--label",
 							"polar-root=/elsewhere",
 							volume,
 						];
 			const created = await containerCommand(runtime, createArgs);
 			expect(created.code, created.stderr).toBe(0);
-			expect(await start(foreignHandle)).toEqual({
+			expect(await start(foreignSessionId)).toEqual({
 				ready: false,
 				message: `sandbox is off: the volume ${volume} is not this session's: its polar-root label is /elsewhere, expected ${root}`,
 				leftovers: [],
 			});
+			expect(await exists(join(root, foreignSessionId, "lock"))).toBe(false);
 			const inspected = await containerCommand(runtime, ["volume", "inspect", volume]);
 			expect(inspected.code).toBe(0);
 			const parsedVol =
@@ -579,24 +576,22 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 					? parseListing(inspected.stdout, "name")
 					: parseOciVolumes(inspected.stdout);
 			expect(parsedVol?.[0].labels).toMatchObject({ "polar-root": "/elsewhere" });
-			expect(await containersOf(foreignHandle.paths.sessionId)).toEqual([]);
+			expect(await containersOf(foreignSessionId)).toEqual([]);
 		} finally {
 			await runtime.driver.deleteWorkVolumes(
-				[{ name: volume, sessionId: foreignHandle.paths.sessionId }],
+				[{ name: volume, sessionId: foreignSessionId }],
 				session,
 				Date.now() + 30_000,
 			);
-			await foreignHandle.release();
 		}
 	}, 120_000);
 
 	it("deletes the container and closes the file at shutdown with a running program", async () => {
-		const ownHandle = await acquireSession(`real-shutdown-${randomUUID().slice(0, 8)}`, root, root);
-		const paths = ownHandle.paths;
-		const started = await start(ownHandle);
+		const started = await start(`real-shutdown-${randomUUID().slice(0, 8)}`);
+		if (!started.ready) throw new Error(started.message);
+		const closing = started.runtime;
+		const paths = closing.handle.paths;
 		try {
-			if (!started.ready) throw new Error(started.message);
-			const closing = started.runtime;
 			const request: SandboxRequest = { language: "bash", code: "echo started; sleep 60" };
 			const admitted = admitCall(closing, request, undefined, "call-1");
 			if (admitted === undefined) throw new Error("the call was not admitted");
@@ -627,7 +622,7 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 				session,
 				Date.now() + 30_000,
 			);
-			await ownHandle.release();
+			await closing.handle.release();
 		}
 	}, 120_000);
 });

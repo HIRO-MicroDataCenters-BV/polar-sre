@@ -26,6 +26,7 @@ import {
 	type SandboxStartOutcome,
 	type SessionPaths,
 	type SpawnCallOutcome,
+	type TrackedChild,
 	type VolumeFailure,
 } from "../types.ts";
 import {
@@ -241,12 +242,13 @@ export class AppleHotSandbox implements HotSandbox {
 			const [error] = await once(child, "error");
 			return { gone: (error as Error).message };
 		}
-		this.runtime.children.set(child, "run");
+		const tracked: TrackedChild = { kind: "run", kill: () => child.kill("SIGKILL") };
+		this.runtime.children.add(tracked);
 		let graceTimer: NodeJS.Timeout | undefined;
 		const closed = new Promise<number | null>((resolve) => {
 			child.once("close", (code) => {
 				clearTimeout(graceTimer);
-				this.runtime.children.delete(child);
+				this.runtime.children.delete(tracked);
 				resolve(code);
 			});
 		});
@@ -451,13 +453,14 @@ export class AppleContainerDriver implements SandboxDriver {
 			return { failed: (error as Error).message };
 		}
 		this.runtime.owned.add(name);
-		this.runtime.children.set(child, "run");
+		const tracked: TrackedChild = { kind: "run", kill: () => child.kill("SIGKILL") };
+		this.runtime.children.add(tracked);
 		child.stdin.on("error", () => {});
 		const stderr = new StreamCapture(COMMAND_STDERR_MAX_BYTES);
 		child.stderr.on("data", (chunk: Buffer) => stderr.retain(chunk));
 		const keepaliveClosed = new Promise<number | null>((resolve) => {
 			child.once("close", (code) => {
-				this.runtime.children.delete(child);
+				this.runtime.children.delete(tracked);
 				resolve(code);
 			});
 		});

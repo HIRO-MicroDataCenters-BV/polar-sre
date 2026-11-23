@@ -1,5 +1,4 @@
 import type { ExtensionContext, SessionShutdownEvent } from "../../../core/extensions/types.ts";
-import { acquireSession } from "../../shared/session.ts";
 import type { SandboxHost, SandboxRuntime, ShowImageOperation } from "./types.ts";
 import {
 	activateRuntime,
@@ -7,6 +6,7 @@ import {
 	type SelectMissingImage,
 	shutdownHost,
 	shutdownRuntime,
+	type Warn,
 } from "./workspace.ts";
 
 type SessionState = "off" | "activating" | "active" | "closing" | "closed";
@@ -15,48 +15,71 @@ export class SandboxController {
 	private readonly host: SandboxHost;
 	private readonly registerRunCode: (runtime: SandboxRuntime) => void;
 	private state: SessionState = "off";
-	private starting = false;
+	private pending: Promise<void> | undefined;
 	private runtime: SandboxRuntime | undefined;
+	private shutdownReason: SessionShutdownEvent["reason"] = "reload";
 
 	constructor(host: SandboxHost, registerRunCode: (runtime: SandboxRuntime) => void) {
 		this.host = host;
 		this.registerRunCode = registerRunCode;
 	}
 
-	async start(
-		ctx: ExtensionContext,
-		selectImage?: SelectMissingImage,
-		showOperation?: ShowImageOperation,
-	): Promise<void> {
-		this.starting = true;
-		try {
-			const readiness = await checkReadiness(this.host, selectImage, showOperation);
+	start(ctx: ExtensionContext, selectImage?: SelectMissingImage, showOperation?: ShowImageOperation): Promise<void> {
+		if (this.state !== "off" || this.pending !== undefined) return Promise.resolve();
+		const guardedSelect: SelectMissingImage | undefined =
+			selectImage === undefined
+				? undefined
+				: async (title, options) => (this.isAlive() ? selectImage(title, options) : undefined);
+		return this.track(async () => {
+			const readiness = await checkReadiness(this.host, guardedSelect, showOperation);
 			if (this.state !== "off") return;
 			if (readiness.ready) await this.activate(readiness.image, ctx);
-			else ctx.ui.notify(readiness.message, "warning");
-		} finally {
-			this.starting = false;
-		}
+			else this.notify(ctx, readiness.message, "warning");
+		});
 	}
 
 	async shutdown(reason: SessionShutdownEvent["reason"], ctx: ExtensionContext): Promise<void> {
 		if (this.state === "closing" || this.state === "closed") return;
 		this.state = "closing";
-		const warn = (message: string) => ctx.ui.notify(message, "warning");
+		this.shutdownReason = reason;
+		const warn = this.shutdownWarn(ctx);
 		if (this.runtime !== undefined) await shutdownRuntime(this.runtime, reason, warn);
-		else await shutdownHost(this.host, () => this.starting, reason, warn);
+		else await shutdownHost(this.host, () => this.pending !== undefined, reason, warn);
 		this.state = "closed";
 	}
 
+	private isAlive(): boolean {
+		return this.state !== "closing" && this.state !== "closed";
+	}
+
+	private track(operation: () => Promise<void>): Promise<void> {
+		const running = operation().finally(() => {
+			if (this.pending === running) this.pending = undefined;
+		});
+		this.pending = running;
+		return running;
+	}
+
+	private notify(ctx: ExtensionContext, message: string, level: "info" | "warning"): void {
+		if (this.isAlive()) ctx.ui.notify(message, level);
+	}
+
+	private shutdownWarn(ctx: ExtensionContext): Warn {
+		return (message) => {
+			if (this.state !== "closed") ctx.ui.notify(message, "warning");
+		};
+	}
+
 	private async activate(image: string, ctx: ExtensionContext): Promise<void> {
-		const warn = (message: string) => ctx.ui.notify(message, "warning");
+		const warn = (message: string) => this.notify(ctx, message, "warning");
 		this.state = "activating";
 		try {
-			const handle = await acquireSession(ctx.sessionManager.getSessionId(), ctx.cwd);
-			const activation = await activateRuntime(this.host, handle, image, warn);
+			const activation = await activateRuntime(this.host, ctx.sessionManager.getSessionId(), ctx.cwd, image, warn);
 			if (this.state !== "activating") {
-				// The session began to shut down meanwhile: nothing will use this runtime.
-				if (activation.ready) await handle.release();
+				// The session began to shut down meanwhile: close the late runtime and register nothing.
+				if (activation.ready) {
+					await shutdownRuntime(activation.runtime, this.shutdownReason, this.shutdownWarn(ctx));
+				}
 				return;
 			}
 			if (!activation.ready) {
@@ -68,9 +91,9 @@ export class SandboxController {
 			this.runtime = runtime;
 			this.state = "active";
 			if (runtime.driver.name === "oci" || runtime.driver.name === "k8s") {
-				ctx.ui.notify(`sandbox: ${runtime.driver.boundaryDescription}`, "info");
+				this.notify(ctx, `sandbox: ${runtime.driver.boundaryDescription}`, "info");
 			}
-			this.registerRunCode(runtime);
+			if (this.isAlive()) this.registerRunCode(runtime);
 		} finally {
 			if (this.state === "activating") this.state = "off";
 		}

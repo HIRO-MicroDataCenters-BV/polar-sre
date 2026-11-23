@@ -20,6 +20,7 @@ import {
 	type SandboxStartOutcome,
 	type SessionPaths,
 	type SpawnCallOutcome,
+	type TrackedChild,
 	type VolumeFailure,
 } from "../types.ts";
 import {
@@ -129,6 +130,7 @@ export interface K8sPodManifestOptions {
 
 export interface K8sDriverOptions {
 	serviceAccountDir?: string;
+	customImage?: boolean;
 }
 
 export function kubectlEnv(environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -460,7 +462,8 @@ export class K8sHotSandbox implements HotSandbox {
 			const [error] = await once(child, "error");
 			return { gone: (error as Error).message };
 		}
-		this.runtime.children.set(child, "run");
+		const tracked: TrackedChild = { kind: "run", kill: () => child.kill("SIGKILL") };
+		this.runtime.children.add(tracked);
 		const stderrOut = new PassThrough();
 		let stderrTail: Buffer = Buffer.alloc(0);
 		child.stderr.on("data", (chunk: Buffer) => {
@@ -477,7 +480,7 @@ export class K8sHotSandbox implements HotSandbox {
 		const closed = new Promise<number | null>((resolve) => {
 			child.once("close", (code) => {
 				clearTimeout(graceTimer);
-				this.runtime.children.delete(child);
+				this.runtime.children.delete(tracked);
 				const remaining = stripKubectlExecTrailer(stderrTail, code);
 				if (remaining.length > 0) {
 					stderrOut.write(remaining);
@@ -565,12 +568,14 @@ export class K8sDriver implements SandboxDriver {
 	readonly name = "k8s" as const;
 	private readonly runtime: SandboxDriverContext;
 	private readonly serviceAccountDir: string;
+	private readonly customImage: boolean;
 	private kubeconfigFile: string | undefined;
 	private namespaceValue = "polar";
 
 	constructor(runtime: SandboxDriverContext, options: K8sDriverOptions = {}) {
 		this.runtime = runtime;
 		this.serviceAccountDir = options.serviceAccountDir ?? DEFAULT_SERVICE_ACCOUNT_DIR;
+		this.customImage = options.customImage ?? false;
 	}
 
 	get pvcName(): string {
@@ -643,9 +648,7 @@ export class K8sDriver implements SandboxDriver {
 			["POLAR_SANDBOX_K8S_RUNTIME_CLASS", this.runtimeClass],
 			[
 				"POLAR_SANDBOX_K8S_IMAGE",
-				this.runtime.customImage
-					? this.runtime.image
-					: (this.runtime.environment.POLAR_SANDBOX_K8S_IMAGE ?? "").trim(),
+				this.customImage ? this.runtime.image : (this.runtime.environment.POLAR_SANDBOX_K8S_IMAGE ?? "").trim(),
 			],
 			["POLAR_SANDBOX_K8S_POD_NAME", this.podName],
 			["POLAR_SANDBOX_K8S_POD_UID", this.podUid],

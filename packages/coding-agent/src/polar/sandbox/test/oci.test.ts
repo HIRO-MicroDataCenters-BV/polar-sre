@@ -42,7 +42,6 @@ import {
 	fakeOciRuntime,
 	fakeState,
 	startedRuntime,
-	startingOciRuntime,
 	testLimits,
 } from "./fixtures.ts";
 
@@ -215,9 +214,13 @@ describe("OciDriver readiness & engine discovery", () => {
 	});
 
 	it("builds with --platform and --build-arg TARGETARCH when selected in UI", async () => {
-		const buildHost = fakeOciHost(state, { IMAGE_MISSING: "1" });
-		buildHost.image = "polar-sandbox:0.2";
-		buildHost.customImage = false;
+		const buildHost = fakeOciHost(
+			state,
+			{ IMAGE_MISSING: "1" },
+			{},
+			{},
+			{ candidates: ["polar-sandbox:0.2"], build: "polar-sandbox:0.2" },
+		);
 		expect(await checkReadiness(buildHost, async () => BUILD_IMAGE_OPTION)).toEqual({
 			ready: true,
 			image: "polar-sandbox:0.2",
@@ -235,8 +238,13 @@ describe("OciDriver readiness & engine discovery", () => {
 			imageDir,
 		]);
 
-		const disabled = fakeOciHost(state, { IMAGE_MISSING: "1" });
-		disabled.image = "polar-sandbox:0.2";
+		const disabled = fakeOciHost(
+			state,
+			{ IMAGE_MISSING: "1" },
+			{},
+			{},
+			{ candidates: ["polar-sandbox:0.2"], build: "polar-sandbox:0.2" },
+		);
 		expect(await checkReadiness(disabled, async () => DISABLE_SANDBOX_OPTION)).toEqual({
 			ready: false,
 			message:
@@ -256,7 +264,7 @@ describe("OciDriver arguments, volumes, and leftovers", () => {
 				{},
 				{ engine: "podman", hostUid: 501, hostGid: 501 },
 			),
-			handle,
+			session,
 			warn,
 		);
 		const podmanDriver = podmanRuntime.driver as OciDriver;
@@ -280,105 +288,88 @@ describe("OciDriver arguments, volumes, and leftovers", () => {
 
 		// 2. Rootless Podman without cpu controller delegated omits --cpus
 		state = await fakeState();
-		const noCpuHandle = await acquireSession("nocpu", root, artifactsRoot());
-		try {
-			const noCpuRuntime = await startedRuntime(
-				fakeOciHost(
-					state,
-					{ ENGINE: "podman", PODMAN_ROOTLESS: "1", CPU_DELEGATED: "0" },
-					{},
-					{ engine: "podman", ociRuntime: "krun" },
-				),
-				noCpuHandle,
-				warn,
-			);
-			const noCpuEcho = JSON.parse((await run("echo_argv", noCpuRuntime)).stdout) as { runArgv: string[] };
-			expect(noCpuEcho.runArgv).not.toContain("--cpus");
-			expect(noCpuEcho.runArgv[noCpuEcho.runArgv.indexOf("--runtime") + 1]).toBe("krun");
-			await shutdownRuntime(noCpuRuntime, "reload", warn);
-		} finally {
-			await noCpuHandle.release();
-		}
+		const noCpuRuntime = await startedRuntime(
+			fakeOciHost(
+				state,
+				{ ENGINE: "podman", PODMAN_ROOTLESS: "1", CPU_DELEGATED: "0" },
+				{},
+				{ engine: "podman", ociRuntime: "krun" },
+			),
+			{ sessionId: "nocpu", cwd: root, outputDirectory: join(artifactsRoot(), "nocpu") },
+			warn,
+		);
+		const noCpuEcho = JSON.parse((await run("echo_argv", noCpuRuntime)).stdout) as { runArgv: string[] };
+		expect(noCpuEcho.runArgv).not.toContain("--cpus");
+		expect(noCpuEcho.runArgv[noCpuEcho.runArgv.indexOf("--runtime") + 1]).toBe("krun");
+		await shutdownRuntime(noCpuRuntime, "reload", warn);
 
 		// 3. Standard Docker uses hostUid:hostGid and no --userns=keep-id
 		state = await fakeState();
-		const dockerHandle = await acquireSession("docker", root, artifactsRoot());
-		try {
-			const dockerRuntime = await startedRuntime(
-				fakeOciHost(state, { ENGINE: "docker" }, {}, { engine: "docker", hostUid: 1002, hostGid: 1003 }),
-				dockerHandle,
-				warn,
-			);
-			const dockerDriver = dockerRuntime.driver as OciDriver;
-			expect(dockerDriver.guestUser).toBe("1002:1003");
-			const calls = await state.calls();
-			const prep = calls.find((call) => call[0] === "run" && call.includes("chown")) ?? [];
-			expect(prep).not.toContain("--userns=keep-id:uid=1000,gid=1000");
-			expect(prep.slice(-3)).toEqual(["chown", "1002:1003", "/work"]);
+		const dockerRuntime = await startedRuntime(
+			fakeOciHost(state, { ENGINE: "docker" }, {}, { engine: "docker", hostUid: 1002, hostGid: 1003 }),
+			{ sessionId: "docker", cwd: root, outputDirectory: join(artifactsRoot(), "docker") },
+			warn,
+		);
+		const dockerDriver = dockerRuntime.driver as OciDriver;
+		expect(dockerDriver.guestUser).toBe("1002:1003");
+		const calls = await state.calls();
+		const prep = calls.find((call) => call[0] === "run" && call.includes("chown")) ?? [];
+		expect(prep).not.toContain("--userns=keep-id:uid=1000,gid=1000");
+		expect(prep.slice(-3)).toEqual(["chown", "1002:1003", "/work"]);
 
-			const dockerEcho = JSON.parse((await run("echo_argv", dockerRuntime)).stdout) as {
-				argv: string[];
-				runArgv: string[];
-			};
-			expect(dockerEcho.runArgv).not.toContain("--userns=keep-id:uid=1000,gid=1000");
-			expect(dockerEcho.runArgv[dockerEcho.runArgv.indexOf("--user") + 1]).toBe("1002:1003");
-			const name = dockerEcho.runArgv[dockerEcho.runArgv.indexOf("--name") + 1];
-			expect(dockerEcho.runArgv).toEqual(
-				ociSandboxArguments(dockerRuntime, name, dockerDriver.runOptions, dockerHandle.paths),
-			);
-			expect(dockerEcho.argv).toEqual(
-				ociExecArguments(name, "python", "1002:1003", dockerRuntime.limits.workMaxBytes),
-			);
-			expect(dockerEcho.runArgv).toContain(`polar-work-docker:/work:nocopy`);
-			await shutdownRuntime(dockerRuntime, "reload", warn);
-		} finally {
-			await dockerHandle.release();
-		}
+		const dockerEcho = JSON.parse((await run("echo_argv", dockerRuntime)).stdout) as {
+			argv: string[];
+			runArgv: string[];
+		};
+		expect(dockerEcho.runArgv).not.toContain("--userns=keep-id:uid=1000,gid=1000");
+		expect(dockerEcho.runArgv[dockerEcho.runArgv.indexOf("--user") + 1]).toBe("1002:1003");
+		const name = dockerEcho.runArgv[dockerEcho.runArgv.indexOf("--name") + 1];
+		expect(dockerEcho.runArgv).toEqual(
+			ociSandboxArguments(dockerRuntime, name, dockerDriver.runOptions, dockerRuntime.handle.paths),
+		);
+		expect(dockerEcho.argv).toEqual(ociExecArguments(name, "python", "1002:1003", dockerRuntime.limits.workMaxBytes));
+		expect(dockerEcho.runArgv).toContain(`polar-work-docker:/work:nocopy`);
+		await shutdownRuntime(dockerRuntime, "reload", warn);
 
 		// 4. gVisor (runsc or custom runtime name with /runsc path) omits --pids-limit in run and sets ulimit -u in exec
 		state = await fakeState();
-		const gvisorHandle = await acquireSession("gvisor", root, artifactsRoot());
-		try {
-			const gvisorRuntime = await startedRuntime(
-				fakeOciHost(
-					state,
-					{
-						ENGINE: "docker",
-						DOCKER_RUNTIMES_JSON: '{"runc":{"path":"runc"},"gvisor":{"path":"/usr/bin/runsc"}}',
-					},
-					{},
-					{ engine: "docker", ociRuntime: "gvisor", hostUid: 1000, hostGid: 1000 },
-				),
-				gvisorHandle,
-				warn,
-			);
-			const gvisorDriver = gvisorRuntime.driver as OciDriver;
-			expect(gvisorDriver.runOptions.gvisor).toBe(true);
+		const gvisorRuntime = await startedRuntime(
+			fakeOciHost(
+				state,
+				{
+					ENGINE: "docker",
+					DOCKER_RUNTIMES_JSON: '{"runc":{"path":"runc"},"gvisor":{"path":"/usr/bin/runsc"}}',
+				},
+				{},
+				{ engine: "docker", ociRuntime: "gvisor", hostUid: 1000, hostGid: 1000 },
+			),
+			{ sessionId: "gvisor", cwd: root, outputDirectory: join(artifactsRoot(), "gvisor") },
+			warn,
+		);
+		const gvisorDriver = gvisorRuntime.driver as OciDriver;
+		expect(gvisorDriver.runOptions.gvisor).toBe(true);
 
-			const gvisorEcho = JSON.parse((await run("echo_argv", gvisorRuntime)).stdout) as {
-				argv: string[];
-				runArgv: string[];
-			};
-			expect(gvisorEcho.runArgv).not.toContain("--pids-limit");
-			expect(gvisorEcho.runArgv[gvisorEcho.runArgv.indexOf("--runtime") + 1]).toBe("gvisor");
-			const gvisorName = gvisorEcho.runArgv[gvisorEcho.runArgv.indexOf("--name") + 1];
-			expect(gvisorEcho.runArgv).toEqual(
-				ociSandboxArguments(gvisorRuntime, gvisorName, gvisorDriver.runOptions, gvisorHandle.paths),
-			);
-			expect(gvisorEcho.argv).toEqual(
-				ociExecArguments(
-					gvisorName,
-					"python",
-					"1000:1000",
-					gvisorRuntime.limits.workMaxBytes,
-					gvisorRuntime.limits.processMax,
-				),
-			);
-			expect(gvisorEcho.argv.at(-1)?.startsWith(`ulimit -u ${gvisorRuntime.limits.processMax}\n`)).toBe(true);
-			await shutdownRuntime(gvisorRuntime, "reload", warn);
-		} finally {
-			await gvisorHandle.release();
-		}
+		const gvisorEcho = JSON.parse((await run("echo_argv", gvisorRuntime)).stdout) as {
+			argv: string[];
+			runArgv: string[];
+		};
+		expect(gvisorEcho.runArgv).not.toContain("--pids-limit");
+		expect(gvisorEcho.runArgv[gvisorEcho.runArgv.indexOf("--runtime") + 1]).toBe("gvisor");
+		const gvisorName = gvisorEcho.runArgv[gvisorEcho.runArgv.indexOf("--name") + 1];
+		expect(gvisorEcho.runArgv).toEqual(
+			ociSandboxArguments(gvisorRuntime, gvisorName, gvisorDriver.runOptions, gvisorRuntime.handle.paths),
+		);
+		expect(gvisorEcho.argv).toEqual(
+			ociExecArguments(
+				gvisorName,
+				"python",
+				"1000:1000",
+				gvisorRuntime.limits.workMaxBytes,
+				gvisorRuntime.limits.processMax,
+			),
+		);
+		expect(gvisorEcho.argv.at(-1)?.startsWith(`ulimit -u ${gvisorRuntime.limits.processMax}\n`)).toBe(true);
+		await shutdownRuntime(gvisorRuntime, "reload", warn);
 	});
 
 	it("recovers leftovers via ps -a + inspect and cleans up volumes of gone sessions", async () => {
@@ -400,8 +391,8 @@ describe("OciDriver arguments, volumes, and leftovers", () => {
 		await state.addVolume("polar-work-ended", ownLabels("ended"));
 		await state.addVolume("polar-work-gone", ownLabels("gone"));
 
-		const runtime = startingOciRuntime(state, handle);
-		expect(await recoverLeftovers(runtime, warn)).toEqual({ clean: true });
+		const host = fakeOciHost(state);
+		expect(await recoverLeftovers(host, session, warn)).toEqual({ clean: true });
 		expect(await state.containers()).toEqual(["polar-sandbox-live-1-bbbbbbbb"]);
 		expect((await state.volumes()).map((v) => v.name).sort()).toEqual([
 			"polar-work-current",
@@ -458,7 +449,7 @@ describe("OciDriver arguments, volumes, and leftovers", () => {
 		);
 
 		await state.addVolume("polar-work-current", ownLabels("current", "/foreign"));
-		expect(await ensureWorkVolume(startingOciRuntime(state, handle))).toEqual({
+		expect(await ensureWorkVolume(fakeOciHost(state), session)).toEqual({
 			reason: `the volume polar-work-current is not this session's: its polar-root label is /foreign, expected ${artifactsRoot()}`,
 		});
 	});

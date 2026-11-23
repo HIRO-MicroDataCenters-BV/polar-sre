@@ -2,7 +2,7 @@ import { spawn } from "child_process";
 import { tmpdir } from "os";
 import { StringDecoder } from "string_decoder";
 import { killProcessGroup } from "../../shared/process.ts";
-import type { CleanupError, CommandOutcome, SandboxDriverContext } from "./types.ts";
+import type { CleanupError, CommandOutcome, SandboxDriverContext, TrackedChild } from "./types.ts";
 
 export const CLI_STOPPED = "sandbox is stopping; no command starts";
 const COMMAND_OUTPUT_MAX_BYTES = 16 * 1024 * 1024;
@@ -63,7 +63,6 @@ export function containerCommand(
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		const { pid } = child;
-		if (pid !== undefined) runtime.children.set(child, "service");
 		const stdout = new StreamCapture(COMMAND_OUTPUT_MAX_BYTES);
 		const stderr = new StreamCapture(COMMAND_OUTPUT_MAX_BYTES);
 		const stdoutLines = options.onLine ? new LineSplitter(options.onLine) : undefined;
@@ -77,7 +76,7 @@ export function containerCommand(
 			clearTimeout(timer);
 			clearTimeout(graceTimer);
 			signal?.removeEventListener("abort", stop);
-			runtime.children.delete(child);
+			if (tracked !== undefined) runtime.children.delete(tracked);
 			stdoutLines?.end();
 			stderrLines?.end();
 			resolve({
@@ -88,16 +87,19 @@ export function containerCommand(
 				spawnError: error?.code,
 			});
 		};
+		const forceKill = () => {
+			if (pid !== undefined) killProcessGroup(pid, "SIGKILL");
+			// A process that left the group may still hold the pipes, and "close" would wait for it.
+			child.stdout.destroy();
+			child.stderr.destroy();
+			settle(child.exitCode);
+		};
+		const tracked: TrackedChild | undefined = pid === undefined ? undefined : { kind: "service", kill: forceKill };
+		if (tracked !== undefined) runtime.children.add(tracked);
 		const stop = () => {
 			if (pid === undefined || graceTimer !== undefined) return;
 			killProcessGroup(pid, "SIGTERM");
-			graceTimer = setTimeout(() => {
-				killProcessGroup(pid, "SIGKILL");
-				// A process that left the group may still hold the pipes, and "close" would wait for it.
-				child.stdout.destroy();
-				child.stderr.destroy();
-				settle(child.exitCode);
-			}, runtime.limits.killGraceMs);
+			graceTimer = setTimeout(forceKill, runtime.limits.killGraceMs);
 		};
 		signal?.addEventListener("abort", stop, { once: true });
 		const timer = setTimeout(

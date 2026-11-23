@@ -74,8 +74,8 @@ function artifactsRoot(): string {
 	return join(root, "artifacts");
 }
 
-function ownHandle(sessionId = "current"): Promise<SessionHandle> {
-	return acquireSession(sessionId, root, artifactsRoot());
+function sessionOf(sessionId: string): Pick<SessionPaths, "sessionId" | "cwd" | "outputDirectory"> {
+	return { sessionId, cwd: root, outputDirectory: join(artifactsRoot(), sessionId) };
 }
 
 function ownPodLabels(sessionId: string, rootPath = artifactsRoot()): Record<string, string> {
@@ -143,7 +143,9 @@ describe("K8sDriver selection & readiness", () => {
 
 	it("verifies required env vars, ServiceAccount credentials, self-pod UID, and runs NetworkPolicy probe after recoverLeftovers", async () => {
 		// 1. Happy path: checkRuntime (get pod polar-0) -> recoverLeftovers -> ensureWorkVolume (netprobe)
-		expect(await startHost(fakeK8sHost(state, saDir), handle, warn)).toMatchObject({ ready: true });
+		const happy = await startHost(fakeK8sHost(state, saDir), session, warn);
+		expect(happy).toMatchObject({ ready: true });
+		if (happy.ready) await happy.runtime.handle.release();
 		expect(await state.containers()).toEqual([]);
 		const calls = await state.calls();
 		expect(calls[0]?.slice(4)).toEqual(["get", "pod", "polar-0", "-o", "json"]);
@@ -165,7 +167,6 @@ describe("K8sDriver selection & readiness", () => {
 			"KUBERNETES_SERVICE_HOST",
 		]) {
 			const missing = fakeK8sHost(state, saDir, { [missingKey]: "" });
-			missing.customImage = false;
 			expect(await checkReadiness(missing), missingKey).toEqual({
 				ready: false,
 				message: `sandbox is off: ${missingKey} is not set`,
@@ -207,7 +208,7 @@ describe("K8sDriver selection & readiness", () => {
 
 		// 6a. /work volume not writable (exit 2) -> probe fails with /work reason
 		const workNotWritable = fakeK8sHost(state, saDir, { WORK_PROBE_FAIL: "1" });
-		expect(await startHost(workNotWritable, await ownHandle(), warn)).toEqual({
+		expect(await startHost(workNotWritable, session, warn)).toEqual({
 			ready: false,
 			message:
 				"sandbox is off: the /work volume (PVC polar-shared subPath work/current) is not writable by uid 1000",
@@ -217,7 +218,7 @@ describe("K8sDriver selection & readiness", () => {
 
 		// 6b. Unresolvable address (exit 3) -> probe fails with resolution reason
 		const gaiError = fakeK8sHost(state, saDir, { NETPOLICY_EXIT: "3" });
-		expect(await startHost(gaiError, await ownHandle(), warn)).toEqual({
+		expect(await startHost(gaiError, session, warn)).toEqual({
 			ready: false,
 			message: "sandbox is off: network policy probe failed: address 10.43.0.1:443 could not be resolved",
 			leftovers: [],
@@ -226,7 +227,7 @@ describe("K8sDriver selection & readiness", () => {
 
 		// 6c. NetworkPolicy allows egress -> probe in ensureWorkVolume fails and disables sandbox
 		const netAllowed = fakeK8sHost(state, saDir, { NETPOLICY_ALLOW: "1" });
-		expect(await startHost(netAllowed, await ownHandle(), warn)).toEqual({
+		expect(await startHost(netAllowed, session, warn)).toEqual({
 			ready: false,
 			message:
 				"sandbox is off: NetworkPolicy deny-all is not enforced: sandbox pod connected to 10.43.0.1:443 (exit 1)",
@@ -236,7 +237,7 @@ describe("K8sDriver selection & readiness", () => {
 
 		// 7. NetworkPolicy probe pod fails to delete -> returns CleanupError and manualDeleteCommand
 		const netDeleteFail = fakeK8sHost(state, saDir, { NETPROBE_DELETE_FAIL: "1" });
-		const netDeleteResult = await startHost(netDeleteFail, await ownHandle(), warn);
+		const netDeleteResult = await startHost(netDeleteFail, session, warn);
 		expect(netDeleteResult.ready).toBe(false);
 		if (!netDeleteResult.ready) {
 			expect(netDeleteResult.leftovers).toHaveLength(1);
@@ -250,71 +251,56 @@ describe("K8sDriver selection & readiness", () => {
 	});
 
 	it("turns off with the reason and creates no helper pod when the sessionId is not valid for Kubernetes", async () => {
-		const invalidHandle = await ownHandle("invalid session");
-		try {
-			expect(await startHost(fakeK8sHost(state, saDir), invalidHandle, warn)).toEqual({
-				ready: false,
-				message: 'sandbox is off: invalid sessionId "invalid session" for k8s sandbox',
-				leftovers: [],
-			});
-			expect(await state.manifests()).toEqual([]);
-		} finally {
-			await invalidHandle.release();
-		}
+		expect(await startHost(fakeK8sHost(state, saDir), sessionOf("invalid session"), warn)).toEqual({
+			ready: false,
+			message: 'sandbox is off: invalid sessionId "invalid session" for k8s sandbox',
+			leftovers: [],
+		});
+		expect(await state.manifests()).toEqual([]);
 	});
 
 	it("strips external KUBECONFIG from child env, formats IPv6 serviceHost, accepts dotted sessionIds, and reuses a single kubeconfig file in /tmp", async () => {
-		const dottedHandle = await acquireSession("session.v1.2", root, artifactsRoot());
-		try {
-			const host1 = fakeK8sHost(state, saDir, {
-				KUBECONFIG: "/evil/external/kubeconfig",
-				KUBERNETES_SERVICE_HOST: "fd00::1",
-			});
-			host1.environment.KUBECONFIG = "/evil/external/kubeconfig";
-			host1.environment.KUBERNETES_SERVICE_HOST = "fd00::1";
-			const runtime1 = await startedRuntime(host1, dottedHandle, warn);
+		const host1 = fakeK8sHost(state, saDir, {
+			KUBECONFIG: "/evil/external/kubeconfig",
+			KUBERNETES_SERVICE_HOST: "fd00::1",
+		});
+		host1.environment.KUBECONFIG = "/evil/external/kubeconfig";
+		host1.environment.KUBERNETES_SERVICE_HOST = "fd00::1";
+		const runtime1 = await startedRuntime(host1, sessionOf("session.v1.2"), warn);
 
-			const driver1 = runtime1.driver as K8sDriver;
-			const expectedTokenFile = join(saDir, "token");
-			const kc1 = JSON.parse(await readFile(driver1.kubeconfigPath, "utf8")) as {
-				clusters: { cluster: { server: string } }[];
-				users: { user: { tokenFile?: string; token?: string } }[];
-			};
-			expect(kc1.clusters[0].cluster.server).toBe("https://[fd00::1]:443");
-			expect(kc1.users[0].user.tokenFile).toBe(expectedTokenFile);
-			expect(kc1.users[0].user.token).toBeUndefined();
+		const driver1 = runtime1.driver as K8sDriver;
+		const expectedTokenFile = join(saDir, "token");
+		const kc1 = JSON.parse(await readFile(driver1.kubeconfigPath, "utf8")) as {
+			clusters: { cluster: { server: string } }[];
+			users: { user: { tokenFile?: string; token?: string } }[];
+		};
+		expect(kc1.clusters[0].cluster.server).toBe("https://[fd00::1]:443");
+		expect(kc1.users[0].user.tokenFile).toBe(expectedTokenFile);
+		expect(kc1.users[0].user.token).toBeUndefined();
 
-			const executed = await run("stdout:clean\nexit:0", runtime1);
-			expect(executed).toMatchObject({ status: "ok", exitCode: 0, stdout: "clean\n" });
-			expect(runtime1.activeSandbox.current?.name).toMatch(/^polar-sandbox-session-v1-2-1-[0-9a-f]{8}$/);
-			await shutdownRuntime(runtime1, "reload", warn);
+		const executed = await run("stdout:clean\nexit:0", runtime1);
+		expect(executed).toMatchObject({ status: "ok", exitCode: 0, stdout: "clean\n" });
+		expect(runtime1.activeSandbox.current?.name).toMatch(/^polar-sandbox-session-v1-2-1-[0-9a-f]{8}$/);
+		await shutdownRuntime(runtime1, "reload", warn);
 
-			// Rotate token and start a second session with the same saDir
-			await writeFile(expectedTokenFile, "rotated-k8s-sa-token\n");
-			const secondHandle = await acquireSession("session.v1.3", root, artifactsRoot());
-			try {
-				const host2 = fakeK8sHost(state, saDir);
-				host2.environment.KUBECONFIG = "/evil/external/kubeconfig";
-				const runtime2 = await startedRuntime(host2, secondHandle, warn);
-				const driver2 = runtime2.driver as K8sDriver;
-				expect(driver2.kubeconfigPath).toBe(driver1.kubeconfigPath);
-				const kc2 = JSON.parse(await readFile(driver2.kubeconfigPath, "utf8")) as {
-					users: { user: { tokenFile?: string; token?: string } }[];
-				};
-				expect(kc2.users[0].user.tokenFile).toBe(expectedTokenFile);
-				expect(kc2.users[0].user.token).toBeUndefined();
+		// Rotate token and start a second session with the same saDir
+		await writeFile(expectedTokenFile, "rotated-k8s-sa-token\n");
+		const host2 = fakeK8sHost(state, saDir);
+		host2.environment.KUBECONFIG = "/evil/external/kubeconfig";
+		const runtime2 = await startedRuntime(host2, sessionOf("session.v1.3"), warn);
+		const driver2 = runtime2.driver as K8sDriver;
+		expect(driver2.kubeconfigPath).toBe(driver1.kubeconfigPath);
+		const kc2 = JSON.parse(await readFile(driver2.kubeconfigPath, "utf8")) as {
+			users: { user: { tokenFile?: string; token?: string } }[];
+		};
+		expect(kc2.users[0].user.tokenFile).toBe(expectedTokenFile);
+		expect(kc2.users[0].user.token).toBeUndefined();
 
-				const dirHash = createHash("sha256").update(saDir).digest("hex").slice(0, 16);
-				const prefix = `polar-k8s-kubeconfig-${process.pid}-${dirHash}`;
-				const matchingTmpFiles = (await readdir(tmpdir())).filter((name) => name.startsWith(prefix));
-				expect(matchingTmpFiles).toEqual([basename(driver1.kubeconfigPath)]);
-				await shutdownRuntime(runtime2, "reload", warn);
-			} finally {
-				await secondHandle.release();
-			}
-		} finally {
-			await dottedHandle.release();
-		}
+		const dirHash = createHash("sha256").update(saDir).digest("hex").slice(0, 16);
+		const prefix = `polar-k8s-kubeconfig-${process.pid}-${dirHash}`;
+		const matchingTmpFiles = (await readdir(tmpdir())).filter((name) => name.startsWith(prefix));
+		expect(matchingTmpFiles).toEqual([basename(driver1.kubeconfigPath)]);
+		await shutdownRuntime(runtime2, "reload", warn);
 	});
 
 	it("returns Forbidden on kubectl logs in fake-kubectl.mjs", async () => {
@@ -329,127 +315,122 @@ describe("K8sDriver selection & readiness", () => {
 
 describe("K8sDriver pod specification, DNS-1123 naming, and GC", () => {
 	it("normalizes uppercase, underscore, and dot sessionIds to DNS-1123 pod names and sets full restricted securityContext", async () => {
-		const mixedHandle = await acquireSession("Session_A1", root, artifactsRoot());
-		try {
-			const runtime = await startedRuntime(fakeK8sHost(state, saDir), mixedHandle, warn);
+		const runtime = await startedRuntime(fakeK8sHost(state, saDir), sessionOf("Session_A1"), warn);
 
-			expect(containerName("Session_A1", "run_code-1")).toMatch(/^polar-sandbox-Session_A1-1-[0-9a-f]{8}$/);
-			expect(k8sPodName("Session_A1.v2")).toBe("session-a1-v2");
+		expect(containerName("Session_A1", "run_code-1")).toMatch(/^polar-sandbox-Session_A1-1-[0-9a-f]{8}$/);
+		expect(k8sPodName("Session_A1.v2")).toBe("session-a1-v2");
 
-			const first = await run("echo_argv", runtime);
-			expect(first.status).toBe("ok");
-			const echo = JSON.parse(first.stdout) as {
-				argv: string[];
-				manifest: {
-					apiVersion: string;
-					kind: string;
-					metadata: Record<string, unknown>;
-					spec: Record<string, unknown>;
-				};
-				codeLength: number;
+		const first = await run("echo_argv", runtime);
+		expect(first.status).toBe("ok");
+		const echo = JSON.parse(first.stdout) as {
+			argv: string[];
+			manifest: {
+				apiVersion: string;
+				kind: string;
+				metadata: Record<string, unknown>;
+				spec: Record<string, unknown>;
 			};
+			codeLength: number;
+		};
 
-			const name = runtime.activeSandbox.current?.name ?? "";
-			expect(name).toMatch(/^polar-sandbox-session-a1-1-[0-9a-f]{8}$/);
+		const name = runtime.activeSandbox.current?.name ?? "";
+		expect(name).toMatch(/^polar-sandbox-session-a1-1-[0-9a-f]{8}$/);
 
-			const driver = runtime.driver as K8sDriver;
-			expect(echo.argv).toEqual(
-				k8sExecArguments(
-					driver.kubeconfigPath,
-					"polar",
-					name,
-					"python",
-					runtime.limits.workMaxBytes,
-					runtime.limits.processMax,
-				),
-			);
+		const driver = runtime.driver as K8sDriver;
+		expect(echo.argv).toEqual(
+			k8sExecArguments(
+				driver.kubeconfigPath,
+				"polar",
+				name,
+				"python",
+				runtime.limits.workMaxBytes,
+				runtime.limits.processMax,
+			),
+		);
 
-			// Explicit verification of metadata, ownerReferences, volumeMounts, and restricted Pod Security fields
-			const { metadata, spec } = echo.manifest;
-			expect(echo.manifest.apiVersion).toBe("v1");
-			expect(echo.manifest.kind).toBe("Pod");
-			expect(metadata.name).toBe(name);
-			expect(metadata.namespace).toBe("polar");
-			expect(metadata.labels).toEqual({
-				"polar-sandbox": "true",
-				"polar-session": "Session_A1",
-				"polar-root-hash": rootHash(artifactsRoot()),
-			});
-			expect(metadata.annotations).toEqual({
-				"polar-root": artifactsRoot(),
-			});
-			expect(metadata.ownerReferences).toEqual([
-				{
-					apiVersion: "v1",
-					kind: "Pod",
-					name: "polar-0",
-					uid: "uid-polar-0",
-				},
-			]);
+		// Explicit verification of metadata, ownerReferences, volumeMounts, and restricted Pod Security fields
+		const { metadata, spec } = echo.manifest;
+		expect(echo.manifest.apiVersion).toBe("v1");
+		expect(echo.manifest.kind).toBe("Pod");
+		expect(metadata.name).toBe(name);
+		expect(metadata.namespace).toBe("polar");
+		expect(metadata.labels).toEqual({
+			"polar-sandbox": "true",
+			"polar-session": "Session_A1",
+			"polar-root-hash": rootHash(artifactsRoot()),
+		});
+		expect(metadata.annotations).toEqual({
+			"polar-root": artifactsRoot(),
+		});
+		expect(metadata.ownerReferences).toEqual([
+			{
+				apiVersion: "v1",
+				kind: "Pod",
+				name: "polar-0",
+				uid: "uid-polar-0",
+			},
+		]);
 
-			expect(spec.runtimeClassName).toBe("gvisor");
-			expect(spec.nodeSelector).toEqual({ "kubernetes.io/hostname": "polar-node-1" });
-			expect(spec.restartPolicy).toBe("Never");
-			expect(spec.terminationGracePeriodSeconds).toBe(1);
-			expect(spec.automountServiceAccountToken).toBe(false);
-			expect(spec.enableServiceLinks).toBe(false);
-			expect(spec.securityContext).toEqual({
-				runAsUser: 1000,
-				runAsGroup: 1000,
-				runAsNonRoot: true,
-				fsGroup: 1000,
-				fsGroupChangePolicy: "OnRootMismatch",
-				seccompProfile: { type: "RuntimeDefault" },
-			});
-			const container = (spec.containers as Record<string, unknown>[])[0];
-			expect(container.image).toBe(runtime.image);
-			expect(container.command).toEqual(["bash", "-c", KEEPALIVE_COMMAND]);
-			expect(container.stdin).toBe(true);
-			expect(container.workingDir).toBe("/work");
-			expect(container.securityContext).toEqual({
-				runAsNonRoot: true,
-				runAsUser: 1000,
-				runAsGroup: 1000,
-				allowPrivilegeEscalation: false,
-				readOnlyRootFilesystem: true,
-				capabilities: { drop: ["ALL"] },
-				seccompProfile: { type: "RuntimeDefault" },
-			});
-			expect(container.volumeMounts).toEqual([
-				{
-					name: "shared",
-					mountPath: "/data",
-					subPath: "artifacts/Session_A1",
-					readOnly: true,
-				},
-				{
-					name: "shared",
-					mountPath: "/work",
-					subPath: "work/Session_A1",
-				},
-				{
-					name: "tmp",
-					mountPath: "/tmp",
-				},
-			]);
-			expect(spec.volumes).toEqual([
-				{
-					name: "shared",
-					persistentVolumeClaim: { claimName: "polar-shared" },
-				},
-				{
-					name: "tmp",
-					emptyDir: { medium: "Memory", sizeLimit: "16Mi" },
-				},
-			]);
-			expect(echo.argv.at(-1)).toContain(`ulimit -u ${runtime.limits.processMax}\n`);
-			expect(launcher("bash", { workMaxBytes: 4096, processMax: 256 }).startsWith("ulimit -u 256\n")).toBe(true);
+		expect(spec.runtimeClassName).toBe("gvisor");
+		expect(spec.nodeSelector).toEqual({ "kubernetes.io/hostname": "polar-node-1" });
+		expect(spec.restartPolicy).toBe("Never");
+		expect(spec.terminationGracePeriodSeconds).toBe(1);
+		expect(spec.automountServiceAccountToken).toBe(false);
+		expect(spec.enableServiceLinks).toBe(false);
+		expect(spec.securityContext).toEqual({
+			runAsUser: 1000,
+			runAsGroup: 1000,
+			runAsNonRoot: true,
+			fsGroup: 1000,
+			fsGroupChangePolicy: "OnRootMismatch",
+			seccompProfile: { type: "RuntimeDefault" },
+		});
+		const container = (spec.containers as Record<string, unknown>[])[0];
+		expect(container.image).toBe(runtime.image);
+		expect(container.command).toEqual(["bash", "-c", KEEPALIVE_COMMAND]);
+		expect(container.stdin).toBe(true);
+		expect(container.workingDir).toBe("/work");
+		expect(container.securityContext).toEqual({
+			runAsNonRoot: true,
+			runAsUser: 1000,
+			runAsGroup: 1000,
+			allowPrivilegeEscalation: false,
+			readOnlyRootFilesystem: true,
+			capabilities: { drop: ["ALL"] },
+			seccompProfile: { type: "RuntimeDefault" },
+		});
+		expect(container.volumeMounts).toEqual([
+			{
+				name: "shared",
+				mountPath: "/data",
+				subPath: "artifacts/Session_A1",
+				readOnly: true,
+			},
+			{
+				name: "shared",
+				mountPath: "/work",
+				subPath: "work/Session_A1",
+			},
+			{
+				name: "tmp",
+				mountPath: "/tmp",
+			},
+		]);
+		expect(spec.volumes).toEqual([
+			{
+				name: "shared",
+				persistentVolumeClaim: { claimName: "polar-shared" },
+			},
+			{
+				name: "tmp",
+				emptyDir: { medium: "Memory", sizeLimit: "16Mi" },
+			},
+		]);
+		expect(echo.argv.at(-1)).toContain(`ulimit -u ${runtime.limits.processMax}\n`);
+		expect(launcher("bash", { workMaxBytes: 4096, processMax: 256 }).startsWith("ulimit -u 256\n")).toBe(true);
 
-			await shutdownRuntime(runtime, "reload", warn);
-			expect(await state.containers()).toEqual([]);
-		} finally {
-			await mixedHandle.release();
-		}
+		await shutdownRuntime(runtime, "reload", warn);
+		expect(await state.containers()).toEqual([]);
 	});
 
 	it("fails fast on fatal pod waiting reasons (ImagePullBackOff / ErrImagePull) and cleans up on AbortSignal during waitForPodRunning", async () => {
@@ -521,7 +502,9 @@ describe("K8sDriver pod specification, DNS-1123 naming, and GC", () => {
 		await state.addVolume("polar-work-gone", { "polar-session": "gone" });
 		await state.addVolume("polar-work-gone-locked", { "polar-session": "gone-locked" });
 
-		expect(await startHost(fakeK8sHost(state, saDir), handle, warn)).toMatchObject({ ready: true });
+		const recovered = await startHost(fakeK8sHost(state, saDir), session, warn);
+		expect(recovered).toMatchObject({ ready: true });
+		if (recovered.ready) await recovered.runtime.handle.release();
 
 		expect(await state.containers()).toEqual(["polar-sandbox-collision-1-ffffffff", "polar-sandbox-live-1-bbbbbbbb"]);
 		expect((await state.volumes()).map((v) => v.name).sort()).toEqual([

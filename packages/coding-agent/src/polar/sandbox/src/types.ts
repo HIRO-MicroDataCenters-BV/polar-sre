@@ -1,4 +1,3 @@
-import type { ChildProcess } from "child_process";
 import type { Readable, Writable } from "stream";
 import type { FinalizedStderr, FinalizedStdout } from "../../shared/reply.ts";
 import type { SessionHandle, SessionPaths } from "../../shared/session.ts";
@@ -36,6 +35,17 @@ export type RuntimeState = "unready" | "open" | "closing" | "closed";
 
 export type ChildKind = "run" | "service";
 
+export interface TrackedChild {
+	readonly kind: ChildKind;
+	kill(): void;
+}
+
+export interface ImageSpec {
+	readonly candidates: readonly string[];
+	readonly pull?: string;
+	readonly build: string;
+}
+
 export interface RunningCall {
 	stop(): void;
 }
@@ -52,13 +62,12 @@ export interface ActiveSandboxHolder {
 export interface SandboxDriverContext {
 	containerCommand: string;
 	image: string;
-	registryImage?: string;
-	customImage?: boolean;
+	readonly imageSpec: ImageSpec;
 	limits: SandboxLimits;
 	environment: NodeJS.ProcessEnv;
 	state: RuntimeState;
 	owned: Set<string>;
-	children: Map<ChildProcess, ChildKind>;
+	children: Set<TrackedChild>;
 	cliStopped: boolean;
 }
 
