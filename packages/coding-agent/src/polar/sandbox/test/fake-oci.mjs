@@ -126,7 +126,8 @@ function signalRecorded(record, signal) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function handleInfo() {
+async function handleInfo() {
+	if (knob("INFO_HANG") === "1") await sleep(60_000);
 	if (engine === "podman" && knob("PODMAN_FAIL") === "1") {
 		fail(knob("PODMAN_FAIL_MESSAGE", "podman info failed"));
 	}
@@ -401,7 +402,7 @@ async function main() {
 	const [command, ...args] = argv;
 	switch (command) {
 		case "info":
-			handleInfo();
+			await handleInfo();
 			break;
 		case "image": {
 			const [sub, img] = args;

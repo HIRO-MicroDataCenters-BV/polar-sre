@@ -1,10 +1,9 @@
 import { stat } from "fs/promises";
 import { join } from "path";
 import { setTimeout as sleep } from "timers/promises";
-import { getSandboxImageDir } from "../../../config.ts";
 import type { SessionShutdownEvent } from "../../../core/extensions/types.ts";
 import { acquireSession, type SessionLiveness, sessionLiveness } from "../../shared/session.ts";
-import { commandFailure, deadlineAfter, describeCleanupErrors, remainingMs } from "./cli.ts";
+import { deadlineAfter, describeCleanupErrors, remainingMs } from "./cli.ts";
 import { artifactsRootOf, LEFTOVERS_STAYED, START_ENDED } from "./driver.ts";
 import type {
 	Activation,
@@ -12,24 +11,17 @@ import type {
 	CleanupError,
 	NotReady,
 	OwnedResource,
-	Readiness,
 	RunningCall,
 	SandboxDriverContext,
 	SandboxHost,
 	SandboxRuntime,
 	SessionPaths,
-	ShowImageOperation,
 	VolumeFailure,
 } from "./types.ts";
 
 export type Recovery = { clean: true } | { leftover: CleanupError[] } | { unknown: string };
 
 export type Warn = (message: string) => void;
-export type SelectMissingImage = (title: string, options: string[]) => Promise<string | undefined>;
-
-export const DOWNLOAD_IMAGE_OPTION = "Download prebuilt image";
-export const BUILD_IMAGE_OPTION = "Build sandbox image locally (~2 min)";
-export const DISABLE_SANDBOX_OPTION = "Disable sandbox for this session";
 
 const TICKET_POLL_MS = 20;
 
@@ -72,55 +64,6 @@ async function directoryMissing(root: string, sessionId: string): Promise<boolea
 function leftoverNotice(host: SandboxHost, errors: CleanupError[]): string {
 	const names = errors.map((error) => error.container);
 	return `${describeCleanupErrors(errors)} could not be deleted; delete them with: ${host.driver.manualDeleteCommand(names)}`;
-}
-
-export async function checkReadiness(
-	host: SandboxHost,
-	selectImage?: SelectMissingImage,
-	showOperation?: ShowImageOperation,
-): Promise<Readiness> {
-	const status = await host.driver.checkRuntime(deadlineAfter(host));
-	if (!status.ready) return off(host, status.reason);
-	const { candidates, pull, build } = host.imageSpec;
-	let lastReason = "";
-	for (const candidate of candidates) {
-		const inspected = await host.driver.inspectImage(candidate, deadlineAfter(host));
-		if (inspected.found) return { ready: true, image: candidate };
-		lastReason = inspected.reason;
-	}
-	if (selectImage === undefined) {
-		return off(host, `image ${build} is not installed (${lastReason})`);
-	}
-	if (host.state !== "unready") return off(host, START_ENDED);
-	const options =
-		pull !== undefined
-			? [DOWNLOAD_IMAGE_OPTION, BUILD_IMAGE_OPTION, DISABLE_SANDBOX_OPTION]
-			: [BUILD_IMAGE_OPTION, DISABLE_SANDBOX_OPTION];
-	const choice = await selectImage(`Sandbox image ${build} is not installed`, options);
-	if (host.state !== "unready") return off(host, START_ENDED);
-	if (choice === DOWNLOAD_IMAGE_OPTION && pull !== undefined) {
-		const operation = showOperation?.("download");
-		const pulled = await host.driver
-			.pullImage(pull, undefined, operation ? (line) => operation.output(line) : undefined)
-			.finally(() => operation?.end());
-		if (host.state !== "unready") return off(host, START_ENDED);
-		if (pulled.code !== 0) {
-			return off(host, `image pull ${pull} failed: ${commandFailure(pulled)}`);
-		}
-		return { ready: true, image: pull };
-	}
-	if (choice === BUILD_IMAGE_OPTION) {
-		const operation = showOperation?.("build");
-		const built = await host.driver
-			.buildImage(build, getSandboxImageDir(), undefined, operation ? (line) => operation.output(line) : undefined)
-			.finally(() => operation?.end());
-		if (host.state !== "unready") return off(host, START_ENDED);
-		if (built.code !== 0) {
-			return off(host, `image build ${build} failed: ${commandFailure(built)}`);
-		}
-		return { ready: true, image: build };
-	}
-	return off(host, `image ${build} is not installed (${lastReason})`);
 }
 
 /** Acquires the session lock and attaches the session to the host only after activation succeeds. */

@@ -6,17 +6,15 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getSandboxImageDir } from "../../../config.ts";
 import type { ExtensionContext } from "../../../core/extensions/types.ts";
 import { acquireSession, type SessionHandle } from "../../shared/session.ts";
-import { createHost, DEFAULT_IMAGE } from "../index.ts";
+import { createHost, DEFAULT_IMAGE, REGISTRY_IMAGE } from "../index.ts";
 import { containerCommand } from "../src/cli.ts";
 import { SandboxController } from "../src/controller.ts";
+import { BUILD_IMAGE_OPTION, DOWNLOAD_IMAGE_OPTION } from "../src/driver.ts";
+import { buildImageSpec, probeHost } from "../src/host.ts";
 import { admitCall } from "../src/runner.ts";
 import type { SandboxDriver, SandboxRuntime, SessionPaths } from "../src/types.ts";
 import {
 	activateRuntime,
-	BUILD_IMAGE_OPTION,
-	checkReadiness,
-	DISABLE_SANDBOX_OPTION,
-	DOWNLOAD_IMAGE_OPTION,
 	ensureWorkVolume,
 	recoverLeftovers,
 	shutdownHost,
@@ -104,131 +102,236 @@ function runChildren(runtime: SandboxRuntime) {
 }
 
 describe("start", () => {
-	it("offers run_code only with a running runtime and the image", async () => {
-		expect(await checkReadiness(fakeHost(state))).toEqual({ ready: true, image: "polar-sandbox:test" });
-		expect(await checkReadiness(fakeHost(state, { STATUS_EXIT: "1" }))).toEqual({
-			ready: false,
-			message: "sandbox is off: container system status failed: exit 1",
-			leftovers: [],
+	it("diagnoses Apple container observations across all 5 table rows and version cases", async () => {
+		// Row 1: ENOENT -> runtime_missing with manual instructions on stage 3a
+		const missingBinHost = fakeHost(state);
+		missingBinHost.containerCommand = join(root, "nonexistent-container-bin");
+		expect(await probeHost(missingBinHost)).toEqual({
+			kind: "runtime_missing",
+			reason: "Apple container is not installed",
+			remedy: {
+				kind: "manual",
+				instructions: [
+					"Install Apple container (>= 1.5.0) from https://github.com/apple/container/releases",
+					"container system start --enable-kernel-install",
+				],
+			},
 		});
-		expect(await checkReadiness(fakeHost(state, { IMAGE_MISSING: "1" }))).toEqual({
-			ready: false,
-			message:
-				"sandbox is off: image polar-sandbox:test is not installed (container image inspect polar-sandbox:test failed: Error: image polar-sandbox:test not found)",
-			leftovers: [],
+
+		// Row 2: exit != 0, status is "unregistered" or "not running", container --version >= 1.5.0 -> runtime_not_ready
+		expect(await probeHost(fakeHost(state, { SERVICE_STOPPED: "1" }))).toEqual({
+			kind: "runtime_not_ready",
+			reason: "Apple container service is not running",
+			remedy: {
+				kind: "manual",
+				instructions: ["container system start --enable-kernel-install"],
+			},
+		});
+		expect(await probeHost(fakeHost(state, { SERVICE_STATUS: "not running", STATUS_EXIT: "1" }))).toEqual({
+			kind: "runtime_not_ready",
+			reason: "Apple container service is not running",
+			remedy: {
+				kind: "manual",
+				instructions: ["container system start --enable-kernel-install"],
+			},
+		});
+
+		// Row 3: running, client and server version >= 1.5.0 -> ready with version (including client/server mismatch)
+		expect(await probeHost(fakeHost(state))).toEqual({
+			kind: "ready",
+			image: "polar-sandbox:test",
+			version: "1.7.1",
+		});
+		expect(await probeHost(fakeHost(state, { CLIENT_VERSION: "1.7.1", SERVER_VERSION: "1.5.0" }))).toEqual({
+			kind: "ready",
+			image: "polar-sandbox:test",
+			version: "1.7.1 (service 1.5.0)",
+		});
+
+		// Row 4: client or server version < 1.5.0 (including unreadable JSON when container --version < 1.5.0)
+		const outdatedUpdateInstructions = [
+			"Update Apple container to >= 1.5.0 from https://github.com/apple/container/releases",
+			"container system stop && container system start --enable-kernel-install",
+		];
+		expect(await probeHost(fakeHost(state, { CLIENT_VERSION: "1.4.2", SERVER_VERSION: "1.4.2" }))).toEqual({
+			kind: "runtime_not_ready",
+			reason: "Apple container >= 1.5.0 is required (found 1.4.2)",
+			remedy: { kind: "manual", instructions: outdatedUpdateInstructions },
+		});
+		expect(await probeHost(fakeHost(state, { CLIENT_VERSION: "1.7.1", SERVER_VERSION: "1.4.2" }))).toEqual({
+			kind: "runtime_not_ready",
+			reason: "Apple container >= 1.5.0 is required (client 1.7.1, service 1.4.2)",
+			remedy: { kind: "manual", instructions: outdatedUpdateInstructions },
+		});
+		expect(await probeHost(fakeHost(state, { STATUS_GARBAGE: "1", CLIENT_VERSION: "1.4.2" }))).toEqual({
+			kind: "runtime_not_ready",
+			reason: "Apple container >= 1.5.0 is required (found 1.4.2)",
+			remedy: { kind: "manual", instructions: outdatedUpdateInstructions },
+		});
+		expect(await probeHost(fakeHost(state, { SERVICE_STOPPED: "1", CLIENT_VERSION: "1.4.2" }))).toEqual({
+			kind: "runtime_not_ready",
+			reason: "Apple container >= 1.5.0 is required (found 1.4.2)",
+			remedy: { kind: "manual", instructions: outdatedUpdateInstructions },
+		});
+
+		// Row 5: timeout, unknown status, or unreadable JSON when CLI >= 1.5.0 (or error of container --version)
+		expect(await probeHost(fakeHost(state, { STATUS_HANG: "1" }, { commandTimeoutMs: 100 }))).toEqual({
+			kind: "probe_failed",
+			reason: "container system status failed: timed out",
+		});
+		expect(await probeHost(fakeHost(state, { SERVICE_STATUS: "degraded" }))).toEqual({
+			kind: "probe_failed",
+			reason: 'container system status reported unknown status "degraded"',
+		});
+		expect(await probeHost(fakeHost(state, { STATUS_GARBAGE: "1", CLIENT_VERSION: "1.7.1" }))).toEqual({
+			kind: "probe_failed",
+			reason: "container system status returned unreadable JSON",
+		});
+		expect(await probeHost(fakeHost(state, { STATUS_GARBAGE: "1", VERSION_FAIL: "1" }))).toEqual({
+			kind: "probe_failed",
+			reason: "container system status returned unreadable JSON",
+		});
+		expect(await probeHost(fakeHost(state, { SERVICE_STOPPED: "1", VERSION_FAIL: "1" }))).toEqual({
+			kind: "probe_failed",
+			reason: "container --version failed: Error: version failed",
+		});
+		expect(
+			await probeHost(fakeHost(state, { SERVICE_STOPPED: "1", VERSION_STDOUT: "container CLI (no semver)" })),
+		).toEqual({
+			kind: "probe_failed",
+			reason: "container --version returned an unreadable version",
+		});
+		expect(
+			await probeHost(
+				fakeHost(state, {
+					STATUS_JSON: JSON.stringify({ status: "running", client: { version: "1.7.1" } }),
+				}),
+			),
+		).toEqual({
+			kind: "probe_failed",
+			reason: "container system status returned missing version fields",
+		});
+		expect(
+			await probeHost(
+				fakeHost(state, {
+					STATUS_JSON: JSON.stringify({
+						status: "running",
+						client: { version: "main-abc" },
+						server: { version: "1.7.1" },
+					}),
+				}),
+			),
+		).toEqual({
+			kind: "probe_failed",
+			reason: 'container system status returned an unreadable version "main-abc"',
+		});
+		expect(
+			await probeHost(
+				fakeHost(state, {
+					STATUS_JSON: JSON.stringify({
+						status: "running",
+						client: { version: "1.7.1" },
+						server: { version: "dev-snapshot" },
+					}),
+				}),
+			),
+		).toEqual({
+			kind: "probe_failed",
+			reason: 'container system status returned an unreadable version "dev-snapshot"',
+		});
+		expect(await probeHost(fakeHost(state, { STATUS_EXIT: "1" }))).toEqual({
+			kind: "probe_failed",
+			reason: "container system status failed: Error: exit 1",
 		});
 	});
 
-	it("checks host.imageSpec.candidates in order and prompts from host.imageSpec only when UI is present", async () => {
+	it("resolves image candidates and remedies across all 4 flag combinations and without a registry image", async () => {
 		const registry = "registry.example/polar-sandbox@sha256:deadbeef";
-		const local = "polar-sandbox:0.2";
+		const custom = "custom.example/polar-sandbox:1.0";
+		const local = DEFAULT_IMAGE;
+		const imageDir = getSandboxImageDir();
+		const hostFor = (image: string, knobs: Record<string, string>, options = {}) => {
+			const h = createHost(image, fakeEnvironment(state, knobs), { driver: "apple-container", ...options });
+			h.containerCommand = FAKE_CONTAINER;
+			h.limits = { ...testLimits };
+			return h;
+		};
 
-		// 1. Single candidate in imageSpec is checked alone even if pull is set
-		const custom = fakeHost(
-			state,
-			{ IMAGE_PRESENT: "custom:1" },
-			{},
-			{ candidates: ["custom:1"], pull: registry, build: "custom:1" },
-		);
-		expect(await checkReadiness(custom)).toEqual({ ready: true, image: "custom:1" });
-		expect(await callsOf("image")).toEqual([["image", "inspect", "custom:1"]]);
-
-		// 2. Default image with registryImage present in cache uses registryImage without checking local tag
-		state = await fakeState();
-		const cachedRegistry = fakeHost(
-			state,
-			{ IMAGE_PRESENT: registry },
-			{},
-			{ candidates: [registry, local], pull: registry, build: local },
-		);
-		expect(await checkReadiness(cachedRegistry)).toEqual({ ready: true, image: registry });
-		expect(await callsOf("image")).toEqual([["image", "inspect", registry]]);
-
-		// 3. Default image with registryImage absent falls back to local tag in cache without prompting
-		state = await fakeState();
-		const cachedLocal = fakeHost(
-			state,
-			{ IMAGE_PRESENT: local },
-			{},
-			{ candidates: [registry, local], pull: registry, build: local },
-		);
-		let prompted = false;
-		expect(
-			await checkReadiness(cachedLocal, async () => {
-				prompted = true;
-				return undefined;
-			}),
-		).toEqual({ ready: true, image: local });
-		expect(prompted).toBe(false);
+		// 1. No flags: searches REGISTRY_IMAGE then polar-sandbox:0.2, pulls REGISTRY_IMAGE, builds polar-sandbox:0.2
+		const row1 = hostFor(local, { IMAGE_PRESENT: local });
+		expect(row1.imageSpec).toEqual({ candidates: [REGISTRY_IMAGE, local], pull: REGISTRY_IMAGE, build: local });
+		expect(await probeHost(row1)).toEqual({ kind: "ready", image: local, version: "1.7.1" });
 		expect(await callsOf("image")).toEqual([
-			["image", "inspect", registry],
+			["image", "inspect", REGISTRY_IMAGE as string],
 			["image", "inspect", local],
 		]);
 
-		// 4. Missing image with UI and no registryImage offers Build and Disable (no Download)
+		// 2. --sandbox-registry-image R: searches R then polar-sandbox:0.2, pulls R, builds polar-sandbox:0.2
 		state = await fakeState();
-		const buildHost = fakeHost(state, { IMAGE_MISSING: "1" }, {}, { candidates: [local], build: local });
-		let seenOptions: string[] = [];
-		expect(
-			await checkReadiness(buildHost, async (_title, options) => {
-				seenOptions = options;
-				return BUILD_IMAGE_OPTION;
-			}),
-		).toEqual({ ready: true, image: local });
-		expect(seenOptions).toEqual([BUILD_IMAGE_OPTION, DISABLE_SANDBOX_OPTION]);
-		const imageDir = getSandboxImageDir();
+		const row2 = hostFor(local, { IMAGE_PRESENT: registry }, { registryImage: registry });
+		expect(row2.imageSpec).toEqual({ candidates: [registry, local], pull: registry, build: local });
+		expect(await probeHost(row2)).toEqual({ kind: "ready", image: registry, version: "1.7.1" });
+		expect(await callsOf("image")).toEqual([["image", "inspect", registry]]);
+
+		// 3. --sandbox-image C: searches C, pulls C (does NOT pull built-in REGISTRY_IMAGE), builds C
+		state = await fakeState();
+		const row3 = hostFor(custom, { IMAGE_MISSING: "1" }, { customImage: true });
+		expect(row3.imageSpec).toEqual({ candidates: [custom], pull: custom, build: custom });
+		const diag3 = await probeHost(row3);
+		expect(diag3.kind).toBe("image_missing");
+		if (diag3.kind !== "image_missing" || diag3.remedy.kind !== "actions") throw new Error("expected image actions");
+		expect(diag3.remedy.actions.map((a) => [a.id, a.label, a.preview])).toEqual([
+			["pull_image", DOWNLOAD_IMAGE_OPTION, [`container image pull --arch arm64 ${custom}`]],
+			[
+				"build_image",
+				BUILD_IMAGE_OPTION,
+				[`container build --arch arm64 --tag ${custom} --file ${join(imageDir, "Containerfile")} ${imageDir}`],
+			],
+		]);
+		const shownLines: string[] = [];
+		const pullResult3 = await diag3.remedy.actions[0].run({
+			signal: new AbortController().signal,
+			onLine: (line) => shownLines.push(line),
+		});
+		expect(pullResult3).toEqual({ ok: true });
+		expect(shownLines).toEqual([`pulled ${custom}`]);
+		expect((await callsOf("image")).at(-1)).toEqual(["image", "pull", "--arch", "arm64", custom]);
+		expect(await probeHost(row3)).toEqual({ kind: "ready", image: custom, version: "1.7.1" });
+
+		// 4. Both flags (--sandbox-image C and --sandbox-registry-image R): searches R then C, pulls R, builds C
+		state = await fakeState();
+		const row4 = hostFor(custom, { IMAGE_MISSING: "1" }, { customImage: true, registryImage: registry });
+		expect(row4.imageSpec).toEqual({ candidates: [registry, custom], pull: registry, build: custom });
+		const diag4 = await probeHost(row4);
+		expect(diag4.kind).toBe("image_missing");
+		if (diag4.kind !== "image_missing" || diag4.remedy.kind !== "actions") throw new Error("expected image actions");
+		expect(diag4.remedy.actions.map((a) => [a.id, a.preview])).toEqual([
+			["pull_image", [`container image pull --arch arm64 ${registry}`]],
+			[
+				"build_image",
+				[`container build --arch arm64 --tag ${custom} --file ${join(imageDir, "Containerfile")} ${imageDir}`],
+			],
+		]);
+		expect(await diag4.remedy.actions[0].run({ signal: new AbortController().signal })).toEqual({ ok: true });
+		// After pulling R, probing row4 finds R in candidates [R, C]
+		expect(await probeHost(row4)).toEqual({ kind: "ready", image: registry, version: "1.7.1" });
+
+		// 5. Without registry image: offers only build_image
+		state = await fakeState();
+		expect(buildImageSpec(local)).toEqual({ candidates: [local], build: local });
+		const noRegistryHost = fakeHost(state, { IMAGE_MISSING: "1" }, {}, buildImageSpec(local));
+		expect(noRegistryHost.imageSpec).toEqual({ candidates: [local], build: local });
+		const diagNoReg = await probeHost(noRegistryHost);
+		expect(diagNoReg.kind).toBe("image_missing");
+		if (diagNoReg.kind !== "image_missing" || diagNoReg.remedy.kind !== "actions") {
+			throw new Error("expected image actions");
+		}
+		expect(diagNoReg.remedy.actions.map((a) => [a.id, a.label])).toEqual([["build_image", BUILD_IMAGE_OPTION]]);
+		expect(await diagNoReg.remedy.actions[0].run({ signal: new AbortController().signal })).toEqual({ ok: true });
 		expect(await callsOf("build")).toEqual([
 			["build", "--arch", "arm64", "--tag", local, "--file", join(imageDir, "Containerfile"), imageDir],
 		]);
-
-		// 5. Missing image with UI and registryImage offers Download, Build, and Disable
-		state = await fakeState();
-		const pullHost = fakeHost(
-			state,
-			{ IMAGE_MISSING: "1" },
-			{},
-			{ candidates: [registry, local], pull: registry, build: local },
-		);
-		expect(
-			await checkReadiness(pullHost, async (_title, options) => {
-				seenOptions = options;
-				return DOWNLOAD_IMAGE_OPTION;
-			}),
-		).toEqual({ ready: true, image: registry });
-		expect(seenOptions).toEqual([DOWNLOAD_IMAGE_OPTION, BUILD_IMAGE_OPTION, DISABLE_SANDBOX_OPTION]);
-		expect(pullHost.image).toBe(local);
-		expect((await callsOf("image")).at(-1)).toEqual(["image", "pull", "--arch", "arm64", registry]);
-
-		// 5a. Forwards pull output lines to showOperation and calls end()
-		state = await fakeState();
-		const shownHost = fakeHost(
-			state,
-			{ IMAGE_MISSING: "1" },
-			{},
-			{ candidates: [registry, local], pull: registry, build: local },
-		);
-		const shown: string[] = [];
-		expect(
-			await checkReadiness(
-				shownHost,
-				async () => DOWNLOAD_IMAGE_OPTION,
-				(kind) => {
-					shown.push(`start ${kind}`);
-					return { output: (line) => shown.push(line), end: () => shown.push("end") };
-				},
-			),
-		).toEqual({ ready: true, image: registry });
-		expect(shown).toEqual(["start download", `pulled ${registry}`, "end"]);
-
-		// 6. Selecting Disable turns off sandbox
-		state = await fakeState();
-		const disabled = fakeHost(state, { IMAGE_MISSING: "1" }, {}, { candidates: [local], build: local });
-		expect(await checkReadiness(disabled, async () => DISABLE_SANDBOX_OPTION)).toEqual({
-			ready: false,
-			message:
-				"sandbox is off: image polar-sandbox:0.2 is not installed (container image inspect polar-sandbox:0.2 failed: Error: image polar-sandbox:0.2 not found)",
-			leftovers: [],
-		});
+		expect(await probeHost(noRegistryHost)).toEqual({ kind: "ready", image: local, version: "1.7.1" });
 	});
 
 	it("treats an unknown listing as not established", async () => {
@@ -495,11 +598,11 @@ describe("start", () => {
 		host.containerCommand = FAKE_CONTAINER;
 		host.limits = { ...testLimits };
 
-		const readiness = await checkReadiness(host);
-		expect(readiness).toEqual({ ready: true, image: registry });
-		if (!readiness.ready) throw new Error("expected ready");
+		const diagnosis = await probeHost(host);
+		expect(diagnosis).toEqual({ kind: "ready", image: registry, version: "1.7.1" });
+		if (diagnosis.kind !== "ready") throw new Error("expected ready");
 
-		const activation = await activateRuntime(host, "failed-prep", root, readiness.image, warn, artifactsRoot());
+		const activation = await activateRuntime(host, "failed-prep", root, diagnosis.image, warn, artifactsRoot());
 		expect(activation).toEqual({
 			ready: false,
 			message: "sandbox is off: the /work volume could not be prepared: exit 1",
@@ -510,7 +613,7 @@ describe("start", () => {
 		expect(await exists(join(artifactsRoot(), "failed-prep", "lock"))).toBe(false);
 
 		host.environment.FAKE_CONTAINER_IMAGE_PRESENT = local;
-		expect(await checkReadiness(host)).toEqual({ ready: true, image: local });
+		expect(await probeHost(host)).toEqual({ kind: "ready", image: local, version: "1.7.1" });
 	});
 });
 
@@ -718,7 +821,9 @@ describe("shutdown", () => {
 			const gatedDriver: SandboxDriver = {
 				name: baseDriver.name,
 				boundaryDescription: baseDriver.boundaryDescription,
-				checkRuntime: (deadlineAt) => baseDriver.checkRuntime(deadlineAt),
+				supportsServiceAutoStart: baseDriver.supportsServiceAutoStart,
+				probeRuntime: () => baseDriver.probeRuntime(),
+				imageRemedy: (spec) => baseDriver.imageRemedy(spec),
 				inspectImage: (image, deadlineAt) => baseDriver.inspectImage(image, deadlineAt),
 				pullImage: (image, signal, onLine) => baseDriver.pullImage(image, signal, onLine),
 				buildImage: (image, contextDir, signal, onLine) => baseDriver.buildImage(image, contextDir, signal, onLine),
@@ -782,7 +887,7 @@ describe("shutdown", () => {
 		}
 	});
 
-	it("does not prompt for a missing image after shutdown begins during inspectImage", async () => {
+	it("does not notify or set status for a missing image after shutdown begins during inspectImage", async () => {
 		for (const afterBudget of [true, false]) {
 			await rm(state.directory, { recursive: true, force: true });
 			state = await fakeState();
@@ -796,7 +901,9 @@ describe("shutdown", () => {
 			host.driver = {
 				name: baseDriver.name,
 				boundaryDescription: baseDriver.boundaryDescription,
-				checkRuntime: (deadlineAt) => baseDriver.checkRuntime(deadlineAt),
+				supportsServiceAutoStart: baseDriver.supportsServiceAutoStart,
+				probeRuntime: () => baseDriver.probeRuntime(),
+				imageRemedy: (spec) => baseDriver.imageRemedy(spec),
 				inspectImage: async (image, deadlineAt) => {
 					inspectEntered = true;
 					await inspectGate;
@@ -817,14 +924,13 @@ describe("shutdown", () => {
 
 			let invalidated = false;
 			const uiNotices: string[] = [];
-			let selectCalls = 0;
+			const uiStatuses: [string, string | undefined][] = [];
 			const ui = {
 				notify: (message: string) => {
 					uiNotices.push(message);
 				},
-				select: async () => {
-					selectCalls += 1;
-					return undefined;
+				setStatus: (key: string, text: string | undefined) => {
+					uiStatuses.push([key, text]);
 				},
 			};
 			const ctx = {
@@ -839,11 +945,7 @@ describe("shutdown", () => {
 			} as unknown as ExtensionContext;
 
 			const controller = new SandboxController(host, () => {});
-			const selectImage =
-				ctx.hasUI && typeof ctx.ui.select === "function"
-					? (title: string, options: string[]) => ctx.ui.select(title, options)
-					: undefined;
-			const starting = controller.start(ctx, selectImage);
+			const starting = controller.start(ctx);
 			await until(() => inspectEntered);
 
 			if (afterBudget) {
@@ -857,8 +959,8 @@ describe("shutdown", () => {
 			}
 
 			await expect(starting).resolves.toBeUndefined();
-			expect(selectCalls).toBe(0);
 			expect(uiNotices).toEqual([]);
+			expect(uiStatuses).toEqual([]);
 			expect(await callsOf("image")).toEqual([["image", "inspect", "polar-sandbox:test"]]);
 		}
 	});
@@ -886,7 +988,9 @@ describe("shutdown", () => {
 				host.driver = {
 					name: baseDriver.name,
 					boundaryDescription: baseDriver.boundaryDescription,
-					checkRuntime: (deadlineAt) => baseDriver.checkRuntime(deadlineAt),
+					supportsServiceAutoStart: baseDriver.supportsServiceAutoStart,
+					probeRuntime: () => baseDriver.probeRuntime(),
+					imageRemedy: (spec) => baseDriver.imageRemedy(spec),
 					inspectImage: (image, deadlineAt) => baseDriver.inspectImage(image, deadlineAt),
 					pullImage: (image, signal, onLine) => baseDriver.pullImage(image, signal, onLine),
 					buildImage: (image, contextDir, signal, onLine) =>

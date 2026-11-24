@@ -12,12 +12,11 @@ import {
 	UnsupportedSandboxDriver,
 	WORK_PATH,
 } from "./src/driver.ts";
-import { showImageOperation } from "./src/indicator.ts";
+import { buildImageSpec } from "./src/host.ts";
 import { buildReply } from "./src/reply.ts";
 import { admitCall, shutdownRefusal } from "./src/runner.ts";
 import {
 	DATA_PATH,
-	type ImageSpec,
 	type OciEngineChoice,
 	type SandboxDriver,
 	type SandboxDriverChoice,
@@ -27,7 +26,6 @@ import {
 	type SandboxLimits,
 	type SandboxRequest,
 	type SandboxRuntime,
-	type ShowImageOperation,
 	type ToolReply,
 } from "./src/types.ts";
 
@@ -119,14 +117,6 @@ function resolveDriverChoice(
 	};
 }
 
-function buildImageSpec(image: string, registryImage: string | undefined, customImage: boolean): ImageSpec {
-	const candidates =
-		!customImage && registryImage !== undefined && registryImage !== image ? [registryImage, image] : [image];
-	return registryImage === undefined
-		? { candidates, build: image }
-		: { candidates, pull: registryImage, build: image };
-}
-
 export function createHost(
 	image: string,
 	environment: NodeJS.ProcessEnv,
@@ -140,7 +130,11 @@ export function createHost(
 	const customImage = options.customImage ?? image !== DEFAULT_IMAGE;
 	let containerCommand: string;
 	let effectiveImage = image;
-	let registryImage: string | undefined = options.registryImage ?? REGISTRY_IMAGE;
+	let imageSpec = buildImageSpec(effectiveImage, {
+		customImage,
+		registryImage: options.registryImage,
+		defaultRegistryImage: REGISTRY_IMAGE,
+	});
 	let createDriver: (context: SandboxDriverContext) => SandboxDriver;
 	if ("unsupported" in resolved) {
 		containerCommand = "container";
@@ -156,13 +150,13 @@ export function createHost(
 		const k8sImage = (env.POLAR_SANDBOX_K8S_IMAGE ?? "").trim();
 		containerCommand = "kubectl";
 		effectiveImage = !customImage && k8sImage !== "" ? k8sImage : image;
-		registryImage = undefined;
+		imageSpec = { candidates: [effectiveImage], build: effectiveImage };
 		createDriver = (context) => new K8sDriver(context, { ...options.k8sOptions, customImage });
 	}
 	const context: SandboxDriverContext = {
 		containerCommand,
 		image: effectiveImage,
-		imageSpec: buildImageSpec(effectiveImage, registryImage, customImage),
+		imageSpec,
 		limits: LIMITS,
 		environment: env,
 		state: "unready",
@@ -279,14 +273,7 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
 		});
 		const controller = new SandboxController(host, (runtime) => pi.registerTool(createRunCodeTool(runtime)));
 		current = controller;
-		const selectImage =
-			ctx.hasUI && typeof ctx.ui.select === "function"
-				? (title: string, options: string[]) => ctx.ui.select(title, options)
-				: undefined;
-		// RPC mode sets hasUI=true for select dialogs, but component widgets are supported only in TUI mode.
-		const showOperation: ShowImageOperation | undefined =
-			ctx.mode === "tui" ? (kind) => showImageOperation(ctx.ui, kind) : undefined;
-		await controller.start(ctx, selectImage, showOperation);
+		await controller.start(ctx);
 	});
 
 	pi.on("session_shutdown", async (event, ctx) => {

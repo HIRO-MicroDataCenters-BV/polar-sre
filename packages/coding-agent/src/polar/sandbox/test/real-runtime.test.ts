@@ -22,6 +22,7 @@ import {
 	sessionLabels,
 	workVolumeName,
 } from "../src/driver.ts";
+import { formatDiagnosisWarning, probeHost } from "../src/host.ts";
 import { buildReply } from "../src/reply.ts";
 import { admitCall } from "../src/runner.ts";
 import type {
@@ -32,13 +33,7 @@ import type {
 	SandboxRuntime,
 	SessionPaths,
 } from "../src/types.ts";
-import {
-	activateRuntime,
-	BUILD_IMAGE_OPTION,
-	checkReadiness,
-	recoverLeftovers,
-	shutdownRuntime,
-} from "../src/workspace.ts";
+import { activateRuntime, recoverLeftovers, shutdownRuntime } from "../src/workspace.ts";
 
 const REAL = process.env.SANDBOX_REAL_RUNTIME === "1";
 const IMAGE = process.env.POLAR_SANDBOX_IMAGE ?? DEFAULT_IMAGE;
@@ -84,9 +79,19 @@ function start(sessionId: string): Promise<Activation> {
 	});
 	host.limits = { ...limits };
 	return timed(`start ${sessionId}`, async () => {
-		const readiness = await checkReadiness(host, async () => BUILD_IMAGE_OPTION);
-		if (!readiness.ready) return readiness;
-		const activation = await activateRuntime(host, sessionId, root, readiness.image, warn, root);
+		let diagnosis = await probeHost(host);
+		if (diagnosis.kind === "image_missing" && diagnosis.remedy.kind === "actions") {
+			const build = diagnosis.remedy.actions.find((action) => action.id === "build_image");
+			if (build !== undefined) {
+				const built = await build.run({ signal: new AbortController().signal });
+				if (!built.ok) return { ready: false, message: `sandbox is off: ${built.reason}`, leftovers: [] };
+				diagnosis = await probeHost(host);
+			}
+		}
+		if (diagnosis.kind !== "ready") {
+			return { ready: false, message: formatDiagnosisWarning(diagnosis), leftovers: [] };
+		}
+		const activation = await activateRuntime(host, sessionId, root, diagnosis.image, warn, root);
 		if (activation.ready) activation.runtime.state = "open";
 		return activation;
 	});

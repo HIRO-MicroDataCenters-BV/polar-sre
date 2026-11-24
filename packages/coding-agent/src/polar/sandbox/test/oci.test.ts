@@ -9,13 +9,16 @@ import { discardOutputFile, readExcerpt } from "../../shared/store.ts";
 import { createHost } from "../index.ts";
 import { deadlineAfter } from "../src/cli.ts";
 import {
+	BUILD_IMAGE_OPTION,
 	cleanupOciContainer,
+	DOWNLOAD_IMAGE_OPTION,
 	KEEPALIVE_COMMAND,
 	launcher,
 	type OciDriver,
 	ociExecArguments,
 	ociInspectionOf,
 	ociSandboxArguments,
+	parseEngineInfo,
 	parseOciContainers,
 	parseOciNames,
 	parseOciVolumes,
@@ -23,17 +26,11 @@ import {
 	SCRUB_SCRIPT,
 	WORK_LIMIT_EXIT_CODE,
 } from "../src/driver.ts";
+import { probeHost } from "../src/host.ts";
 import { buildReply } from "../src/reply.ts";
 import { admitCall } from "../src/runner.ts";
 import type { SandboxLanguage, SandboxResult, SandboxRuntime, SessionPaths } from "../src/types.ts";
-import {
-	BUILD_IMAGE_OPTION,
-	checkReadiness,
-	DISABLE_SANDBOX_OPTION,
-	ensureWorkVolume,
-	recoverLeftovers,
-	shutdownRuntime,
-} from "../src/workspace.ts";
+import { ensureWorkVolume, recoverLeftovers, shutdownRuntime } from "../src/workspace.ts";
 import {
 	FAKE_OCI,
 	type FakeState,
@@ -95,7 +92,7 @@ async function takeOutput(result: SandboxResult): Promise<string> {
 }
 
 describe("OciDriver readiness & engine discovery", () => {
-	it("prefers podman in auto mode, falls back to docker when podman is unavailable, and reports boundaryDescription", async () => {
+	it("prefers podman in auto mode, falls back to docker when podman is unavailable or unsuitable, and reports boundaryDescription and version", async () => {
 		const bin = join(root, "bin");
 		await mkdir(bin, { recursive: true });
 		const dockerWrapper = join(bin, "docker");
@@ -112,7 +109,7 @@ describe("OciDriver readiness & engine discovery", () => {
 			ociEngine: "auto",
 		});
 		dockerHost.limits = { ...testLimits };
-		expect(await checkReadiness(dockerHost)).toMatchObject({ ready: true });
+		expect(await probeHost(dockerHost)).toMatchObject({ kind: "ready", version: "28.5.2" });
 		expect(dockerHost.driver.boundaryDescription).toBe("oci (docker/runc, shared kernel)");
 		expect(dockerHost.containerCommand).toBe("docker");
 
@@ -128,17 +125,47 @@ describe("OciDriver readiness & engine discovery", () => {
 			ociEngine: "auto",
 		});
 		podmanHost.limits = { ...testLimits };
-		expect(await checkReadiness(podmanHost)).toMatchObject({ ready: true });
+		expect(await probeHost(podmanHost)).toMatchObject({ kind: "ready", version: "5.4.0" });
 		expect(podmanHost.driver.boundaryDescription).toBe("oci (podman/crun, shared kernel)");
 		expect(podmanHost.containerCommand).toBe("podman");
 
+		// 2b. Unsuitable podman (< 4.3) in PATH with working docker -> auto falls back to docker
+		await writeFile(
+			podmanWrapper,
+			`#!/bin/sh\nexport FAKE_OCI_ENGINE=podman\nexport FAKE_OCI_PODMAN_VERSION=4.2.1\nexec "${process.execPath}" "${FAKE_OCI}" "$@"\n`,
+		);
+		await chmod(podmanWrapper, 0o755);
+		const fallbackHost = createHost("polar-sandbox:0.2", envOnlyDocker, {
+			driver: "oci",
+			ociEngine: "auto",
+		});
+		fallbackHost.limits = { ...testLimits };
+		expect(await probeHost(fallbackHost)).toMatchObject({ kind: "ready", version: "28.5.2" });
+		expect(fallbackHost.driver.boundaryDescription).toBe("oci (docker/runc, shared kernel)");
+		expect(fallbackHost.containerCommand).toBe("docker");
+
+		// 2c. Hanging podman info gets its own commandTimeoutMs and does not starve docker info in auto mode
+		await writeFile(
+			podmanWrapper,
+			`#!/bin/sh\nexport FAKE_OCI_ENGINE=podman\nexport FAKE_OCI_INFO_HANG=1\nexec "${process.execPath}" "${FAKE_OCI}" "$@"\n`,
+		);
+		await chmod(podmanWrapper, 0o755);
+		const hangingPodmanHost = createHost("polar-sandbox:0.2", envOnlyDocker, {
+			driver: "oci",
+			ociEngine: "auto",
+		});
+		hangingPodmanHost.limits = { ...testLimits, commandTimeoutMs: 1200 };
+		expect(await probeHost(hangingPodmanHost)).toMatchObject({ kind: "ready", version: "28.5.2" });
+		expect(hangingPodmanHost.driver.boundaryDescription).toBe("oci (docker/runc, shared kernel)");
+		expect(hangingPodmanHost.containerCommand).toBe("docker");
+
 		// 3. Explicit --sandbox-oci-runtime=krun or runsc omits "shared kernel"
 		const krunHost = fakeOciHost(state, { ENGINE: "podman" }, {}, { engine: "podman", ociRuntime: "krun" });
-		expect(await checkReadiness(krunHost)).toMatchObject({ ready: true });
+		expect(await probeHost(krunHost)).toMatchObject({ kind: "ready", version: "5.4.0" });
 		expect(krunHost.driver.boundaryDescription).toBe("oci (podman/krun)");
 
 		const runscHost = fakeOciHost(state, { ENGINE: "docker" }, {}, { engine: "docker", ociRuntime: "runsc" });
-		expect(await checkReadiness(runscHost)).toMatchObject({ ready: true });
+		expect(await probeHost(runscHost)).toMatchObject({ kind: "ready", version: "28.5.2" });
 		expect(runscHost.driver.boundaryDescription).toBe("oci (docker/runsc)");
 		expect((runscHost.driver as OciDriver).runOptions.gvisor).toBe(true);
 
@@ -152,7 +179,7 @@ describe("OciDriver readiness & engine discovery", () => {
 			{},
 			{ engine: "docker", ociRuntime: "gvisor-custom" },
 		);
-		expect(await checkReadiness(customAliasHost)).toMatchObject({ ready: true });
+		expect(await probeHost(customAliasHost)).toMatchObject({ kind: "ready", version: "28.5.2" });
 		expect(customAliasHost.driver.boundaryDescription).toBe("oci (docker/gvisor-custom)");
 		expect((customAliasHost.driver as OciDriver).runOptions.gvisor).toBe(true);
 
@@ -163,17 +190,60 @@ describe("OciDriver readiness & engine discovery", () => {
 			{},
 			{ engine: "podman" },
 		);
-		expect(await checkReadiness(podmanAliasHost)).toMatchObject({ ready: true });
+		expect(await probeHost(podmanAliasHost)).toMatchObject({ kind: "ready", version: "5.4.0" });
 		expect(podmanAliasHost.driver.boundaryDescription).toBe("oci (podman/gvisor-podman)");
 		expect((podmanAliasHost.driver as OciDriver).runOptions.gvisor).toBe(true);
 	});
 
-	it("refuses rootless Docker and rootless Podman < 4.3 with clear reasons", async () => {
-		const rootlessDocker = fakeOciHost(state, { ENGINE: "docker", DOCKER_ROOTLESS: "1" }, {}, { engine: "docker" });
-		expect(await checkReadiness(rootlessDocker)).toEqual({
+	it("parses engine info purely and refuses unsuitable or missing engines with exact reasons", async () => {
+		expect(parseEngineInfo("podman", "not json")).toEqual({
 			ready: false,
-			message: `sandbox is off: ${ROOTLESS_DOCKER_UNSUPPORTED}`,
-			leftovers: [],
+			reason: "podman info returned unreadable JSON",
+		});
+		expect(
+			parseEngineInfo(
+				"podman",
+				JSON.stringify({
+					host: {
+						security: { rootless: true },
+						cgroupControllers: ["memory", "pids"],
+						ociRuntime: { name: "krun", path: "/usr/bin/krun" },
+					},
+					version: { Version: "5.4.0" },
+				}),
+			),
+		).toEqual({
+			ready: true,
+			version: "5.4.0",
+			rootless: true,
+			cpuDelegated: false,
+			detectedRuntime: "krun",
+			gvisor: false,
+		});
+		expect(
+			parseEngineInfo(
+				"docker",
+				JSON.stringify({
+					ServerVersion: "28.5.2",
+					SecurityOptions: ["name=seccomp,profile=builtin"],
+					DefaultRuntime: "runc",
+					Runtimes: { runc: {}, runsc: { path: "/usr/bin/runsc" } },
+				}),
+				"runsc",
+			),
+		).toEqual({
+			ready: true,
+			version: "28.5.2",
+			rootless: false,
+			cpuDelegated: true,
+			detectedRuntime: "runc",
+			gvisor: true,
+		});
+
+		const rootlessDocker = fakeOciHost(state, { ENGINE: "docker", DOCKER_ROOTLESS: "1" }, {}, { engine: "docker" });
+		expect(await probeHost(rootlessDocker)).toMatchObject({
+			kind: "runtime_not_ready",
+			reason: ROOTLESS_DOCKER_UNSUPPORTED,
 		});
 
 		const oldPodman = fakeOciHost(
@@ -182,10 +252,9 @@ describe("OciDriver readiness & engine discovery", () => {
 			{},
 			{ engine: "podman" },
 		);
-		expect(await checkReadiness(oldPodman)).toEqual({
-			ready: false,
-			message: "sandbox is off: rootless Podman >= 4.3 is required for keep-id UID mapping (found 4.2.1)",
-			leftovers: [],
+		expect(await probeHost(oldPodman)).toMatchObject({
+			kind: "runtime_not_ready",
+			reason: "rootless Podman >= 4.3 is required for keep-id UID mapping (found 4.2.1)",
 		});
 
 		const serverErrorDocker = fakeOciHost(
@@ -194,10 +263,9 @@ describe("OciDriver readiness & engine discovery", () => {
 			{},
 			{ engine: "docker" },
 		);
-		expect(await checkReadiness(serverErrorDocker)).toEqual({
-			ready: false,
-			message: "sandbox is off: docker info failed: Cannot connect to the Docker daemon",
-			leftovers: [],
+		expect(await probeHost(serverErrorDocker)).toMatchObject({
+			kind: "runtime_not_ready",
+			reason: "docker info failed: Cannot connect to the Docker daemon",
 		});
 
 		const missingRuntimeDocker = fakeOciHost(
@@ -206,14 +274,62 @@ describe("OciDriver readiness & engine discovery", () => {
 			{},
 			{ engine: "docker", ociRuntime: "runsc" },
 		);
-		expect(await checkReadiness(missingRuntimeDocker)).toEqual({
-			ready: false,
-			message: "sandbox is off: OCI runtime runsc is not available in docker",
-			leftovers: [],
+		expect(await probeHost(missingRuntimeDocker)).toMatchObject({
+			kind: "runtime_not_ready",
+			reason: "OCI runtime runsc is not available in docker",
+		});
+
+		// Engine discovery across missing / unsuitable combinations
+		const emptyBin = join(root, "empty-oci-bin");
+		await mkdir(emptyBin, { recursive: true });
+		const neitherHost = createHost(
+			"polar-sandbox:0.2",
+			{ ...fakeOciEnvironment(state), PATH: emptyBin },
+			{
+				driver: "oci",
+				ociEngine: "auto",
+			},
+		);
+		neitherHost.limits = { ...testLimits };
+		expect(await probeHost(neitherHost)).toMatchObject({
+			kind: "runtime_missing",
+			reason: "neither podman nor docker is installed",
 		});
 	});
 
-	it("builds with --platform and --build-arg TARGETARCH when selected in UI", async () => {
+	it("provides pull_image and build_image actions with --build-arg TARGETARCH when the image is missing", async () => {
+		const registry = "registry.example/polar-sandbox@sha256:deadbeef";
+		const imageDir = getSandboxImageDir();
+		const arch = process.arch === "x64" ? "amd64" : "arm64";
+		const pullAndBuildHost = fakeOciHost(
+			state,
+			{ IMAGE_MISSING: "1" },
+			{},
+			{},
+			{ candidates: [registry, "polar-sandbox:0.2"], pull: registry, build: "polar-sandbox:0.2" },
+		);
+		const pullDiag = await probeHost(pullAndBuildHost);
+		expect(pullDiag).toMatchObject({
+			kind: "image_missing",
+			reason:
+				"image polar-sandbox:0.2 is not installed (podman image inspect polar-sandbox:0.2 failed: Error: image polar-sandbox:0.2 not found)",
+		});
+		if (pullDiag.kind !== "image_missing" || pullDiag.remedy.kind !== "actions") {
+			throw new Error("expected image actions");
+		}
+		expect(pullDiag.remedy.actions.map((a) => [a.id, a.label, a.preview])).toEqual([
+			["pull_image", DOWNLOAD_IMAGE_OPTION, [`podman image pull ${registry}`]],
+			[
+				"build_image",
+				BUILD_IMAGE_OPTION,
+				[
+					`podman build --build-arg TARGETARCH=${arch} --tag polar-sandbox:0.2 --file ${join(imageDir, "Containerfile")} ${imageDir}`,
+				],
+			],
+		]);
+		expect(await pullDiag.remedy.actions[0].run({ signal: new AbortController().signal })).toEqual({ ok: true });
+		expect(await state.calls()).toContainEqual(["image", "pull", registry]);
+
 		const buildHost = fakeOciHost(
 			state,
 			{ IMAGE_MISSING: "1" },
@@ -221,12 +337,17 @@ describe("OciDriver readiness & engine discovery", () => {
 			{},
 			{ candidates: ["polar-sandbox:0.2"], build: "polar-sandbox:0.2" },
 		);
-		expect(await checkReadiness(buildHost, async () => BUILD_IMAGE_OPTION)).toEqual({
-			ready: true,
-			image: "polar-sandbox:0.2",
+		const diagnosis = await probeHost(buildHost);
+		expect(diagnosis).toMatchObject({
+			kind: "image_missing",
+			reason:
+				"image polar-sandbox:0.2 is not installed (podman image inspect polar-sandbox:0.2 failed: Error: image polar-sandbox:0.2 not found)",
 		});
-		const arch = process.arch === "x64" ? "amd64" : "arm64";
-		const imageDir = getSandboxImageDir();
+		if (diagnosis.kind !== "image_missing" || diagnosis.remedy.kind !== "actions") {
+			throw new Error("expected image actions");
+		}
+		expect(diagnosis.remedy.actions.map((a) => [a.id, a.label])).toEqual([["build_image", BUILD_IMAGE_OPTION]]);
+		expect(await diagnosis.remedy.actions[0].run({ signal: new AbortController().signal })).toEqual({ ok: true });
 		expect(await state.calls()).toContainEqual([
 			"build",
 			"--build-arg",
@@ -237,20 +358,6 @@ describe("OciDriver readiness & engine discovery", () => {
 			join(imageDir, "Containerfile"),
 			imageDir,
 		]);
-
-		const disabled = fakeOciHost(
-			state,
-			{ IMAGE_MISSING: "1" },
-			{},
-			{},
-			{ candidates: ["polar-sandbox:0.2"], build: "polar-sandbox:0.2" },
-		);
-		expect(await checkReadiness(disabled, async () => DISABLE_SANDBOX_OPTION)).toEqual({
-			ready: false,
-			message:
-				"sandbox is off: image polar-sandbox:0.2 is not installed (podman image inspect polar-sandbox:0.2 failed: Error: image polar-sandbox:0.2 not found)",
-			leftovers: [],
-		});
 	});
 });
 

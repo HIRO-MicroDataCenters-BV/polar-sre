@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { spawn } from "child_process";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 
@@ -10,6 +11,8 @@ if (!stateRoot) {
 const knob = (name, fallback) => process.env[`FAKE_CONTAINER_${name}`] ?? fallback;
 const containersDir = join(stateRoot, "containers");
 const volumesDir = join(stateRoot, "volumes");
+const systemStatePath = join(stateRoot, "system.json");
+const imagesStatePath = join(stateRoot, "images.json");
 mkdirSync(containersDir, { recursive: true });
 mkdirSync(volumesDir, { recursive: true });
 
@@ -37,6 +40,43 @@ function containerPath(id) {
 
 function volumePath(name) {
 	return join(volumesDir, `${name}.json`);
+}
+
+function readSystemState() {
+	const persisted = existsSync(systemStatePath) ? readJson(systemStatePath) : {};
+	const defaultStatus = knob("SERVICE_STATUS", knob("SERVICE_STOPPED") === "1" ? "unregistered" : "running");
+	const defaultKernel = knob("KERNEL_MISSING") !== "1";
+	return {
+		status: persisted.status ?? defaultStatus,
+		kernelConfigured: persisted.kernelConfigured ?? defaultKernel,
+	};
+}
+
+function writeSystemState(patch) {
+	const current = existsSync(systemStatePath) ? readJson(systemStatePath) : {};
+	writeFileSync(systemStatePath, JSON.stringify({ ...current, ...patch }));
+}
+
+function recordedImages() {
+	if (!existsSync(imagesStatePath)) return new Set();
+	return new Set(readJson(imagesStatePath));
+}
+
+function recordImage(image) {
+	if (typeof image !== "string" || image === "") return;
+	const images = recordedImages();
+	images.add(image);
+	writeFileSync(imagesStatePath, JSON.stringify([...images]));
+}
+
+function maybeSpawnStdoutHolder(knobName) {
+	if (knob(knobName) !== "1" && knob("SPAWN_HOLDER") !== "1") return;
+	const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 30000)"], {
+		stdio: ["ignore", "inherit", "inherit"],
+	});
+	if (child.pid !== undefined) {
+		appendFileSync(join(stateRoot, "holders.jsonl"), `${JSON.stringify(child.pid)}\n`);
+	}
 }
 
 const SWITCHES = new Set(["--init", "--read-only", "--interactive", "-i", "--rm", "--all", "-a", "--force", "-f"]);
@@ -95,8 +135,21 @@ const OOM_LINE =
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function requireRunningService() {
+	if (readSystemState().status !== "running") {
+		fail("XPC connection error: Connection invalid. Did you run 'container system start'?");
+	}
+}
+
 async function run(args) {
 	if (knob("RUN_HANG") === "1") await sleep(60_000);
+	requireRunningService();
+	const sys = readSystemState();
+	if (!sys.kernelConfigured) {
+		fail(
+			"default kernel not configured for architecture arm64, please use the `container system kernel set` command to configure it",
+		);
+	}
 	if (knob("RUN_FAILS") === "1") fail("failed to create container: image not found");
 	const { options, command } = parseRun(args);
 	const id = options["--name"];
@@ -258,18 +311,105 @@ async function execCommand(args) {
 	}, delayMs);
 }
 
+async function handleSystem(args) {
+	const [sub, ...rest] = args;
+	if (sub === "start") {
+		maybeSpawnStdoutHolder("START_SPAWN_HOLDER");
+		if (knob("START_HANG") === "1") await sleep(60_000);
+		if (knob("START_FAIL") === "1") fail(knob("START_FAIL_MESSAGE", "system start failed"));
+		const sys = readSystemState();
+		const enableKernel = rest.includes("--enable-kernel-install");
+		const disableKernel = rest.includes("--disable-kernel-install");
+		const nextKernel = enableKernel ? true : disableKernel ? sys.kernelConfigured : sys.kernelConfigured;
+		process.stderr.write("Launching container-apiserver...\n");
+		process.stderr.write("Testing access to container-apiserver...\n");
+		process.stderr.write("Verifying machine API server is running...\n");
+		if (enableKernel && !sys.kernelConfigured) {
+			process.stderr.write("Installing kernel...\n");
+		}
+		writeSystemState({ status: "running", kernelConfigured: nextKernel });
+		process.exit(0);
+	}
+	if (sub === "stop") {
+		writeSystemState({ status: "unregistered" });
+		process.exit(0);
+	}
+	if (knob("STATUS_HANG") === "1") await sleep(60_000);
+	const statusExitKnob = knob("STATUS_EXIT");
+	const exitCode = Number(statusExitKnob ?? 0);
+	if (knob("STATUS_GARBAGE") === "1") {
+		process.stdout.write("not json\n");
+		process.exit(exitCode);
+	}
+	if (knob("STATUS_JSON") !== undefined) {
+		process.stdout.write(`${knob("STATUS_JSON")}\n`);
+		process.exit(exitCode);
+	}
+	if (statusExitKnob !== undefined && exitCode !== 0 && knob("SERVICE_STATUS") === undefined && knob("SERVICE_STOPPED") === undefined) {
+		fail(knob("STATUS_FAIL_MESSAGE", `exit ${exitCode}`), exitCode);
+	}
+	const sys = readSystemState();
+	const jsonFormat = rest.includes("--format") && rest[rest.indexOf("--format") + 1] === "json";
+	if (sys.status === "unregistered" || sys.status === "not running") {
+		if (jsonFormat) {
+			process.stdout.write(`${JSON.stringify({ status: sys.status })}\n`);
+		} else {
+			process.stderr.write("apiserver is not running and not registered with launchd\n");
+		}
+		process.exit(statusExitKnob !== undefined ? exitCode : 1);
+	}
+	const clientVersion = knob("CLIENT_VERSION", knob("VERSION", "1.7.1"));
+	const serverVersion = knob("SERVER_VERSION", knob("VERSION", "1.7.1"));
+	if (jsonFormat) {
+		process.stdout.write(
+			`${JSON.stringify({
+				client: { appName: "container", build: "release", version: clientVersion },
+				host: { architecture: "arm64", cpus: 8, operatingSystem: "Version 26.5.1 (Build 25F80)" },
+				paths: { appRoot: "/tmp/com.apple.container/", installRoot: "/usr/local/" },
+				resources: { containersRunning: 0, containersTotal: 0, images: 1 },
+				server: { appName: "container-apiserver", build: "release", version: serverVersion },
+				status: sys.status,
+			})}\n`,
+		);
+	}
+	process.exit(exitCode);
+}
+
+function handleVersion() {
+	if (knob("VERSION_FAIL") === "1") fail(knob("VERSION_FAIL_MESSAGE", "version failed"));
+	if (knob("VERSION_STDOUT") !== undefined) {
+		process.stdout.write(`${knob("VERSION_STDOUT")}\n`);
+		process.exit(0);
+	}
+	const clientVersion = knob("CLIENT_VERSION", knob("VERSION", "1.7.1"));
+	process.stdout.write(`container CLI version ${clientVersion} (build: release, commit: a15b460)\n`);
+	process.exit(0);
+}
+
 async function main() {
 	const [command, ...args] = argv;
 	switch (command) {
+		case "--version":
+		case "version":
+			handleVersion();
+			break;
 		case "system":
-			process.exit(Number(knob("STATUS_EXIT", 0)));
+			await handleSystem(args);
 			break;
 		case "image": {
+			requireRunningService();
 			const sub = args[0];
 			const img = args.at(-1);
 			if (sub === "pull") {
+				maybeSpawnStdoutHolder("PULL_SPAWN_HOLDER");
+				if (knob("PULL_HANG") === "1") await sleep(60_000);
 				if (knob("PULL_FAIL") === "1") fail(`pull ${img} failed`);
+				recordImage(img);
 				process.stdout.write(`pulled ${img}\n`);
+				break;
+			}
+			if (recordedImages().has(img)) {
+				process.stdout.write(`[{"id":"${img}"}]\n`);
 				break;
 			}
 			const present = knob("IMAGE_PRESENT");
@@ -279,10 +419,16 @@ async function main() {
 			process.stdout.write(`[{"id":"${img}"}]\n`);
 			break;
 		}
-		case "build":
+		case "build": {
+			requireRunningService();
+			maybeSpawnStdoutHolder("BUILD_SPAWN_HOLDER");
+			if (knob("BUILD_HANG") === "1") await sleep(60_000);
 			if (knob("BUILD_FAIL") === "1") fail("build failed");
+			const { options } = parseRun(args);
+			recordImage(options["--tag"] ?? options["-t"]);
 			process.stdout.write("built\n");
 			break;
+		}
 		case "run":
 			return run(args);
 		case "exec":

@@ -140,9 +140,45 @@ export interface ToolReply {
 
 export type NotReady = { ready: false; message: string; leftovers: CleanupError[] };
 
-export type Readiness = { ready: true; image: string } | NotReady;
-
 export type Activation = { ready: true; runtime: SandboxRuntime } | NotReady;
+
+export type SetupActionId = "install_runtime" | "start_service" | "pull_image" | "build_image";
+
+export type SetupActionMode = "background" | "foreground";
+
+export interface ActionIO {
+	signal: AbortSignal;
+	onLine?: (line: string) => void;
+	onDownloadProgress?: (doneBytes: number, totalBytes?: number) => void;
+	handoffTerminal?: <T>(fn: () => Promise<T>) => Promise<T>;
+}
+
+export type ActionResult = { ok: true; detail?: string } | { ok: false; reason: string; cancelled?: boolean };
+
+export interface SetupAction {
+	id: SetupActionId;
+	label: string;
+	preview: string[];
+	mode: SetupActionMode;
+	run(io: ActionIO): Promise<ActionResult>;
+	runQuick?(signal: AbortSignal): Promise<ActionResult>;
+}
+
+export type Remedy =
+	| { kind: "manual"; instructions: string[] }
+	| { kind: "actions"; actions: SetupAction[]; outlook: string[] };
+
+export type RuntimeProbeResult =
+	| { kind: "ready"; version?: string; repair?: Remedy }
+	| { kind: "unsupported"; reason: string }
+	| { kind: "runtime_missing"; reason: string; remedy: Remedy }
+	| { kind: "runtime_not_ready"; reason: string; remedy: Remedy }
+	| { kind: "probe_failed"; reason: string };
+
+export type HostDiagnosis =
+	| { kind: "ready"; image: string; version?: string; repair?: Remedy }
+	| Exclude<RuntimeProbeResult, { kind: "ready" }>
+	| { kind: "image_missing"; reason: string; remedy: Remedy };
 
 export type ImageOperationKind = "download" | "build";
 
@@ -150,8 +186,6 @@ export interface ImageOperation {
 	output(line: string): void;
 	end(): void;
 }
-
-export type ShowImageOperation = (kind: ImageOperationKind) => ImageOperation;
 
 export interface VolumeFailure {
 	reason: string;
@@ -181,8 +215,10 @@ export type SpawnCallOutcome = { spawned: SandboxProcess } | { gone: string };
 export interface SandboxDriver {
 	readonly name: "apple-container" | "oci" | "k8s";
 	readonly boundaryDescription: string;
+	readonly supportsServiceAutoStart: boolean;
 
-	checkRuntime(deadlineAt: number): Promise<{ ready: true } | { ready: false; reason: string }>;
+	probeRuntime(): Promise<RuntimeProbeResult>;
+	imageRemedy(imageSpec: ImageSpec): Remedy;
 	inspectImage(image: string, deadlineAt: number): Promise<{ found: true } | { found: false; reason: string }>;
 	pullImage(image: string, signal?: AbortSignal, onLine?: (line: string) => void): Promise<CommandOutcome>;
 	buildImage(

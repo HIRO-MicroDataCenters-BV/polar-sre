@@ -14,6 +14,8 @@ import {
 	type HotSandbox,
 	type Inspection,
 	type OwnedResource,
+	type Remedy,
+	type RuntimeProbeResult,
 	type SandboxDriver,
 	type SandboxDriverContext,
 	type SandboxLanguage,
@@ -566,6 +568,7 @@ export class K8sHotSandbox implements HotSandbox {
 
 export class K8sDriver implements SandboxDriver {
 	readonly name = "k8s" as const;
+	readonly supportsServiceAutoStart = false;
 	private readonly runtime: SandboxDriverContext;
 	private readonly serviceAccountDir: string;
 	private readonly customImage: boolean;
@@ -642,7 +645,11 @@ export class K8sDriver implements SandboxDriver {
 		);
 	}
 
-	async checkRuntime(deadlineAt: number): Promise<{ ready: true } | { ready: false; reason: string }> {
+	async probeRuntime(): Promise<RuntimeProbeResult> {
+		const manual: Remedy = {
+			kind: "manual",
+			instructions: ["Check Kubernetes sandbox configuration and Pod RBAC permissions."],
+		};
 		const required: [string, string][] = [
 			["POLAR_SANDBOX_K8S_PVC", this.pvcName],
 			["POLAR_SANDBOX_K8S_RUNTIME_CLASS", this.runtimeClass],
@@ -656,26 +663,49 @@ export class K8sDriver implements SandboxDriver {
 			["KUBERNETES_SERVICE_HOST", this.serviceHost],
 		];
 		for (const [key, value] of required) {
-			if (value === "") return { ready: false, reason: `${key} is not set` };
+			if (value === "") return { kind: "runtime_not_ready", reason: `${key} is not set`, remedy: manual };
 		}
 		const kc = await this.ensureKubeconfig();
-		if (!kc.ok) return { ready: false, reason: kc.reason };
+		if (!kc.ok) return { kind: "runtime_not_ready", reason: kc.reason, remedy: manual };
 
-		const selfPod = await this.kubectl(["get", "pod", this.podName, "-o", "json"], remainingMs(deadlineAt));
+		const selfPod = await this.kubectl(["get", "pod", this.podName, "-o", "json"]);
+		if (selfPod.spawnError === "ENOENT") {
+			return {
+				kind: "runtime_missing",
+				reason: `kubectl get pod ${this.podName} failed: ${commandFailure(selfPod)}`,
+				remedy: { kind: "manual", instructions: ["Ensure kubectl is installed in the polar Pod image."] },
+			};
+		}
 		if (selfPod.code !== 0) {
-			return { ready: false, reason: `kubectl get pod ${this.podName} failed: ${commandFailure(selfPod)}` };
+			return {
+				kind: "runtime_not_ready",
+				reason: `kubectl get pod ${this.podName} failed: ${commandFailure(selfPod)}`,
+				remedy: manual,
+			};
 		}
 		const parsedSelf = parseK8sPod(selfPod.stdout);
 		if (parsedSelf?.uid === undefined) {
-			return { ready: false, reason: `kubectl get pod ${this.podName} returned unreadable JSON` };
+			return {
+				kind: "runtime_not_ready",
+				reason: `kubectl get pod ${this.podName} returned unreadable JSON`,
+				remedy: manual,
+			};
 		}
 		if (parsedSelf.uid !== this.podUid) {
 			return {
-				ready: false,
+				kind: "runtime_not_ready",
 				reason: `pod UID mismatch for ${this.podName}: expected ${this.podUid}, got ${parsedSelf.uid}`,
+				remedy: manual,
 			};
 		}
-		return { ready: true };
+		return { kind: "ready" };
+	}
+
+	imageRemedy(): Remedy {
+		return {
+			kind: "manual",
+			instructions: ["Set POLAR_SANDBOX_K8S_IMAGE or pass --sandbox-image with an image available in the cluster."],
+		};
 	}
 
 	inspectImage(_image: string, _deadlineAt: number): Promise<{ found: true } | { found: false; reason: string }> {

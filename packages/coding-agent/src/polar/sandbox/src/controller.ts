@@ -1,13 +1,7 @@
 import type { ExtensionContext, SessionShutdownEvent } from "../../../core/extensions/types.ts";
-import type { SandboxHost, SandboxRuntime, ShowImageOperation } from "./types.ts";
-import {
-	activateRuntime,
-	checkReadiness,
-	type SelectMissingImage,
-	shutdownHost,
-	shutdownRuntime,
-	type Warn,
-} from "./workspace.ts";
+import { formatDiagnosisWarning, probeHost, SANDBOX_OFF_STATUS } from "./host.ts";
+import type { SandboxHost, SandboxRuntime } from "./types.ts";
+import { activateRuntime, shutdownHost, shutdownRuntime, type Warn } from "./workspace.ts";
 
 type SessionState = "off" | "activating" | "active" | "closing" | "closed";
 
@@ -17,6 +11,7 @@ export class SandboxController {
 	private state: SessionState = "off";
 	private pending: Promise<void> | undefined;
 	private runtime: SandboxRuntime | undefined;
+	private statusShown = false;
 	private shutdownReason: SessionShutdownEvent["reason"] = "reload";
 
 	constructor(host: SandboxHost, registerRunCode: (runtime: SandboxRuntime) => void) {
@@ -24,17 +19,17 @@ export class SandboxController {
 		this.registerRunCode = registerRunCode;
 	}
 
-	start(ctx: ExtensionContext, selectImage?: SelectMissingImage, showOperation?: ShowImageOperation): Promise<void> {
+	start(ctx: ExtensionContext): Promise<void> {
 		if (this.state !== "off" || this.pending !== undefined) return Promise.resolve();
-		const guardedSelect: SelectMissingImage | undefined =
-			selectImage === undefined
-				? undefined
-				: async (title, options) => (this.isAlive() ? selectImage(title, options) : undefined);
 		return this.track(async () => {
-			const readiness = await checkReadiness(this.host, guardedSelect, showOperation);
+			const diagnosis = await probeHost(this.host);
 			if (this.state !== "off") return;
-			if (readiness.ready) await this.activate(readiness.image, ctx);
-			else this.notify(ctx, readiness.message, "warning");
+			if (diagnosis.kind === "ready") {
+				await this.activate(diagnosis.image, ctx);
+			} else {
+				this.setOffStatus(ctx);
+				this.notify(ctx, formatDiagnosisWarning(diagnosis), "warning");
+			}
 		});
 	}
 
@@ -64,6 +59,18 @@ export class SandboxController {
 		if (this.isAlive()) ctx.ui.notify(message, level);
 	}
 
+	private setOffStatus(ctx: ExtensionContext): void {
+		if (!this.isAlive()) return;
+		this.statusShown = true;
+		ctx.ui.setStatus("sandbox", SANDBOX_OFF_STATUS);
+	}
+
+	private clearStatus(ctx: ExtensionContext): void {
+		if (!this.isAlive() || !this.statusShown) return;
+		this.statusShown = false;
+		ctx.ui.setStatus("sandbox", undefined);
+	}
+
 	private shutdownWarn(ctx: ExtensionContext): Warn {
 		return (message) => {
 			if (this.state !== "closed") ctx.ui.notify(message, "warning");
@@ -83,6 +90,7 @@ export class SandboxController {
 				return;
 			}
 			if (!activation.ready) {
+				this.setOffStatus(ctx);
 				warn(activation.message);
 				return;
 			}
@@ -94,6 +102,7 @@ export class SandboxController {
 				this.notify(ctx, `sandbox: ${runtime.driver.boundaryDescription}`, "info");
 			}
 			if (this.isAlive()) this.registerRunCode(runtime);
+			this.clearStatus(ctx);
 		} finally {
 			if (this.state === "activating") this.state = "off";
 		}

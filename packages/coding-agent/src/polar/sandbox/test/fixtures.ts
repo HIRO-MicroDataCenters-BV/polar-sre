@@ -13,6 +13,7 @@ import {
 	OciDriver,
 	type OciDriverOptions,
 } from "../src/driver.ts";
+import { formatDiagnosisWarning, probeHost } from "../src/host.ts";
 import type {
 	Activation,
 	ImageSpec,
@@ -24,7 +25,7 @@ import type {
 	SessionHandle,
 	SessionPaths,
 } from "../src/types.ts";
-import { activateRuntime, checkReadiness, type Warn } from "../src/workspace.ts";
+import { activateRuntime, type Warn } from "../src/workspace.ts";
 
 export const FAKE_CONTAINER = fileURLToPath(new URL("./fake-container.mjs", import.meta.url));
 export const FAKE_OCI = fileURLToPath(new URL("./fake-oci.mjs", import.meta.url));
@@ -134,15 +135,17 @@ function openRuntime(host: SandboxHost, handle: SessionHandle): SandboxRuntime {
 	});
 }
 
-/** Checks readiness and activates the session on the host, as a session start does. */
+/** Probes the host and activates the session on it, as a session start does. */
 export async function startHost(
 	host: SandboxHost,
 	session: Pick<SessionPaths, "sessionId" | "cwd" | "outputDirectory">,
 	warn: Warn = () => {},
 ): Promise<Activation> {
-	const readiness = await checkReadiness(host);
-	if (!readiness.ready) return readiness;
-	return activateRuntime(host, session.sessionId, session.cwd, readiness.image, warn, artifactsRootOf(session));
+	const diagnosis = await probeHost(host);
+	if (diagnosis.kind !== "ready") {
+		return { ready: false, message: formatDiagnosisWarning(diagnosis), leftovers: [] };
+	}
+	return activateRuntime(host, session.sessionId, session.cwd, diagnosis.image, warn, artifactsRootOf(session));
 }
 
 export async function startedRuntime(

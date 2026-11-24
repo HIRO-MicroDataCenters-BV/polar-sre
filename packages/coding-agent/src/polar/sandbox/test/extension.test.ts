@@ -11,7 +11,7 @@ import type {
 	ToolDefinition,
 } from "../../../core/extensions/types.ts";
 import sandboxExtension, { DEFAULT_IMAGE, RUN_CODE_RULES } from "../index.ts";
-import { BUILD_IMAGE_OPTION, DISABLE_SANDBOX_OPTION, DOWNLOAD_IMAGE_OPTION } from "../src/workspace.ts";
+import { DOWNLOAD_IMAGE_OPTION, ROOTLESS_DOCKER_UNSUPPORTED } from "../src/driver.ts";
 import { FAKE_CONTAINER, FAKE_OCI, type FakeState, fakeState, until } from "./fixtures.ts";
 
 const fault = vi.hoisted(() => ({ failReplyOnce: false }));
@@ -34,7 +34,7 @@ type Method = (...args: never[]) => unknown;
 type ShutdownReason = "quit" | "reload" | "new" | "resume" | "fork";
 
 const SESSION_ID = randomUUID();
-const ENV_KEYS = ["PATH", "POLAR_ARTIFACTS_DIR", "FAKE_CONTAINER_STATE"];
+const ENV_KEYS = ["PATH", "POLAR_ARTIFACTS_DIR", "POLAR_CODING_AGENT_DIR", "FAKE_CONTAINER_STATE"];
 
 let root: string;
 let bin: string;
@@ -52,6 +52,7 @@ beforeEach(async () => {
 	await setKnobs();
 	process.env.PATH = `${bin}${delimiter}${process.env.PATH ?? ""}`;
 	process.env.POLAR_ARTIFACTS_DIR = root;
+	process.env.POLAR_CODING_AGENT_DIR = join(root, "agent");
 	process.env.FAKE_CONTAINER_STATE = state.directory;
 	shutdowns = [];
 });
@@ -179,7 +180,7 @@ describe("sandbox extension", () => {
 	it("offers run_code only from a clean state", async () => {
 		const labels = { "polar-session": SESSION_ID, "polar-root": root };
 		const refusals: [string, Record<string, string>, string][] = [
-			["readiness", { STATUS_EXIT: "1" }, "sandbox is off: container system status failed: exit 1"],
+			["readiness", { SERVICE_STOPPED: "1" }, "sandbox is off: Apple container service is not running"],
 			[
 				"unknown listing",
 				{ LIST_GARBAGE: "1" },
@@ -198,7 +199,7 @@ describe("sandbox extension", () => {
 			await off.startSession();
 			expect(off.tools, refusal).toEqual([]);
 			expect(off.notices, refusal).toEqual([[message, "warning"]]);
-			expect(off.footer.get("sandbox"), refusal).toBeUndefined();
+			expect(off.footer.get("sandbox"), refusal).toBe("sandbox: off, run /sandbox");
 			await off.shutdown();
 			expect(await exists(lockPath()), refusal).toBe(false);
 		}
@@ -213,7 +214,7 @@ describe("sandbox extension", () => {
 				"warning",
 			],
 		]);
-		expect(foreign.footer.get("sandbox")).toBeUndefined();
+		expect(foreign.footer.get("sandbox")).toBe("sandbox: off, run /sandbox");
 		expect(await state.containers()).toEqual([]);
 		await foreign.shutdown();
 		expect(await exists(lockPath())).toBe(false);
@@ -227,13 +228,17 @@ describe("sandbox extension", () => {
 		expect(ready.notices).toEqual([]);
 		expect(await state.volumes()).toEqual([{ name: `polar-work-${SESSION_ID}`, labels, size: "4096M" }]);
 		expect(await readFile(lockPath(), "utf8")).toBe(`${process.pid}\n`);
+		const executed = await ready.execute("call-1", { language: "bash", code: "stdout:ready-ok" });
+		expect(executed.isError).toBe(false);
+		expect(text(executed)).toContain("ready-ok");
 	});
 
 	it("holds the session lock only while the sandbox is active", async () => {
-		await setKnobs({ STATUS_EXIT: "1" });
+		await setKnobs({ SERVICE_STOPPED: "1" });
 		const notReady = loadExtension();
 		await notReady.startSession();
 		expect(notReady.tools).toEqual([]);
+		expect(notReady.footer.get("sandbox")).toBe("sandbox: off, run /sandbox");
 		expect(await exists(join(root, SESSION_ID))).toBe(false);
 		await notReady.shutdown();
 
@@ -241,6 +246,7 @@ describe("sandbox extension", () => {
 		const failed = loadExtension();
 		await failed.startSession();
 		expect(failed.tools).toEqual([]);
+		expect(failed.footer.get("sandbox")).toBe("sandbox: off, run /sandbox");
 		expect(failed.notices).toEqual([
 			["sandbox is off: runtime state could not be established: unreadable listing", "warning"],
 		]);
@@ -251,6 +257,7 @@ describe("sandbox extension", () => {
 		const active = loadExtension();
 		await active.startSession();
 		expect(active.tools.map((tool) => tool.name)).toEqual(["run_code"]);
+		expect(active.footer.get("sandbox")).toBeUndefined();
 		expect(await readFile(lockPath(), "utf8")).toBe(`${process.pid}\n`);
 		await active.shutdown();
 		expect(await exists(lockPath())).toBe(false);
@@ -363,81 +370,133 @@ describe("sandbox extension", () => {
 		expect(Object.keys(tool.parameters.properties)).toEqual(["language", "code"]);
 	});
 
-	it("turns off without menu when hasUI is false and prompts with ctx.ui.select when hasUI is true", async () => {
+	it("sets footer status and warns without prompting when container is missing or the image is absent", async () => {
+		const emptyBin = join(root, "empty-bin");
+		await mkdir(emptyBin, { recursive: true });
+		const fullPath = process.env.PATH;
+		process.env.PATH = emptyBin;
+		const missingRuntime = loadExtension({}, { hasUI: true, selectChoice: DOWNLOAD_IMAGE_OPTION });
+		await missingRuntime.startSession();
+		expect(missingRuntime.tools).toEqual([]);
+		expect(missingRuntime.selects).toEqual([]);
+		expect(missingRuntime.footer.get("sandbox")).toBe("sandbox: off, run /sandbox");
+		expect(missingRuntime.notices).toEqual([["sandbox is off: Apple container is not installed", "warning"]]);
+		await missingRuntime.shutdown();
+		process.env.PATH = fullPath;
+
 		await setKnobs({ IMAGE_MISSING: "1" });
-		const headless = loadExtension({}, { hasUI: false });
-		await headless.startSession();
-		expect(headless.tools).toEqual([]);
-		expect(headless.selects).toEqual([]);
-		expect(headless.notices).toEqual([
+		const missingImage = loadExtension({}, { hasUI: true, selectChoice: DOWNLOAD_IMAGE_OPTION });
+		await missingImage.startSession();
+		expect(missingImage.tools).toEqual([]);
+		expect(missingImage.selects).toEqual([]);
+		expect(missingImage.widgets).toEqual([]);
+		expect(missingImage.footer.get("sandbox")).toBe("sandbox: off, run /sandbox");
+		expect(missingImage.notices).toEqual([
 			[
 				`sandbox is off: image ${DEFAULT_IMAGE} is not installed (container image inspect ${DEFAULT_IMAGE} failed: Error: image ${DEFAULT_IMAGE} not found)`,
 				"warning",
 			],
 		]);
-		await headless.shutdown();
-
-		const built = loadExtension({}, { hasUI: true, selectChoice: BUILD_IMAGE_OPTION });
-		await built.startSession();
-		expect(built.selects).toEqual([
-			[
-				`Sandbox image ${DEFAULT_IMAGE} is not installed`,
-				[DOWNLOAD_IMAGE_OPTION, BUILD_IMAGE_OPTION, DISABLE_SANDBOX_OPTION],
-			],
-		]);
-		expect(built.tools.map((tool) => tool.name)).toEqual(["run_code"]);
-		await built.shutdown();
-
-		const registry = "registry.example/polar-sandbox@sha256:abc";
-		const pulled = loadExtension(
-			{ "sandbox-registry-image": registry },
-			{ hasUI: true, selectChoice: DOWNLOAD_IMAGE_OPTION },
-		);
-		await pulled.startSession();
-		expect(pulled.selects).toEqual([
-			[
-				`Sandbox image ${DEFAULT_IMAGE} is not installed`,
-				[DOWNLOAD_IMAGE_OPTION, BUILD_IMAGE_OPTION, DISABLE_SANDBOX_OPTION],
-			],
-		]);
-		expect(pulled.tools.map((tool) => tool.name)).toEqual(["run_code"]);
-		await pulled.shutdown();
+		expect((await state.calls()).some((call) => call[0] === "image" && call[1] === "pull")).toBe(false);
+		await missingImage.shutdown();
 	});
 
-	it("mounts the progress widget only in TUI mode and clears it when pull or build finishes", async () => {
-		await setKnobs({ IMAGE_MISSING: "1" });
-		const registry = "registry.example/polar-sandbox@sha256:abc";
-		const flags = { "sandbox-registry-image": registry };
+	it("registers and executes run_code in non-interactive modes when the host is ready", async () => {
+		const headless = loadExtension({}, { hasUI: false });
+		await headless.startSession();
+		expect(headless.tools.map((tool) => tool.name)).toEqual(["run_code"]);
+		expect(headless.selects).toEqual([]);
+		expect(headless.notices).toEqual([]);
+		expect(headless.footer.get("sandbox")).toBeUndefined();
+		const result = await headless.execute("call-1", { language: "bash", code: "stdout:headless-ok" });
+		expect(result.isError).toBe(false);
+		expect(text(result)).toContain("headless-ok");
+		await headless.shutdown();
+	});
 
-		const pulled = loadExtension(flags, { selectChoice: DOWNLOAD_IMAGE_OPTION });
-		await pulled.startSession();
-		expect(pulled.widgets).toEqual([
-			["sandbox-image", "shown"],
-			["sandbox-image", "removed"],
-		]);
-		await pulled.shutdown();
+	it("reports OCI engine reasons for installed engines only and falls back from unsuitable Podman to working Docker", async () => {
+		const ociBin = join(root, "oci-bin");
+		await mkdir(ociBin, { recursive: true });
+		process.env.PATH = ociBin;
 
-		const built = loadExtension(flags, { selectChoice: BUILD_IMAGE_OPTION });
-		await built.startSession();
-		expect(built.widgets).toEqual([
-			["sandbox-image", "shown"],
-			["sandbox-image", "removed"],
-		]);
-		await built.shutdown();
+		// 1. Both engines missing (ENOENT)
+		const neither = loadExtension({ "sandbox-driver": "oci" });
+		await neither.startSession();
+		expect(neither.tools).toEqual([]);
+		expect(neither.footer.get("sandbox")).toBe("sandbox: off, run /sandbox");
+		expect(neither.notices).toEqual([["sandbox is off: neither podman nor docker is installed", "warning"]]);
+		await neither.shutdown();
 
-		await setKnobs({ IMAGE_MISSING: "1", PULL_FAIL: "1" });
-		const failed = loadExtension(flags, { selectChoice: DOWNLOAD_IMAGE_OPTION });
-		await failed.startSession();
-		expect(failed.tools).toEqual([]);
-		expect(failed.widgets.at(-1)).toEqual(["sandbox-image", "removed"]);
-		await failed.shutdown();
+		// 2. Podman missing, Docker installed but unsuitable (rootless)
+		const podmanState = await fakeState();
+		const dockerState = await fakeState();
+		try {
+			const dockerWrapper = join(ociBin, "docker");
+			const writeOciWrapper = async (
+				target: string,
+				engine: string,
+				engineState: FakeState,
+				knobs: Record<string, string>,
+			) => {
+				const exports = Object.entries(knobs)
+					.map(([name, value]) => `export FAKE_OCI_${name}=${shellWord(value)}\n`)
+					.join("");
+				await writeFile(
+					target,
+					`#!/bin/sh\nexport FAKE_OCI_ENGINE=${engine}\nexport FAKE_OCI_STATE=${shellWord(engineState.directory)}\n${exports}exec "${process.execPath}" "${FAKE_OCI}" "$@"\n`,
+				);
+				await chmod(target, 0o755);
+			};
+			await writeOciWrapper(dockerWrapper, "docker", dockerState, { DOCKER_ROOTLESS: "1" });
+			const onlyDockerBad = loadExtension({ "sandbox-driver": "oci" });
+			await onlyDockerBad.startSession();
+			expect(onlyDockerBad.tools).toEqual([]);
+			expect(onlyDockerBad.footer.get("sandbox")).toBe("sandbox: off, run /sandbox");
+			expect(onlyDockerBad.notices).toEqual([[`sandbox is off: ${ROOTLESS_DOCKER_UNSUPPORTED}`, "warning"]]);
+			await onlyDockerBad.shutdown();
 
-		await setKnobs({ IMAGE_MISSING: "1" });
-		const rpc = loadExtension(flags, { mode: "rpc", selectChoice: DOWNLOAD_IMAGE_OPTION });
-		await rpc.startSession();
-		expect(rpc.tools.map((tool) => tool.name)).toEqual(["run_code"]);
-		expect(rpc.widgets).toEqual([]);
-		await rpc.shutdown();
+			// 3. Both installed and both unsuitable -> reasons of both
+			const podmanWrapper = join(ociBin, "podman");
+			await writeOciWrapper(podmanWrapper, "podman", podmanState, {
+				PODMAN_ROOTLESS: "1",
+				PODMAN_VERSION: "4.2.1",
+			});
+			const bothBad = loadExtension({ "sandbox-driver": "oci" });
+			await bothBad.startSession();
+			expect(bothBad.tools).toEqual([]);
+			expect(bothBad.footer.get("sandbox")).toBe("sandbox: off, run /sandbox");
+			expect(bothBad.notices).toEqual([
+				[
+					`sandbox is off: rootless Podman >= 4.3 is required for keep-id UID mapping (found 4.2.1); ${ROOTLESS_DOCKER_UNSUPPORTED}`,
+					"warning",
+				],
+			]);
+			await bothBad.shutdown();
+
+			// 4. Unsuitable Podman + working Docker -> falls back to Docker and runs code in docker
+			await rm(join(podmanState.directory, "calls.jsonl"), { force: true });
+			await rm(join(dockerState.directory, "calls.jsonl"), { force: true });
+			await writeOciWrapper(dockerWrapper, "docker", dockerState, {});
+			const fallback = loadExtension({ "sandbox-driver": "oci" });
+			await fallback.startSession();
+			expect(fallback.tools.map((tool) => tool.name)).toEqual(["run_code"]);
+			expect(fallback.footer.get("sandbox")).toBeUndefined();
+			expect(fallback.notices).toEqual([["sandbox: oci (docker/runc, shared kernel)", "info"]]);
+			const result = await fallback.execute("call-1", { language: "bash", code: "echo_argv" });
+			expect(result.isError).toBe(false);
+			expect(text(result)).not.toContain("--userns=keep-id");
+			expect(await podmanState.calls()).toEqual([["info", "--format", "{{json .}}"]]);
+			const dockerCommands = (await dockerState.calls()).map((call) => call[0]);
+			expect(dockerCommands).toContain("info");
+			expect(dockerCommands).toContain("image");
+			expect(dockerCommands).toContain("volume");
+			expect(dockerCommands).toContain("run");
+			expect(dockerCommands).toContain("exec");
+			await fallback.shutdown();
+		} finally {
+			await rm(podmanState.directory, { recursive: true, force: true });
+			await rm(dockerState.directory, { recursive: true, force: true });
+		}
 	});
 
 	it("rejects an empty or NUL program before any run", async () => {

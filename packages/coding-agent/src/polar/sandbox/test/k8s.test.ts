@@ -28,10 +28,11 @@ import {
 	stripKubectlExecTrailer,
 	WORK_LIMIT_EXIT_CODE,
 } from "../src/driver.ts";
+import { probeHost } from "../src/host.ts";
 import { buildReply } from "../src/reply.ts";
 import { admitCall, containerName } from "../src/runner.ts";
 import type { SandboxLanguage, SandboxResult, SandboxRuntime, SessionPaths } from "../src/types.ts";
-import { checkReadiness, shutdownRuntime } from "../src/workspace.ts";
+import { shutdownRuntime } from "../src/workspace.ts";
 import {
 	type FakeState,
 	fakeK8sEnvironment,
@@ -142,7 +143,7 @@ describe("K8sDriver selection & readiness", () => {
 	});
 
 	it("verifies required env vars, ServiceAccount credentials, self-pod UID, and runs NetworkPolicy probe after recoverLeftovers", async () => {
-		// 1. Happy path: checkRuntime (get pod polar-0) -> recoverLeftovers -> ensureWorkVolume (netprobe)
+		// 1. Happy path: probeRuntime (get pod polar-0) -> recoverLeftovers -> ensureWorkVolume (netprobe)
 		const happy = await startHost(fakeK8sHost(state, saDir), session, warn);
 		expect(happy).toMatchObject({ ready: true });
 		if (happy.ready) await happy.runtime.handle.release();
@@ -167,43 +168,38 @@ describe("K8sDriver selection & readiness", () => {
 			"KUBERNETES_SERVICE_HOST",
 		]) {
 			const missing = fakeK8sHost(state, saDir, { [missingKey]: "" });
-			expect(await checkReadiness(missing), missingKey).toEqual({
-				ready: false,
-				message: `sandbox is off: ${missingKey} is not set`,
-				leftovers: [],
+			expect(await probeHost(missing), missingKey).toMatchObject({
+				kind: "runtime_not_ready",
+				reason: `${missingKey} is not set`,
 			});
 		}
 
 		// 3. Missing ServiceAccount directory
 		const missingSa = fakeK8sHost(state, join(root, "nonexistent-sa"));
-		const saReadiness = await checkReadiness(missingSa);
-		expect(saReadiness.ready).toBe(false);
-		if (!saReadiness.ready) {
-			expect(saReadiness.message).toContain("serviceaccount credentials");
+		const saDiagnosis = await probeHost(missingSa);
+		expect(saDiagnosis.kind).toBe("runtime_not_ready");
+		if (saDiagnosis.kind !== "ready") {
+			expect(saDiagnosis.reason).toContain("serviceaccount credentials");
 		}
 
 		// 4. Self-pod UID mismatch
 		const uidMismatch = fakeK8sHost(state, saDir, { SELF_POD_UID: "wrong-uid" });
-		expect(await checkReadiness(uidMismatch)).toEqual({
-			ready: false,
-			message: "sandbox is off: pod UID mismatch for polar-0: expected uid-polar-0, got wrong-uid",
-			leftovers: [],
+		expect(await probeHost(uidMismatch)).toMatchObject({
+			kind: "runtime_not_ready",
+			reason: "pod UID mismatch for polar-0: expected uid-polar-0, got wrong-uid",
 		});
 
 		// 5. Self-pod NotFound and AUTH_FAIL
 		const selfMissing = fakeK8sHost(state, saDir, { SELF_POD_MISSING: "1" });
-		expect(await checkReadiness(selfMissing)).toEqual({
-			ready: false,
-			message:
-				'sandbox is off: kubectl get pod polar-0 failed: Error from server (NotFound): pods "polar-0" not found',
-			leftovers: [],
+		expect(await probeHost(selfMissing)).toMatchObject({
+			kind: "runtime_not_ready",
+			reason: 'kubectl get pod polar-0 failed: Error from server (NotFound): pods "polar-0" not found',
 		});
 
 		const authFail = fakeK8sHost(state, saDir, { AUTH_FAIL: "1" });
-		expect(await checkReadiness(authFail)).toEqual({
-			ready: false,
-			message: "sandbox is off: kubectl get pod polar-0 failed: Error from server (Unauthorized): Unauthorized",
-			leftovers: [],
+		expect(await probeHost(authFail)).toMatchObject({
+			kind: "runtime_not_ready",
+			reason: "kubectl get pod polar-0 failed: Error from server (Unauthorized): Unauthorized",
 		});
 
 		// 6a. /work volume not writable (exit 2) -> probe fails with /work reason
