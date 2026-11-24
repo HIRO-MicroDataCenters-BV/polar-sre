@@ -1,5 +1,5 @@
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import type { AgentSession } from "../src/core/agent-session.ts";
 import type { ReadonlyFooterDataProvider } from "../src/core/footer-data-provider.ts";
 import { FooterComponent, formatCwdForFooter } from "../src/modes/interactive/components/footer.ts";
@@ -158,6 +158,15 @@ describe("FooterComponent width handling", () => {
 		for (const line of lines) {
 			expect(visibleWidth(line)).toBeLessThanOrEqual(width);
 		}
+	});
+
+	it("ends a truncated model name with an ellipsis", () => {
+		// The experimental marker shares the stats line with the model name and shifts where the name is cut.
+		vi.stubEnv("PI_EXPERIMENTAL", "0");
+		const session = createSession({ sessionName: "", modelId: "anthropic/claude-opus-5.5-long-model-name" });
+		const footer = new FooterComponent(session, createFooterData(1));
+
+		expect(stripAnsi(footer.render(40)[1])).toBe("12.3%/200k (auto)  anthropic/claude-o...");
 	});
 
 	it("shows the physical model a virtual model routed to", () => {
