@@ -123,6 +123,7 @@ packages/coding-agent/src/polar/
 │   │   ├── drivers/
 │   │   │   ├── shared.ts            # Shared guest constants, launcher, version helper, and UnsupportedSandboxDriver
 │   │   │   ├── apple.ts             # AppleContainerDriver & AppleHotSandbox (`container` microVM)
+│   │   │   ├── apple-install.ts     # Pinned Apple container .pkg download, SHA-256 & pkgutil verification, sudo installer launch, and platform probe
 │   │   │   ├── oci.ts               # OciDriver & OciHotSandbox (`podman` / `docker`)
 │   │   │   └── k8s.ts               # K8sDriver & K8sHotSandbox (`kubectl` Pod)
 │   │   ├── host.ts                  # Layer 3: Host diagnosis (`probeHost` -> `HostDiagnosis`), `ImageSpec` resolution, diagnosis texts
@@ -132,7 +133,7 @@ packages/coding-agent/src/polar/
 │   │   ├── reply.ts                 # Layer 6: Sandbox reply formatting (with OOM, work_limit, inspection, and cleanup notices)
 │   │   ├── preferences.ts           # Atomic read and merge update of `sandbox.json` in `getAgentDir()`
 │   │   ├── controller.ts            # Sandbox state of the session (`off`/`activating`/`active`/`disabled`/`closing`/`closed`), host probe, setup task, activation, footer status, run_code registration, shutdown
-│   │   ├── command.ts               # `/sandbox` command screens and menus
+│   │   ├── command.ts               # `/sandbox` command screens, menus, installer download dialog, and terminal handoff
 │   │   ├── progress.ts              # CLI pull progress parser (`container` and `docker` output)
 │   │   └── indicator.ts             # TUI single-line progress widget (`"download" | "build" | "service"`)
 │   └── test/

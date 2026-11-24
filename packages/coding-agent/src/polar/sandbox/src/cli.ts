@@ -6,8 +6,8 @@ import type { CleanupError, CommandOutcome, SandboxDriverContext, TrackedChild }
 
 export const CLI_STOPPED = "sandbox is stopping; no command starts";
 const COMMAND_OUTPUT_MAX_BYTES = 16 * 1024 * 1024;
-const DIAGNOSTIC_MAX_BYTES = 4 * 1024;
-const DIAGNOSTIC_MAX_LINES = 64;
+export const DIAGNOSTIC_MAX_BYTES = 4 * 1024;
+export const DIAGNOSTIC_MAX_LINES = 64;
 
 export interface ListedResource {
 	name: string;

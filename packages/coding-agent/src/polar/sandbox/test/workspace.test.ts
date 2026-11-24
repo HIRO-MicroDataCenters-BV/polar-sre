@@ -113,19 +113,87 @@ function runChildren(runtime: SandboxRuntime) {
 
 describe("start", () => {
 	it("diagnoses Apple container observations across all 5 table rows and version cases", async () => {
-		// Row 1: ENOENT -> runtime_missing with manual instructions on stage 3a
-		const missingBinHost = fakeHost(state);
+		const writeScript = async (name: string, body: string): Promise<string> => {
+			const scriptPath = join(root, name);
+			await writeFile(scriptPath, `#!/bin/sh\n${body}\n`);
+			await chmod(scriptPath, 0o755);
+			return scriptPath;
+		};
+		const arm64Sysctl = await writeScript("sysctl-arm64", "echo 1");
+		const intelSysctl = await writeScript("sysctl-intel", "echo 0");
+		const macos26SwVers = await writeScript("sw_vers-26", "echo 26.5.1");
+		const macos15SwVers = await writeScript("sw_vers-15", "echo 15.4");
+
+		// Row 1: ENOENT -> runtime_missing with install_runtime on Apple silicon + macOS >= 26, manual instructions on older macOS, unsupported on Intel
+		const missingBinHost = fakeHost(state, {}, {}, undefined, {
+			sysctlPath: arm64Sysctl,
+			swVersPath: macos26SwVers,
+		});
 		missingBinHost.containerCommand = join(root, "nonexistent-container-bin");
-		expect(await probeHost(missingBinHost)).toEqual({
+		const missingDiag = await probeHost(missingBinHost);
+		expect(missingDiag).toMatchObject({
+			kind: "runtime_missing",
+			reason: "Apple container is not installed",
+			remedy: {
+				kind: "actions",
+				outlook: [
+					"Download and install Apple container 1.7.1 — 170 MB, signed by Apple. Asks for your macOS password.",
+					"Start the container service — the first start downloads a Linux kernel, about 680 MB.",
+					IMAGE_BUILD_OUTLOOK,
+				],
+			},
+		});
+		if (missingDiag.kind !== "runtime_missing" || missingDiag.remedy.kind !== "actions") {
+			throw new Error("expected install_runtime action");
+		}
+		expect(missingDiag.remedy.actions).toHaveLength(1);
+		expect(missingDiag.remedy.actions[0].id).toBe("install_runtime");
+		expect(missingDiag.remedy.actions[0].label).toBe("Install and set up");
+		expect(missingDiag.remedy.actions[0].title).toBe("Installing Apple container 1.7.1");
+		expect(missingDiag.remedy.actions[0].mode).toBe("foreground");
+		expect(missingDiag.remedy.actions[0].preview).toEqual([
+			"curl -fLo container-1.7.1-installer-signed.pkg https://github.com/apple/container/releases/download/1.7.1/container-1.7.1-installer-signed.pkg",
+			"sudo installer -pkg container-1.7.1-installer-signed.pkg -target /",
+			"container system start --enable-kernel-install",
+		]);
+
+		const oldMacHost = fakeHost(state, {}, {}, undefined, {
+			sysctlPath: arm64Sysctl,
+			swVersPath: macos15SwVers,
+		});
+		oldMacHost.containerCommand = join(root, "nonexistent-container-bin");
+		expect(await probeHost(oldMacHost)).toEqual({
 			kind: "runtime_missing",
 			reason: "Apple container is not installed",
 			remedy: {
 				kind: "manual",
 				instructions: [
+					"Automatic installation requires macOS 26 or later (found 15.4)",
 					"Install Apple container (>= 1.5.0) from https://github.com/apple/container/releases",
 					"container system start --enable-kernel-install",
 				],
 			},
+		});
+
+		const intelHost = fakeHost(state, {}, {}, undefined, {
+			sysctlPath: intelSysctl,
+			swVersPath: macos26SwVers,
+		});
+		intelHost.containerCommand = join(root, "nonexistent-container-bin");
+		expect(await probeHost(intelHost)).toEqual({
+			kind: "unsupported",
+			reason: "Apple container requires Apple silicon (arm64)",
+		});
+
+		// Installed and running container is accepted regardless of macOS version
+		const runningOnOldMac = fakeHost(state, {}, {}, undefined, {
+			sysctlPath: arm64Sysctl,
+			swVersPath: macos15SwVers,
+		});
+		expect(await probeHost(runningOnOldMac)).toMatchObject({
+			kind: "ready",
+			image: "polar-sandbox:test",
+			version: "1.7.1",
 		});
 
 		// Row 2: exit != 0, status is "unregistered" or "not running", container --version >= 1.5.0 -> runtime_not_ready with start_service (including runQuick)

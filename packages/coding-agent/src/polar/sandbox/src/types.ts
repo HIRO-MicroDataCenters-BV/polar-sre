@@ -158,6 +158,7 @@ export type ActionResult = { ok: true; detail?: string } | { ok: false; reason: 
 export interface SetupAction {
 	id: SetupActionId;
 	label: string;
+	title?: string;
 	preview: string[];
 	mode: SetupActionMode;
 	run(io: ActionIO): Promise<ActionResult>;

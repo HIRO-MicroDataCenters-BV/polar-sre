@@ -4,7 +4,7 @@ import lockfile from "proper-lockfile";
 import { setTimeout as sleep } from "timers/promises";
 import { getAgentDir } from "../../../config.ts";
 import { probeHost } from "./host.ts";
-import type { ActionIO, HostDiagnosis, SandboxHost, SetupAction, SetupActionId } from "./types.ts";
+import type { ActionIO, ActionResult, HostDiagnosis, SandboxHost, SetupAction, SetupActionId } from "./types.ts";
 
 const LOCK_STALE_MS = 30_000;
 const LOCK_UPDATE_MS = 1_000;
@@ -34,13 +34,18 @@ export type HostSetupOutcome =
 	| { kind: "stale"; diagnosis: HostDiagnosis }
 	| { kind: "finished"; result: SetupTaskResult };
 
+export type ForegroundRunner = (
+	action: SetupAction,
+	execute: (io: Pick<ActionIO, "onDownloadProgress" | "handoffTerminal">) => Promise<ActionResult>,
+	signal: AbortSignal,
+) => Promise<ActionResult>;
+
 export interface SetupTaskCallbacks {
 	signal: AbortSignal;
 	onActionStart?: (action: SetupAction) => void;
 	onLine?: (line: string) => void;
 	onActionEnd?: () => void;
-	onDownloadProgress?: (doneBytes: number, totalBytes?: number) => void;
-	handoffTerminal?: <T>(fn: () => Promise<T>) => Promise<T>;
+	runForeground?: ForegroundRunner;
 }
 
 export type MachineLockOutcome<T> = { locked: false } | { locked: true; value: T };
@@ -224,21 +229,8 @@ export async function runHostSetup(
 
 				const completedActions: SetupActionId[] = [];
 				let action: SetupAction = firstAction;
-				let stepIndex = 0;
 
 				while (true) {
-					if (stepIndex > 0 && action.mode === "foreground") {
-						return {
-							kind: "finished",
-							result: {
-								diagnosis: currentDiagnosis,
-								completedActions,
-								stopReason: "foreground_required",
-								reason: `${currentDiagnosis.kind === "ready" ? "additional setup step required" : currentDiagnosis.reason}; run /sandbox to continue`,
-							},
-						};
-					}
-
 					let lastLine: string | undefined;
 					if (action.mode === "background") {
 						callbacks.onActionStart?.(action);
@@ -251,13 +243,20 @@ export async function runHostSetup(
 							if (trimmed !== "") lastLine = trimmed;
 							if (action.mode === "background") callbacks.onLine?.(line);
 						},
-						onDownloadProgress: callbacks.onDownloadProgress,
-						handoffTerminal: callbacks.handoffTerminal,
 					};
 
 					let outcome: Awaited<ReturnType<SetupAction["run"]>>;
 					try {
-						outcome = await action.run(io);
+						if (action.mode === "foreground" && callbacks.runForeground !== undefined) {
+							const currentAction = action;
+							outcome = await callbacks.runForeground(
+								currentAction,
+								(foregroundIO) => currentAction.run({ ...io, ...foregroundIO }),
+								taskAbort.signal,
+							);
+						} else {
+							outcome = await action.run(io);
+						}
 					} finally {
 						if (action.mode === "background") callbacks.onActionEnd?.();
 					}
@@ -355,12 +354,26 @@ export async function runHostSetup(
 						};
 					}
 
+					if (next.kind !== currentDiagnosis.kind && next.remedy.actions[0].mode === "foreground") {
+						return {
+							kind: "finished",
+							result: {
+								diagnosis: next,
+								completedActions,
+								stopReason: "foreground_required",
+								reason: `${next.reason}; run /sandbox to continue`,
+							},
+						};
+					}
+
 					const prevRank = diagnosisRank(currentDiagnosis);
 					const nextRank = diagnosisRank(next);
 					if (prevRank === undefined || nextRank === undefined || nextRank <= prevRank) {
 						const reason =
 							actionDetail !== undefined && actionDetail !== ""
-								? `${next.reason} (${actionDetail})`
+								? actionDetail.includes("\n")
+									? `${next.reason}\n${actionDetail}`
+									: `${next.reason} (${actionDetail})`
 								: next.reason;
 						return {
 							kind: "finished",
@@ -375,7 +388,6 @@ export async function runHostSetup(
 
 					currentDiagnosis = next;
 					action = next.remedy.actions[0];
-					stepIndex += 1;
 				}
 			},
 		);

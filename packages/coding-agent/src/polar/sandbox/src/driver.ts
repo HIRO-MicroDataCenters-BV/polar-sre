@@ -13,6 +13,8 @@ export {
 	sandboxArguments,
 } from "./drivers/apple.ts";
 
+export type { AppleInstallOptions } from "./drivers/apple-install.ts";
+
 export {
 	cleanupK8sPod,
 	DEFAULT_SERVICE_ACCOUNT_DIR,

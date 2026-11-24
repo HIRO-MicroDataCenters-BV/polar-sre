@@ -3,7 +3,13 @@ import type { ExtensionContext, SessionShutdownEvent } from "../../../core/exten
 import { formatDiagnosisWarning, probeHost, SANDBOX_OFF_STATUS } from "./host.ts";
 import { showImageOperation } from "./indicator.ts";
 import { readSandboxPreferences, updateSandboxPreferences } from "./preferences.ts";
-import { defaultDiagnosisAction, runHostSetup, runQuickSetup, type SetupTaskResult } from "./setup.ts";
+import {
+	defaultDiagnosisAction,
+	type ForegroundRunner,
+	runHostSetup,
+	runQuickSetup,
+	type SetupTaskResult,
+} from "./setup.ts";
 import type {
 	Activation,
 	HostDiagnosis,
@@ -146,7 +152,11 @@ export class SandboxController {
 		return outcome;
 	}
 
-	startSetup(actionId: SetupActionId, ctx: ExtensionContext): Promise<StartSetupOutcome> {
+	startSetup(
+		actionId: SetupActionId,
+		ctx: ExtensionContext,
+		options?: { runForeground?: ForegroundRunner },
+	): Promise<StartSetupOutcome> {
 		if (!this.isAlive() || this.state === "disabled" || this.pending !== undefined) {
 			return Promise.resolve({ kind: "busy" });
 		}
@@ -164,6 +174,7 @@ export class SandboxController {
 			try {
 				const outcome = await runHostSetup(this.host, actionId, {
 					signal: abortController.signal,
+					runForeground: options?.runForeground,
 					onActionStart: (action) => {
 						this.mountWidget(ctx, operationKindFor(action));
 						resolveStart({ kind: "started" });

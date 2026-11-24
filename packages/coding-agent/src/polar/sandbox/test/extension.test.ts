@@ -1,5 +1,9 @@
-import { randomUUID } from "crypto";
+import type { Component, TUI } from "@earendil-works/pi-tui";
+import { createHash, randomUUID } from "crypto";
+import { readdirSync } from "fs";
 import { access, chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "fs/promises";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "http";
+import type { AddressInfo } from "net";
 import { tmpdir } from "os";
 import { delimiter, join } from "path";
 import type { TObject } from "typebox";
@@ -15,7 +19,12 @@ import type {
 import sandboxExtension, { DEFAULT_IMAGE, REGISTRY_IMAGE, RUN_CODE_RULES } from "../index.ts";
 import { runSandboxCommand } from "../src/command.ts";
 import { SandboxController } from "../src/controller.ts";
-import { BUILD_IMAGE_OPTION, DOWNLOAD_IMAGE_OPTION, ROOTLESS_DOCKER_UNSUPPORTED } from "../src/driver.ts";
+import {
+	type AppleInstallOptions,
+	BUILD_IMAGE_OPTION,
+	DOWNLOAD_IMAGE_OPTION,
+	ROOTLESS_DOCKER_UNSUPPORTED,
+} from "../src/driver.ts";
 import {
 	FAKE_CONTAINER,
 	FAKE_OCI,
@@ -54,15 +63,29 @@ const ENV_KEYS = ["PATH", "POLAR_ARTIFACTS_DIR", "POLAR_CODING_AGENT_DIR", "FAKE
 let root: string;
 let bin: string;
 let state: FakeState;
+let defaultSysctlPath: string;
+let defaultSwVersPath: string;
 let savedEnv: [string, string | undefined][] = [];
+let savedStdinIsTty: boolean | undefined;
+let savedStdoutIsTty: boolean | undefined;
 let shutdowns: (() => Promise<unknown>)[] = [];
 
 beforeEach(async () => {
 	savedEnv = ENV_KEYS.map((key) => [key, process.env[key]]);
+	savedStdinIsTty = process.stdin.isTTY;
+	savedStdoutIsTty = process.stdout.isTTY;
+	process.stdin.isTTY = true;
+	process.stdout.isTTY = true;
 	fault.failReplyOnce = false;
 	root = await mkdtemp(join(tmpdir(), "sandbox-extension-"));
 	bin = join(root, "bin");
 	await mkdir(bin, { recursive: true });
+	defaultSysctlPath = join(root, "sysctl-default");
+	await writeFile(defaultSysctlPath, "#!/bin/sh\necho 1\n");
+	await chmod(defaultSysctlPath, 0o755);
+	defaultSwVersPath = join(root, "sw_vers-default");
+	await writeFile(defaultSwVersPath, "#!/bin/sh\necho 26.5.1\n");
+	await chmod(defaultSwVersPath, 0o755);
 	state = await fakeState();
 	await setKnobs();
 	process.env.PATH = `${bin}${delimiter}${process.env.PATH ?? ""}`;
@@ -75,6 +98,8 @@ beforeEach(async () => {
 afterEach(async () => {
 	for (const shutdown of shutdowns) await shutdown();
 	shutdowns = [];
+	process.stdin.isTTY = savedStdinIsTty as boolean;
+	process.stdout.isTTY = savedStdoutIsTty as boolean;
 	for (const [key, value] of savedEnv) {
 		if (value === undefined) delete process.env[key];
 		else process.env[key] = value;
@@ -100,7 +125,12 @@ interface FakeContextOptions {
 	selectChoices?: (string | undefined)[];
 	onSelect?: SelectHandler;
 	mode?: string;
+	tuiMode?: "regular" | "fullscreen";
 	sessionId?: string;
+	isIdle?: () => boolean;
+	hasPendingMessages?: () => boolean;
+	waitForIdle?: () => Promise<void>;
+	onLoaderMessage?: (message: string, pressEscape: () => void) => void;
 }
 
 function fakeContext(options: FakeContextOptions = {}) {
@@ -108,10 +138,18 @@ function fakeContext(options: FakeContextOptions = {}) {
 	const footer = new Map<string, string | undefined>();
 	const selects: [string, string[]][] = [];
 	const widgets: [string, "shown" | "removed"][] = [];
+	const loaderMessages: string[] = [];
+	const tuiEvents: string[] = [];
+	let tuiStopped = false;
+	let activeCustomComponent: (Component & { dispose?(): void }) | undefined;
 	const hasUI = options.hasUI ?? true;
 	const queue = options.selectChoices ? [...options.selectChoices] : [];
 	let selectHandler: SelectHandler | undefined = options.onSelect;
 	let fallbackChoice: string | undefined = options.selectChoice;
+	let isIdleFn: () => boolean = options.isIdle ?? (() => true);
+	let hasPendingFn: () => boolean = options.hasPendingMessages ?? (() => false);
+	let waitForIdleFn: () => Promise<void> = options.waitForIdle ?? (async () => {});
+	let onLoaderMessageFn = options.onLoaderMessage;
 	let invalidated = false;
 	const assertValid = () => {
 		if (invalidated) throw new Error("context invalidated");
@@ -121,8 +159,9 @@ function fakeContext(options: FakeContextOptions = {}) {
 		mode: options.mode ?? (hasUI ? "tui" : "print"),
 		hasUI,
 		cwd: process.cwd(),
-		isIdle: () => true,
-		hasPendingMessages: () => false,
+		isIdle: () => isIdleFn(),
+		hasPendingMessages: () => hasPendingFn(),
+		waitForIdle: () => waitForIdleFn(),
 		ui: {
 			notify: (message: string, type?: string) => {
 				assertValid();
@@ -143,16 +182,90 @@ function fakeContext(options: FakeContextOptions = {}) {
 				if (queue.length > 0) return queue.shift();
 				return fallbackChoice;
 			},
+			custom: async <T>(
+				factory: (
+					tui: TUI,
+					theme: { fg: (color: string, text: string) => string },
+					keybindings: unknown,
+					done: (result: T) => void,
+				) => (Component & { dispose?(): void }) | Promise<Component & { dispose?(): void }>,
+			): Promise<T> => {
+				assertValid();
+				if (context.mode !== "tui") return undefined as T;
+				return new Promise<T>((resolve) => {
+					const fakeTui = {
+						mode: options.tuiMode ?? "regular",
+						renderNow: () => {
+							tuiEvents.push("renderNow");
+						},
+						requestRender: (force?: boolean) => {
+							if (force) tuiEvents.push("requestRender:force");
+						},
+						stop: (opts?: { preserveScreen?: boolean }) => {
+							tuiStopped = true;
+							tuiEvents.push(`stop:${Boolean(opts?.preserveScreen)}`);
+						},
+						start: () => {
+							tuiStopped = false;
+							tuiEvents.push("start");
+						},
+						terminal: {
+							drainInput: async () => {
+								tuiEvents.push("drainInput");
+							},
+						},
+					} as unknown as TUI;
+					const fakeTheme = { fg: (_color: string, text: string) => text };
+					const finish = (result: T) => {
+						activeCustomComponent?.dispose?.();
+						activeCustomComponent = undefined;
+						resolve(result);
+					};
+					void Promise.resolve(factory(fakeTui, fakeTheme, {}, finish)).then((component) => {
+						activeCustomComponent = component;
+						const recordRender = () => {
+							const rendered = component
+								.render(100)
+								.map((line) => line.trim())
+								.filter((line) => line !== "")
+								.join("\n");
+							if (rendered !== "") {
+								loaderMessages.push(rendered);
+								onLoaderMessageFn?.(rendered, () => {
+									component.handleInput?.("\x1b");
+								});
+							}
+						};
+						recordRender();
+						const maybeLoader = component as unknown as {
+							setMessage?: (message: string) => void;
+						};
+						if (typeof maybeLoader.setMessage === "function") {
+							const originalSetMessage = maybeLoader.setMessage.bind(maybeLoader);
+							maybeLoader.setMessage = (message: string) => {
+								originalSetMessage(message);
+								recordRender();
+							};
+						}
+					});
+				});
+			},
 		},
 		sessionManager: { getSessionId: () => sessionId },
 		shutdown: () => {},
 	};
 	return {
-		ctx: context as unknown as ExtensionContext,
+		ctx: context as unknown as ExtensionCommandContext,
 		notices,
 		footer,
 		selects,
 		widgets,
+		loaderMessages,
+		tuiEvents,
+		isTuiStopped: () => tuiStopped,
+		pressEscape: () => {
+			activeCustomComponent?.handleInput?.("\x1b");
+		},
 		assertValid,
 		invalidate: () => {
 			invalidated = true;
@@ -170,10 +283,24 @@ function fakeContext(options: FakeContextOptions = {}) {
 		setOnSelect: (handler: SelectHandler | undefined) => {
 			selectHandler = handler;
 		},
+		setIdleState: (idle: boolean, pending = false) => {
+			isIdleFn = () => idle;
+			hasPendingFn = () => pending;
+		},
+		setWaitForIdle: (fn: () => Promise<void>) => {
+			waitForIdleFn = fn;
+		},
+		setOnLoaderMessage: (fn: ((message: string, pressEscape: () => void) => void) | undefined) => {
+			onLoaderMessageFn = fn;
+		},
 	};
 }
 
-function loadExtension(flagValues: Record<string, string> = {}, contextOptions: FakeContextOptions = {}) {
+function loadExtension(
+	flagValues: Record<string, string> = {},
+	contextOptions: FakeContextOptions = {},
+	appleOptions?: AppleInstallOptions,
+) {
 	const flags: Record<string, string> = { "sandbox-driver": "apple-container", ...flagValues };
 	const {
 		ctx,
@@ -181,11 +308,18 @@ function loadExtension(flagValues: Record<string, string> = {}, contextOptions: 
 		footer,
 		selects,
 		widgets,
+		loaderMessages,
+		tuiEvents,
+		isTuiStopped,
+		pressEscape,
 		assertValid,
 		invalidate,
 		setSelectChoice,
 		setSelectChoices,
 		setOnSelect,
+		setIdleState,
+		setWaitForIdle,
+		setOnLoaderMessage,
 	} = fakeContext(contextOptions);
 	const toolRegistry = new Map<string, ToolDefinition<TObject>>();
 	const commands = new Map<string, CommandOption>();
@@ -214,7 +348,11 @@ function loadExtension(flagValues: Record<string, string> = {}, contextOptions: 
 			return (...args: never[]) => target[name]?.(...args);
 		},
 	});
-	sandboxExtension(pi as unknown as ExtensionAPI);
+	sandboxExtension(pi as unknown as ExtensionAPI, {
+		sysctlPath: defaultSysctlPath,
+		swVersPath: defaultSwVersPath,
+		...appleOptions,
+	});
 	const fire = async (eventName: string, event: object) => handlers.get(eventName)?.(event, ctx);
 	const visibleTools = () => [...toolRegistry.values()].filter((tool) => tool.exposure !== "hidden");
 	const extension = {
@@ -228,11 +366,18 @@ function loadExtension(flagValues: Record<string, string> = {}, contextOptions: 
 		footer,
 		selects,
 		widgets,
+		loaderMessages,
+		tuiEvents,
+		isTuiStopped,
+		pressEscape,
 		flagDefaults,
 		invalidate,
 		setSelectChoice,
 		setSelectChoices,
 		setOnSelect,
+		setIdleState,
+		setWaitForIdle,
+		setOnLoaderMessage,
 		startSession: () => fire("session_start", { type: "session_start", reason: "startup" }),
 		shutdown: (reason: ShutdownReason = "quit") => fire("session_shutdown", { type: "session_shutdown", reason }),
 		runCommand: async (name = "sandbox", args = "") => {
@@ -1600,5 +1745,516 @@ describe("sandbox extension", () => {
 		expect(executed.isError).toBe(false);
 		expect(text(executed)).toContain("chain-ok");
 		await pi.shutdown();
+	});
+
+	describe("Apple container installation", () => {
+		const pkgPayload = Buffer.concat([Buffer.alloc(1_000_000, 0x61), Buffer.alloc(1_000_000, 0x62)]);
+		const pkgSha256 = createHash("sha256").update(pkgPayload).digest("hex");
+		const teamId = "UPBK2H6LZM";
+
+		let server: Server;
+		let pkgUrl: string;
+		let requestMode: "normal" | "corrupt" | "hang";
+		let httpRequests: number;
+		let hangResponse: ServerResponse | undefined;
+		let scriptsDir: string;
+		let installerLogPath: string;
+		let containerBinaryBackup: string;
+		let terminalOutput: string[];
+		let baseAppleOptions: AppleInstallOptions;
+
+		const writeScript = async (name: string, body: string): Promise<string> => {
+			const target = join(scriptsDir, name);
+			await writeFile(target, `#!/bin/sh\n${body}\n`);
+			await chmod(target, 0o755);
+			return target;
+		};
+
+		const makeInstallerScript = async (extraBody = ""): Promise<string> =>
+			writeScript(
+				"installer",
+				[
+					`"${process.execPath}" -e '`,
+					`const fs = require("fs");`,
+					`const argv = process.argv.slice(1);`,
+					`const pkgIdx = argv.indexOf("-pkg");`,
+					`const pkgPath = pkgIdx >= 0 ? argv[pkgIdx + 1] : "";`,
+					`fs.appendFileSync(${JSON.stringify(installerLogPath)}, JSON.stringify({ argv, pkgExists: fs.existsSync(pkgPath), pathEnv: process.env.PATH }) + "\\n");`,
+					`' -- "$@"`,
+					extraBody,
+				].join("\n"),
+			);
+
+		const installDirFiles = async (): Promise<string[]> => {
+			const agentDir = process.env.POLAR_CODING_AGENT_DIR!;
+			const entries = await readdir(agentDir, { withFileTypes: true }).catch(() => []);
+			const found: string[] = [];
+			for (const entry of entries) {
+				if (entry.isDirectory()) {
+					const inner = await readdir(join(agentDir, entry.name)).catch(() => []);
+					for (const name of inner) {
+						if (name.endsWith(".pkg") || name.endsWith(".pkg.part")) {
+							found.push(join(entry.name, name));
+						}
+					}
+				} else if (entry.name.endsWith(".pkg") || entry.name.endsWith(".pkg.part")) {
+					found.push(entry.name);
+				}
+			}
+			return found;
+		};
+
+		const readInstallerCalls = async (): Promise<{ argv: string[]; pkgExists: boolean; pathEnv: string }[]> => {
+			const raw = await readFile(installerLogPath, "utf8").catch(() => "");
+			return raw
+				.split("\n")
+				.filter((line) => line !== "")
+				.map((line) => JSON.parse(line));
+		};
+
+		beforeEach(async () => {
+			requestMode = "normal";
+			httpRequests = 0;
+			hangResponse = undefined;
+			terminalOutput = [];
+
+			server = createServer((_req: IncomingMessage, res: ServerResponse) => {
+				httpRequests += 1;
+				if (requestMode === "corrupt") {
+					const bad = Buffer.from("corrupted-installer-bytes");
+					res.writeHead(200, { "content-length": String(bad.byteLength) });
+					res.end(bad);
+					return;
+				}
+				res.writeHead(200, { "content-length": String(pkgPayload.byteLength) });
+				res.write(pkgPayload.subarray(0, 1_000_000));
+				if (requestMode === "hang") {
+					hangResponse = res;
+					return;
+				}
+				setTimeout(() => {
+					res.end(pkgPayload.subarray(1_000_000));
+				}, 15);
+			});
+			await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+			const port = (server.address() as AddressInfo).port;
+			pkgUrl = `http://127.0.0.1:${port}/container-1.7.1-installer-signed.pkg`;
+
+			scriptsDir = join(root, "install-scripts");
+			await mkdir(scriptsDir, { recursive: true });
+			installerLogPath = join(root, "installer-calls.jsonl");
+			containerBinaryBackup = join(root, "container-wrapper-backup");
+			await setKnobs({ SERVICE_STOPPED: "1", IMAGE_MISSING: "1" });
+			await writeFile(containerBinaryBackup, await readFile(join(bin, "container"), "utf8"));
+			process.env.PATH = bin;
+			await rm(join(bin, "container"), { force: true });
+
+			const pkgutilOk = await writeScript(
+				"pkgutil-ok",
+				`echo "Package: container-1.7.1-installer-signed.pkg"\necho "   Status: signed by a developer certificate issued by Apple for distribution"\necho "   Certificate Chain:"\necho "    1. Developer ID Installer: Apple Inc. - Containerization (${teamId})"`,
+			);
+			const sudoPassThrough = await writeScript("sudo-pass", `if [ "$1" = "--" ]; then shift; fi\nexec "$@"`);
+			const baseInstaller = await makeInstallerScript();
+			baseAppleOptions = {
+				pkgUrl,
+				pkgSha256,
+				teamId,
+				pkgutilPath: pkgutilOk,
+				sudoPath: sudoPassThrough,
+				installerPath: baseInstaller,
+				writeStdout: (chunk: string | Buffer) => terminalOutput.push(String(chunk)),
+				writeStderr: (chunk: string | Buffer) => terminalOutput.push(String(chunk)),
+			};
+		});
+
+		afterEach(async () => {
+			hangResponse?.end();
+			hangResponse = undefined;
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+		});
+
+		it("installs Apple container with download progress, terminal handoff, and background service and image setup", async () => {
+			const installingScript = await makeInstallerScript(
+				`cp "${containerBinaryBackup}" "${join(bin, "container")}" && chmod 755 "${join(bin, "container")}"`,
+			);
+			const session = loadExtension(
+				{},
+				{ selectChoice: "Install and set up" },
+				{ ...baseAppleOptions, installerPath: installingScript },
+			);
+			await session.startSession();
+			expect(session.tools).toEqual([]);
+			expect(session.footer.get("sandbox")).toBe("sandbox: off, run /sandbox");
+
+			await session.runCommand("sandbox");
+
+			const [selectTitle, selectItems] = session.selects.at(-1) ?? ["", []];
+			expect(selectTitle).toContain("Sandbox is off: Apple container is not installed");
+			expect(selectTitle).toContain(
+				"1. Download and install Apple container 1.7.1 — 170 MB, signed by Apple. Asks for your macOS password.",
+			);
+			expect(selectTitle).toContain(
+				"2. Start the container service — the first start downloads a Linux kernel, about 680 MB.",
+			);
+			expect(selectTitle).toContain("3. Download the sandbox image — 240 MB.");
+			expect(selectItems).toEqual(["Install and set up", "Show commands", "Disable sandbox", "Cancel"]);
+
+			expect(session.loaderMessages[0]).toContain("Downloading the installer...");
+			expect(
+				session.loaderMessages.some(
+					(m) =>
+						m.includes("Installing Apple container 1.7.1") &&
+						m.includes("Downloading the installer: 1 of 2 MB") &&
+						m.includes("Esc cancels. Nothing is installed until you enter your password."),
+				),
+			).toBe(true);
+			expect(
+				session.loaderMessages.some(
+					(m) =>
+						m.includes("Installing Apple container 1.7.1") &&
+						m.includes("Downloading the installer: 2 of 2 MB") &&
+						m.includes("Esc cancels. Nothing is installed until you enter your password."),
+				),
+			).toBe(true);
+			expect(session.loaderMessages.at(-1)).not.toContain("Esc cancels");
+			expect(session.tuiEvents).toEqual(["renderNow", "drainInput", "stop:false", "start", "requestRender:force"]);
+			const joinedTerminal = terminalOutput.join("");
+			expect(joinedTerminal).toContain("Polar is paused. macOS asks for your password to install Apple container.");
+			expect(joinedTerminal).toContain(
+				`Verified: signed by Apple Inc. (${teamId}), SHA-256 ${pkgSha256.slice(0, 8)}…${pkgSha256.slice(-4)}`,
+			);
+			expect(joinedTerminal).toContain("container-1.7.1-installer-signed.pkg -target /");
+
+			const installCalls = await readInstallerCalls();
+			expect(installCalls).toHaveLength(1);
+			expect(installCalls[0]?.pkgExists).toBe(true);
+			expect(installCalls[0]?.argv[1]).toMatch(/container-1\.7\.1-installer-signed\.pkg$/);
+			expect(await installDirFiles()).toEqual([]);
+
+			await until(() => session.tools.length === 1);
+			expect(session.tools.map((t) => t.name)).toEqual(["run_code"]);
+			expect(session.footer.get("sandbox")).toBeUndefined();
+			expect(session.notices).toContainEqual(["sandbox: ready", "info"]);
+			const cliCalls = await state.calls();
+			expect(cliCalls).toContainEqual(["system", "start", "--enable-kernel-install"]);
+			expect(cliCalls).toContainEqual(["image", "pull", "--arch", "arm64", REGISTRY_IMAGE]);
+			const executed = await session.execute("call-1", {
+				language: "bash",
+				code: "stdout:installed-and-ready",
+			});
+			expect(executed.isError).toBe(false);
+			expect(text(executed)).toContain("installed-and-ready");
+			expect(
+				JSON.parse(await readFile(join(process.env.POLAR_CODING_AGENT_DIR!, "sandbox.json"), "utf8"))
+					.autoStartService,
+			).toBe(true);
+		});
+
+		it("aborts installation when SHA-256 does not match and deletes the downloaded file", async () => {
+			requestMode = "corrupt";
+			const session = loadExtension({}, { selectChoice: "Install and set up" }, baseAppleOptions);
+			await session.startSession();
+			await session.runCommand("sandbox");
+			expect(httpRequests).toBe(1);
+			expect(await readInstallerCalls()).toEqual([]);
+			expect(session.tuiEvents.some((e) => e.startsWith("stop:"))).toBe(false);
+			expect(await installDirFiles()).toEqual([]);
+			expect(session.notices.at(-1)?.[0]).toContain("SHA-256");
+		});
+
+		it("aborts installation when pkgutil signature verification fails or reports a different Team ID", async () => {
+			const pkgutilFail = await writeScript(
+				"pkgutil-fail",
+				'echo \'Package "container-1.7.1-installer-signed.pkg":\'\necho "   Status: no signature"\nexit 1',
+			);
+			const sigFailSession = loadExtension(
+				{},
+				{ selectChoice: "Install and set up" },
+				{ ...baseAppleOptions, pkgutilPath: pkgutilFail },
+			);
+			await sigFailSession.startSession();
+			await sigFailSession.runCommand("sandbox");
+			expect(await readInstallerCalls()).toEqual([]);
+			expect(sigFailSession.tuiEvents.some((e) => e.startsWith("stop:"))).toBe(false);
+			expect(await installDirFiles()).toEqual([]);
+			expect(sigFailSession.notices.at(-1)?.[0]).toContain("Status: no signature");
+			await sigFailSession.shutdown();
+
+			const pkgutilWrongTeam = await writeScript(
+				"pkgutil-wrong-team",
+				'echo "1. Developer ID Installer: Another Vendor (WRONG12345)"',
+			);
+			const wrongTeamSession = loadExtension(
+				{},
+				{ selectChoice: "Install and set up" },
+				{ ...baseAppleOptions, pkgutilPath: pkgutilWrongTeam },
+			);
+			await wrongTeamSession.startSession();
+			await wrongTeamSession.runCommand("sandbox");
+			expect(await readInstallerCalls()).toEqual([]);
+			expect(wrongTeamSession.tuiEvents.some((e) => e.startsWith("stop:"))).toBe(false);
+			expect(await installDirFiles()).toEqual([]);
+			expect(wrongTeamSession.notices.at(-1)?.[0]).toContain(teamId);
+		});
+
+		it("cancels during installer download on Escape and removes the partial file", async () => {
+			requestMode = "hang";
+			let partFilesAtEscape: string[] = [];
+			const session = loadExtension(
+				{},
+				{
+					selectChoice: "Install and set up",
+					onLoaderMessage: (msg, pressEscape) => {
+						if (msg.includes("Downloading the installer: 1 of 2 MB")) {
+							partFilesAtEscape = readdirSync(
+								join(process.env.POLAR_CODING_AGENT_DIR!, "container-install"),
+							).filter((name) => name.endsWith(".pkg.part"));
+							pressEscape();
+						}
+					},
+				},
+				baseAppleOptions,
+			);
+			await session.startSession();
+			await session.runCommand("sandbox");
+			expect(httpRequests).toBe(1);
+			expect(partFilesAtEscape).toHaveLength(1);
+			expect(await installDirFiles()).toEqual([]);
+			expect(await readInstallerCalls()).toEqual([]);
+			expect(session.tuiEvents.some((e) => e.startsWith("stop:"))).toBe(false);
+			expect(session.footer.get("sandbox")).toBe("sandbox: off, run /sandbox");
+		});
+
+		it("cancels on Escape while waiting for agent idleness before terminal handoff", async () => {
+			let waitForIdleStarted = false;
+			let releaseIdleWait!: () => void;
+			const idleWaitGate = new Promise<void>((resolve) => {
+				releaseIdleWait = resolve;
+			});
+			const session = loadExtension(
+				{},
+				{
+					selectChoice: "Install and set up",
+					onLoaderMessage: (msg) => {
+						if (msg.includes("Downloading the installer: 1 of 2 MB")) {
+							session.setIdleState(false);
+						}
+					},
+					waitForIdle: () => {
+						waitForIdleStarted = true;
+						return idleWaitGate;
+					},
+				},
+				baseAppleOptions,
+			);
+			await session.startSession();
+			let commandDone = false;
+			const commandPromise = session.runCommand("sandbox").finally(() => {
+				commandDone = true;
+			});
+			try {
+				await until(() => waitForIdleStarted);
+				expect(
+					session.loaderMessages.some((m) => m.includes("Waiting for the current response to finish...")),
+				).toBe(true);
+				session.pressEscape();
+				await until(() => commandDone, 1000);
+				await commandPromise;
+				expect(await readInstallerCalls()).toEqual([]);
+				expect(session.tuiEvents.some((e) => e.startsWith("stop:"))).toBe(false);
+				expect(await installDirFiles()).toEqual([]);
+				expect(session.footer.get("sandbox")).toBe("sandbox: off, run /sandbox");
+			} finally {
+				releaseIdleWait();
+				await commandPromise;
+			}
+		});
+
+		it("waits when isIdle() is true and hasPendingMessages() is true, then proceeds once the queue drains", async () => {
+			const installingScript = await makeInstallerScript(
+				`cp "${containerBinaryBackup}" "${join(bin, "container")}" && chmod 755 "${join(bin, "container")}"`,
+			);
+			let waitForIdleCalls = 0;
+			const session = loadExtension(
+				{},
+				{
+					selectChoice: "Install and set up",
+					onLoaderMessage: (msg) => {
+						if (msg.includes("Downloading the installer: 1 of 2 MB")) {
+							session.setIdleState(true, true);
+						}
+					},
+					waitForIdle: async () => {
+						waitForIdleCalls += 1;
+					},
+				},
+				{ ...baseAppleOptions, installerPath: installingScript },
+			);
+			await session.startSession();
+			const commandPromise = session.runCommand("sandbox");
+
+			await until(() => waitForIdleCalls >= 1);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			expect(session.loaderMessages.some((m) => m.includes("Waiting for the current response to finish..."))).toBe(
+				true,
+			);
+			expect(session.tuiEvents.some((e) => e.startsWith("stop:"))).toBe(false);
+			expect(await readInstallerCalls()).toEqual([]);
+
+			session.setIdleState(true, false);
+			await commandPromise;
+			expect(await readInstallerCalls()).toHaveLength(1);
+			await until(() => session.tools.length === 1);
+			expect(session.notices).toContainEqual(["sandbox: ready", "info"]);
+		});
+
+		it("reports installer failure output and exact commands after TUI resumes", async () => {
+			const failingInstaller = await makeInstallerScript('echo "sudo: 3 incorrect password attempts" >&2\nexit 1');
+			const session = loadExtension(
+				{},
+				{ selectChoice: "Install and set up", tuiMode: "fullscreen" },
+				{ ...baseAppleOptions, installerPath: failingInstaller },
+			);
+			await session.startSession();
+			await session.runCommand("sandbox");
+			const failedCalls = await readInstallerCalls();
+			expect(failedCalls).toHaveLength(1);
+			expect(failedCalls[0]?.pkgExists).toBe(true);
+			expect(failedCalls[0]?.argv[0]).toBe("-pkg");
+			expect(failedCalls[0]?.argv[1]).toMatch(/container-1\.7\.1-installer-signed\.pkg$/);
+			expect(failedCalls[0]?.pathEnv).toBe("/usr/bin:/bin:/usr/sbin:/sbin");
+			expect(session.tuiEvents).toEqual(["renderNow", "drainInput", "stop:true", "start", "requestRender:force"]);
+			expect(await installDirFiles()).toEqual([]);
+			const failLines = (session.notices.at(-1)?.[0] ?? "").split("\n");
+			expect(failLines).toEqual([
+				"sandbox is off: Apple container is not installed",
+				"sudo: 3 incorrect password attempts",
+				`curl -fLo container-1.7.1-installer-signed.pkg ${pkgUrl}`,
+				"sudo installer -pkg container-1.7.1-installer-signed.pkg -target /",
+				"container system start --enable-kernel-install",
+			]);
+			expect(failLines.at(-1)).toBe("container system start --enable-kernel-install");
+		});
+
+		it("truncates long installer output to the last 64 lines", async () => {
+			const echoLines = Array.from({ length: 70 }, (_, idx) => {
+				const num = idx + 1;
+				return num === 70
+					? 'echo "installer: fatal error on line 70" >&2'
+					: `echo "installer: step ${num} progress"`;
+			});
+			const noisyInstaller = await makeInstallerScript([...echoLines, "exit 1"].join("\n"));
+			const noisySession = loadExtension(
+				{},
+				{ selectChoice: "Install and set up" },
+				{ ...baseAppleOptions, installerPath: noisyInstaller },
+			);
+			await noisySession.startSession();
+			await noisySession.runCommand("sandbox");
+			const noisyNotice = noisySession.notices.at(-1)?.[0] ?? "";
+			expect(noisyNotice).toContain("installer: fatal error on line 70");
+			expect(noisyNotice).not.toContain("installer: step 1 progress");
+		});
+
+		it("lets the installer finish when cancelled after terminal handoff and stops before background steps", async () => {
+			const markerFile = join(root, "installer-finished-marker");
+			const startedFile = join(root, "installer-started-marker");
+			const slowInstaller = await makeInstallerScript(
+				[
+					`echo "started" > "${startedFile}"`,
+					`sleep 0.2`,
+					`cp "${containerBinaryBackup}" "${join(bin, "container")}" && chmod 755 "${join(bin, "container")}"`,
+					`echo "done" > "${markerFile}"`,
+					`exit 0`,
+				].join("\n"),
+			);
+			const session = loadExtension(
+				{},
+				{ selectChoice: "Install and set up" },
+				{ ...baseAppleOptions, installerPath: slowInstaller },
+			);
+			await session.startSession();
+			const commandPromise = session.runCommand("sandbox");
+			await until(() => exists(startedFile));
+			expect(session.isTuiStopped()).toBe(true);
+			session.pressEscape();
+			await commandPromise;
+			expect(await exists(markerFile)).toBe(true);
+			expect(session.isTuiStopped()).toBe(false);
+			expect(await installDirFiles()).toEqual([]);
+			expect(await state.calls()).toEqual([]);
+			expect((await state.calls()).some((call) => call[0] === "system" && call[1] === "start")).toBe(false);
+			expect(session.notices.some(([msg]) => msg === "sandbox: ready")).toBe(false);
+			expect(session.tools).toEqual([]);
+			expect(session.footer.get("sandbox")).toBe("sandbox: off, run /sandbox");
+		});
+
+		it("prints manual commands without downloading in RPC mode, without a TTY, or when the agent is busy", async () => {
+			const rpcSession = loadExtension({}, { mode: "rpc", selectChoice: "Install and set up" }, baseAppleOptions);
+			await rpcSession.startSession();
+			await rpcSession.runCommand("sandbox");
+			expect(httpRequests).toBe(0);
+			expect(await readInstallerCalls()).toEqual([]);
+			expect(rpcSession.notices.at(-1)?.[0]).toContain(
+				"sudo installer -pkg container-1.7.1-installer-signed.pkg -target /",
+			);
+			await rpcSession.shutdown();
+
+			process.stdin.isTTY = false;
+			const noTtySession = loadExtension({}, { mode: "tui", selectChoice: "Install and set up" }, baseAppleOptions);
+			await noTtySession.startSession();
+			await noTtySession.runCommand("sandbox");
+			expect(httpRequests).toBe(0);
+			expect(await readInstallerCalls()).toEqual([]);
+			expect(noTtySession.notices.at(-1)?.[0]).toContain(
+				"sudo installer -pkg container-1.7.1-installer-signed.pkg -target /",
+			);
+			await noTtySession.shutdown();
+			process.stdin.isTTY = true;
+
+			const busyAtSelect = loadExtension(
+				{},
+				{ mode: "tui", isIdle: () => false, selectChoice: "Install and set up" },
+				baseAppleOptions,
+			);
+			await busyAtSelect.startSession();
+			await busyAtSelect.runCommand("sandbox");
+			expect(httpRequests).toBe(0);
+			expect(await readInstallerCalls()).toEqual([]);
+			expect(busyAtSelect.notices.at(-1)?.[0]).toContain(
+				"sudo installer -pkg container-1.7.1-installer-signed.pkg -target /",
+			);
+		});
+
+		it("stops and asks to run /sandbox when a foreground action is required in the background phase", async () => {
+			const selfRemovingWrapper = join(bin, "container");
+			await writeFile(
+				selfRemovingWrapper,
+				[
+					"#!/bin/sh",
+					`export FAKE_CONTAINER_SERVICE_STOPPED='1'`,
+					`export FAKE_CONTAINER_IMAGE_MISSING='1'`,
+					`if [ "$1" = "system" ] && [ "$2" = "start" ]; then`,
+					`  "${process.execPath}" "${FAKE_CONTAINER}" "$@"`,
+					`  rc=$?`,
+					`  /bin/rm -f "${selfRemovingWrapper}"`,
+					`  exit $rc`,
+					`fi`,
+					`exec "${process.execPath}" "${FAKE_CONTAINER}" "$@"`,
+				].join("\n"),
+			);
+			await chmod(selfRemovingWrapper, 0o755);
+
+			const session = loadExtension({}, { selectChoice: "Start container service" }, baseAppleOptions);
+			await session.startSession();
+			await session.runCommand("sandbox");
+			await until(() =>
+				session.notices.some(([msg, level]) => level === "warning" && msg.includes("run /sandbox to continue")),
+			);
+			expect(httpRequests).toBe(0);
+			expect(await readInstallerCalls()).toEqual([]);
+			expect(session.tools).toEqual([]);
+			expect(session.footer.get("sandbox")).toBe("sandbox: off, run /sandbox");
+		});
 	});
 });

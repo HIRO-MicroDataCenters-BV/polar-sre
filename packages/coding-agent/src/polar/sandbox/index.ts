@@ -7,6 +7,7 @@ import { runSandboxCommand } from "./src/command.ts";
 import { SandboxController } from "./src/controller.ts";
 import {
 	AppleContainerDriver,
+	type AppleInstallOptions,
 	K8sDriver,
 	type K8sDriverOptions,
 	OciDriver,
@@ -93,6 +94,7 @@ export interface RuntimeImageOptions {
 	ociRuntime?: string;
 	k8sPvc?: string;
 	k8sOptions?: K8sDriverOptions;
+	appleOptions?: AppleInstallOptions;
 	platform?: NodeJS.Platform;
 }
 
@@ -142,7 +144,7 @@ export function createHost(
 		createDriver = () => new UnsupportedSandboxDriver("oci", resolved.unsupported);
 	} else if (resolved.name === "apple-container") {
 		containerCommand = "container";
-		createDriver = (context) => new AppleContainerDriver(context);
+		createDriver = (context) => new AppleContainerDriver(context, options.appleOptions);
 	} else if (resolved.name === "oci") {
 		containerCommand = options.ociEngine === "docker" ? "docker" : "podman";
 		createDriver = (context) =>
@@ -216,7 +218,7 @@ export function createRunCodeTool(runtime: SandboxRuntime) {
 	});
 }
 
-export default function sandboxExtension(pi: ExtensionAPI): void {
+export default function sandboxExtension(pi: ExtensionAPI, appleOptions?: AppleInstallOptions): void {
 	let current: SandboxController | undefined;
 
 	pi.registerFlag("sandbox-driver", {
@@ -279,6 +281,7 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
 				ociEngine,
 				ociRuntime,
 				k8sPvc,
+				appleOptions,
 			});
 		const controller = new SandboxController(buildHost, (runtime, options) => {
 			const tool = createRunCodeTool(runtime);

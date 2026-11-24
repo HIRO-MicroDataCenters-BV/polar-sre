@@ -35,6 +35,12 @@ import {
 	type VolumeFailure,
 } from "../types.ts";
 import {
+	type AppleInstallOptions,
+	createInstallRuntimeAction,
+	INSTALL_CONTAINER_OUTLOOK,
+	probeAppleInstallPlatform,
+} from "./apple-install.ts";
+import {
 	artifactsRootOf,
 	BUILD_IMAGE_OPTION,
 	BUILD_TIMEOUT_MS,
@@ -70,11 +76,6 @@ const MIN_CONTAINER_MINOR = 5;
 const START_SERVICE_OPTION = "Start container service";
 const SERVICE_START_OUTLOOK = "Start the container service — the first start downloads a Linux kernel, about 680 MB.";
 const SERVICE_START_TIMEOUT_MS = 1_800_000;
-
-const INSTALL_CONTAINER_INSTRUCTIONS = [
-	"Install Apple container (>= 1.5.0) from https://github.com/apple/container/releases",
-	"container system start --enable-kernel-install",
-];
 
 const UPDATE_CONTAINER_INSTRUCTIONS = [
 	"Update Apple container to >= 1.5.0 from https://github.com/apple/container/releases",
@@ -369,18 +370,35 @@ export class AppleContainerDriver implements SandboxDriver {
 	readonly boundaryDescription = "apple-container (microVM)";
 	readonly supportsServiceAutoStart = true;
 	private readonly runtime: SandboxDriverContext;
+	private readonly installOptions: AppleInstallOptions | undefined;
 
-	constructor(runtime: SandboxDriverContext) {
+	constructor(runtime: SandboxDriverContext, installOptions?: AppleInstallOptions) {
 		this.runtime = runtime;
+		this.installOptions = installOptions;
 	}
 
 	async probeRuntime(): Promise<RuntimeProbeResult> {
 		const status = await containerCommand(this.runtime, ["system", "status", "--format", "json"]);
 		if (status.spawnError === "ENOENT") {
+			const platform = await probeAppleInstallPlatform(this.runtime, this.installOptions);
+			if (platform.kind === "unsupported") {
+				return { kind: "unsupported", reason: platform.reason };
+			}
+			if (platform.kind === "manual") {
+				return {
+					kind: "runtime_missing",
+					reason: "Apple container is not installed",
+					remedy: { kind: "manual", instructions: platform.instructions },
+				};
+			}
 			return {
 				kind: "runtime_missing",
 				reason: "Apple container is not installed",
-				remedy: { kind: "manual", instructions: INSTALL_CONTAINER_INSTRUCTIONS },
+				remedy: {
+					kind: "actions",
+					actions: [createInstallRuntimeAction(this.runtime, this.installOptions)],
+					outlook: [INSTALL_CONTAINER_OUTLOOK, SERVICE_START_OUTLOOK, this.imageOutlook()],
+				},
 			};
 		}
 		if (status.timedOut || status.spawnError !== undefined) {

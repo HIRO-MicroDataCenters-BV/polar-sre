@@ -7,6 +7,7 @@ import { fileURLToPath } from "url";
 import { LineSplitter } from "../src/cli.ts";
 import {
 	AppleContainerDriver,
+	type AppleInstallOptions,
 	artifactsRootOf,
 	K8sDriver,
 	type K8sDriverOptions,
@@ -164,6 +165,7 @@ export function fakeHost(
 	knobs: Record<string, string> = {},
 	limits: Partial<SandboxLimits> = {},
 	imageSpec: ImageSpec = { candidates: ["polar-sandbox:test"], build: "polar-sandbox:test" },
+	appleOptions?: AppleInstallOptions,
 ): SandboxHost {
 	const context: SandboxDriverContext = {
 		containerCommand: FAKE_CONTAINER,
@@ -176,7 +178,7 @@ export function fakeHost(
 		children: new Set(),
 		cliStopped: false,
 	};
-	return Object.assign(context, { driver: new AppleContainerDriver(context) });
+	return Object.assign(context, { driver: new AppleContainerDriver(context, appleOptions) });
 }
 
 export function fakeRuntime(
