@@ -6,6 +6,8 @@ import type {
 	CleanupOutcome,
 	CommandOutcome,
 	OwnedResource,
+	Remedy,
+	RuntimeProbeResult,
 	SandboxDriver,
 	SandboxDriverName,
 	SandboxLanguage,
@@ -22,6 +24,11 @@ export const WORK_PATH = "/work";
 export const TMP_PATH = "/tmp";
 export const GUEST_USER = "1000:1000";
 export const KEEPALIVE_COMMAND = "echo; while read -r _; do :; done";
+
+export const DOWNLOAD_IMAGE_OPTION = "Download prebuilt image";
+export const BUILD_IMAGE_OPTION = "Build sandbox image locally (~2 min)";
+export const IMAGE_DOWNLOAD_OUTLOOK = "Download the sandbox image — 240 MB.";
+export const IMAGE_BUILD_OUTLOOK = "Build the sandbox image locally (~2 min).";
 
 export const SCRUB_SCRIPT = [
 	"kill -9 -1 2>/dev/null",
@@ -153,9 +160,25 @@ export function parseOomKillCount(text: string): number | undefined {
 	return match === null ? undefined : Number(match[1]);
 }
 
+export function parseSemver(version: string): [major: number, minor: number, patch: number] | undefined {
+	const match = /^v?(\d+)\.(\d+)(?:\.(\d+))?/.exec(version.trim());
+	if (match === null) return undefined;
+	return [Number(match[1]), Number(match[2]), match[3] === undefined ? 0 : Number(match[3])];
+}
+
+export function isVersionAtLeast(version: string, minMajor: number, minMinor: number, minPatch = 0): boolean {
+	const parsed = parseSemver(version);
+	if (parsed === undefined) return false;
+	const [major, minor, patch] = parsed;
+	if (major !== minMajor) return major > minMajor;
+	if (minor !== minMinor) return minor > minMinor;
+	return patch >= minPatch;
+}
+
 export class UnsupportedSandboxDriver implements SandboxDriver {
 	readonly name: SandboxDriverName;
 	readonly boundaryDescription: string;
+	readonly supportsServiceAutoStart = false;
 	private readonly reason: string;
 
 	constructor(name: SandboxDriverName, reason: string) {
@@ -164,8 +187,12 @@ export class UnsupportedSandboxDriver implements SandboxDriver {
 		this.reason = reason;
 	}
 
-	async checkRuntime(): Promise<{ ready: false; reason: string }> {
-		return { ready: false, reason: this.reason };
+	async probeRuntime(): Promise<RuntimeProbeResult> {
+		return { kind: "unsupported", reason: this.reason };
+	}
+
+	imageRemedy(): Remedy {
+		return { kind: "manual", instructions: [this.reason] };
 	}
 
 	async inspectImage(): Promise<{ found: false; reason: string }> {

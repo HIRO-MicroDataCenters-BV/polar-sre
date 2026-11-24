@@ -14,12 +14,15 @@ import {
 	type HotSandbox,
 	type Inspection,
 	type OwnedResource,
+	type Remedy,
+	type RuntimeProbeResult,
 	type SandboxDriver,
 	type SandboxDriverContext,
 	type SandboxLanguage,
 	type SandboxStartOutcome,
 	type SessionPaths,
 	type SpawnCallOutcome,
+	type TrackedChild,
 	type VolumeFailure,
 } from "../types.ts";
 import {
@@ -129,6 +132,7 @@ export interface K8sPodManifestOptions {
 
 export interface K8sDriverOptions {
 	serviceAccountDir?: string;
+	customImage?: boolean;
 }
 
 export function kubectlEnv(environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -460,7 +464,8 @@ export class K8sHotSandbox implements HotSandbox {
 			const [error] = await once(child, "error");
 			return { gone: (error as Error).message };
 		}
-		this.runtime.children.set(child, "run");
+		const tracked: TrackedChild = { kind: "run", kill: () => child.kill("SIGKILL") };
+		this.runtime.children.add(tracked);
 		const stderrOut = new PassThrough();
 		let stderrTail: Buffer = Buffer.alloc(0);
 		child.stderr.on("data", (chunk: Buffer) => {
@@ -477,7 +482,7 @@ export class K8sHotSandbox implements HotSandbox {
 		const closed = new Promise<number | null>((resolve) => {
 			child.once("close", (code) => {
 				clearTimeout(graceTimer);
-				this.runtime.children.delete(child);
+				this.runtime.children.delete(tracked);
 				const remaining = stripKubectlExecTrailer(stderrTail, code);
 				if (remaining.length > 0) {
 					stderrOut.write(remaining);
@@ -563,14 +568,17 @@ export class K8sHotSandbox implements HotSandbox {
 
 export class K8sDriver implements SandboxDriver {
 	readonly name = "k8s" as const;
+	readonly supportsServiceAutoStart = false;
 	private readonly runtime: SandboxDriverContext;
 	private readonly serviceAccountDir: string;
+	private readonly customImage: boolean;
 	private kubeconfigFile: string | undefined;
 	private namespaceValue = "polar";
 
 	constructor(runtime: SandboxDriverContext, options: K8sDriverOptions = {}) {
 		this.runtime = runtime;
 		this.serviceAccountDir = options.serviceAccountDir ?? DEFAULT_SERVICE_ACCOUNT_DIR;
+		this.customImage = options.customImage ?? false;
 	}
 
 	get pvcName(): string {
@@ -637,15 +645,17 @@ export class K8sDriver implements SandboxDriver {
 		);
 	}
 
-	async checkRuntime(deadlineAt: number): Promise<{ ready: true } | { ready: false; reason: string }> {
+	async probeRuntime(): Promise<RuntimeProbeResult> {
+		const manual: Remedy = {
+			kind: "manual",
+			instructions: ["Check Kubernetes sandbox configuration and Pod RBAC permissions."],
+		};
 		const required: [string, string][] = [
 			["POLAR_SANDBOX_K8S_PVC", this.pvcName],
 			["POLAR_SANDBOX_K8S_RUNTIME_CLASS", this.runtimeClass],
 			[
 				"POLAR_SANDBOX_K8S_IMAGE",
-				this.runtime.customImage
-					? this.runtime.image
-					: (this.runtime.environment.POLAR_SANDBOX_K8S_IMAGE ?? "").trim(),
+				this.customImage ? this.runtime.image : (this.runtime.environment.POLAR_SANDBOX_K8S_IMAGE ?? "").trim(),
 			],
 			["POLAR_SANDBOX_K8S_POD_NAME", this.podName],
 			["POLAR_SANDBOX_K8S_POD_UID", this.podUid],
@@ -653,30 +663,49 @@ export class K8sDriver implements SandboxDriver {
 			["KUBERNETES_SERVICE_HOST", this.serviceHost],
 		];
 		for (const [key, value] of required) {
-			if (value === "") return { ready: false, reason: `${key} is not set` };
-		}
-		const sessionId = this.runtime.handle.paths.sessionId;
-		if (!VALID_K8S_SESSION_ID.test(sessionId)) {
-			return { ready: false, reason: `invalid sessionId "${sessionId}" for k8s sandbox` };
+			if (value === "") return { kind: "runtime_not_ready", reason: `${key} is not set`, remedy: manual };
 		}
 		const kc = await this.ensureKubeconfig();
-		if (!kc.ok) return { ready: false, reason: kc.reason };
+		if (!kc.ok) return { kind: "runtime_not_ready", reason: kc.reason, remedy: manual };
 
-		const selfPod = await this.kubectl(["get", "pod", this.podName, "-o", "json"], remainingMs(deadlineAt));
+		const selfPod = await this.kubectl(["get", "pod", this.podName, "-o", "json"]);
+		if (selfPod.spawnError === "ENOENT") {
+			return {
+				kind: "runtime_missing",
+				reason: `kubectl get pod ${this.podName} failed: ${commandFailure(selfPod)}`,
+				remedy: { kind: "manual", instructions: ["Ensure kubectl is installed in the polar Pod image."] },
+			};
+		}
 		if (selfPod.code !== 0) {
-			return { ready: false, reason: `kubectl get pod ${this.podName} failed: ${commandFailure(selfPod)}` };
+			return {
+				kind: "runtime_not_ready",
+				reason: `kubectl get pod ${this.podName} failed: ${commandFailure(selfPod)}`,
+				remedy: manual,
+			};
 		}
 		const parsedSelf = parseK8sPod(selfPod.stdout);
 		if (parsedSelf?.uid === undefined) {
-			return { ready: false, reason: `kubectl get pod ${this.podName} returned unreadable JSON` };
+			return {
+				kind: "runtime_not_ready",
+				reason: `kubectl get pod ${this.podName} returned unreadable JSON`,
+				remedy: manual,
+			};
 		}
 		if (parsedSelf.uid !== this.podUid) {
 			return {
-				ready: false,
+				kind: "runtime_not_ready",
 				reason: `pod UID mismatch for ${this.podName}: expected ${this.podUid}, got ${parsedSelf.uid}`,
+				remedy: manual,
 			};
 		}
-		return { ready: true };
+		return { kind: "ready" };
+	}
+
+	imageRemedy(): Remedy {
+		return {
+			kind: "manual",
+			instructions: ["Set POLAR_SANDBOX_K8S_IMAGE or pass --sandbox-image with an image available in the cluster."],
+		};
 	}
 
 	inspectImage(_image: string, _deadlineAt: number): Promise<{ found: true } | { found: false; reason: string }> {
@@ -734,9 +763,10 @@ export class K8sDriver implements SandboxDriver {
 		return `kubectl -n ${this.namespace} delete pod --wait=true ${names.join(" ")}`;
 	}
 
-	async listWorkVolumes(_root: string, deadlineAt: number): Promise<OwnedResource[]> {
+	async listWorkVolumes(session: SessionPaths, deadlineAt: number): Promise<OwnedResource[]> {
 		if (remainingMs(deadlineAt) === 0 || this.runtime.cliStopped) return [];
-		const session = this.runtime.handle.paths;
+		// The listing Pod carries the session id in its name and labels; ensureWorkVolume reports an invalid id.
+		if (!VALID_K8S_SESSION_ID.test(session.sessionId)) return [];
 		const podName = `polar-work-ls-${k8sPodName(session.sessionId)}-${randomBytes(4).toString("hex")}`;
 		this.runtime.owned.add(podName);
 		const manifest = this.helperPodManifest(podName, session, ["bash", "-c", KEEPALIVE_COMMAND], {
@@ -818,11 +848,10 @@ export class K8sDriver implements SandboxDriver {
 		return undefined;
 	}
 
-	async deleteWorkVolumes(volumes: OwnedResource[], deadlineAt: number): Promise<void> {
+	async deleteWorkVolumes(volumes: OwnedResource[], session: SessionPaths, deadlineAt: number): Promise<void> {
 		if (remainingMs(deadlineAt) === 0 || this.runtime.cliStopped) return;
 		const sessionIds = volumes.map((v) => v.sessionId).filter((id) => VALID_K8S_SESSION_ID.test(id));
 		if (sessionIds.length === 0) return;
-		const session = this.runtime.handle.paths;
 		const podName = `polar-work-rm-${k8sPodName(session.sessionId)}-${randomBytes(4).toString("hex")}`;
 		this.runtime.owned.add(podName);
 		const manifest = this.helperPodManifest(

@@ -2,7 +2,7 @@ import { type Component, type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionUIContext } from "../../../core/extensions/types.ts";
 import type { Theme } from "../../../modes/interactive/theme/theme.ts";
-import { showImageOperation } from "../src/indicator.ts";
+import { ForegroundActionDialog, showImageOperation } from "../src/indicator.ts";
 import type { ImageOperationKind } from "../src/types.ts";
 import { recordedLines } from "./fixtures.ts";
 
@@ -190,5 +190,200 @@ describe("showImageOperation", () => {
 		expect(build.line()).toBeUndefined();
 		vi.advanceTimersByTime(1000);
 		expect(build.renderRequests()).toBe(ticksBeforeEnd);
+	});
+
+	it("renders Starting status line for service kind without switching to bar and makes end() idempotent", () => {
+		let setWidgetCalls = 0;
+		let widget: (Component & { dispose?(): void }) | undefined;
+		const ui = {
+			setWidget(_key: string, factory: ((tui: TUI, theme: Theme) => Component & { dispose?(): void }) | undefined) {
+				setWidgetCalls += 1;
+				widget?.dispose?.();
+				widget = factory?.({ requestRender() {} } as unknown as TUI, { fg: (_color, text) => text } as Theme);
+			},
+		};
+		const operation = showImageOperation(ui as unknown as ExtensionUIContext, "service" as ImageOperationKind);
+		expect(setWidgetCalls).toBe(1);
+		operation.output("[1/2] Installing kernel... 50% (340/680 MB)");
+		const rendered = widget?.render(80)[0]?.replace(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/, "⠋") ?? "";
+		expect(rendered).toContain(" ⠋ Starting   ");
+		expect(rendered).toContain("Installing kernel...");
+		expect(BAR.test(rendered)).toBe(false);
+
+		operation.end();
+		expect(setWidgetCalls).toBe(2);
+		operation.end();
+		expect(setWidgetCalls).toBe(2);
+	});
+});
+
+const DIALOG_TITLE = "Installing Apple container 1.7.1";
+const DIALOG_HINT = "Esc cancels. Nothing is installed until you enter your password.";
+
+function mountDialog() {
+	let renderRequests = 0;
+	const tui = {
+		requestRender() {
+			renderRequests += 1;
+		},
+	} as unknown as TUI;
+	const theme = {
+		fg: (_color: string, text: string) => text,
+		bold: (text: string) => text,
+	} as unknown as Theme;
+	const dialog = new ForegroundActionDialog(tui, theme, DIALOG_TITLE, DIALOG_HINT);
+	const render = (width = 80) => dialog.render(width).map((line) => line.replace(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/, "⠋"));
+	return { dialog, render, renderRequests: () => renderRequests };
+}
+
+describe("ForegroundActionDialog", () => {
+	it("renders initial 8-line frame with borders, title, plain Downloading 0s line, and cancel hint", () => {
+		const { dialog, render } = mountDialog();
+		const lines = render(80);
+		dialog.dispose();
+
+		expect(lines).toHaveLength(8);
+		expect(lines[0]).toBe("─".repeat(80));
+		expect(lines[1]).toBe("");
+		expect(lines[2]?.trim()).toBe(DIALOG_TITLE);
+		expect(lines[3]).toContain(" ⠋ Downloading");
+		expect(lines[3]?.endsWith(" 0s")).toBe(true);
+		expect(BAR.test(lines[3] ?? "")).toBe(false);
+		expect(lines[4]).toBe("");
+		expect(lines[5]?.trim()).toBe(DIALOG_HINT);
+		expect(lines[6]).toBe("");
+		expect(lines[7]).toBe("─".repeat(80));
+	});
+
+	it("renders progress bar with MB amounts and keeps bar start and slash column fixed across updates", () => {
+		const { dialog, render } = mountDialog();
+		const columns = [0, 1_000_000, 2_000_000].map((doneBytes) => {
+			dialog.setDownloadProgress(doneBytes, 2_000_000);
+			const lines = render(80);
+			expect(lines).toHaveLength(8);
+			return { middle: lines[3] ?? "", cols: columnsOf(lines[3] ?? "") };
+		});
+		dialog.dispose();
+
+		expect(columns[0]?.middle).toBe(` ⠋ Downloading  ${"─".repeat(47)}      0.0/2.0 MB`);
+		expect(columns[1]?.middle).toBe(` ⠋ Downloading  ${"━".repeat(23)}╸${"─".repeat(23)}      1.0/2.0 MB`);
+		expect(columns[2]?.middle).toBe(` ⠋ Downloading  ${"━".repeat(47)}      2.0/2.0 MB`);
+		expect(new Set(columns.map((entry) => entry.cols.barStart)).size).toBe(1);
+		expect(new Set(columns.map((entry) => entry.cols.slash)).size).toBe(1);
+	});
+
+	it("clamps doneBytes above totalBytes without throwing and shows 2.0/2.0 MB", () => {
+		const { dialog, render } = mountDialog();
+		expect(() => dialog.setDownloadProgress(3_000_000, 2_000_000)).not.toThrow();
+		const lines = render(80);
+		dialog.dispose();
+
+		expect(lines).toHaveLength(8);
+		expect(BAR.test(lines[3] ?? "")).toBe(true);
+		expect(lines[3]).toContain("2.0/2.0 MB");
+	});
+
+	it("keeps phase 1 plain Downloading line when totalBytes is undefined", () => {
+		const { dialog, render } = mountDialog();
+		expect(() => dialog.setDownloadProgress(1_000_000, undefined)).not.toThrow();
+		const lines = render(80);
+		dialog.dispose();
+
+		expect(lines).toHaveLength(8);
+		expect(lines[3]).toContain(" ⠋ Downloading");
+		expect(lines[3]?.endsWith(" 0s")).toBe(true);
+		expect(BAR.test(lines[3] ?? "")).toBe(false);
+	});
+
+	it("renders spinner and status text in middle line while keeping cancel hint", () => {
+		const { dialog, render } = mountDialog();
+		dialog.setStatus("Waiting for the current response to finish...");
+		const lines = render(80);
+		dialog.dispose();
+
+		expect(lines).toHaveLength(8);
+		expect(lines[3]).toBe(" ⠋ Waiting for the current response to finish...");
+		expect(lines[5]?.trim()).toBe(DIALOG_HINT);
+	});
+
+	it("renders 5 lines without middle line or hint on enterHandoff and stops timer on enterHandoff, stop, and dispose", () => {
+		vi.useFakeTimers();
+
+		const handoff = mountDialog();
+		vi.advanceTimersByTime(160);
+		expect(handoff.renderRequests()).toBeGreaterThan(0);
+		handoff.dialog.enterHandoff();
+		const lines = handoff.render(80);
+		expect(lines).toHaveLength(5);
+		expect(lines[0]).toBe("─".repeat(80));
+		expect(lines[1]).toBe("");
+		expect(lines[2]?.trim()).toBe(DIALOG_TITLE);
+		expect(lines[3]).toBe("");
+		expect(lines[4]).toBe("─".repeat(80));
+		expect(lines.some((line) => line.includes("Downloading") || line.includes("Esc cancels"))).toBe(false);
+		const afterHandoff = handoff.renderRequests();
+		vi.advanceTimersByTime(1000);
+		expect(handoff.renderRequests()).toBe(afterHandoff);
+
+		const stopped = mountDialog();
+		stopped.dialog.stop();
+		stopped.dialog.stop();
+		const afterStop = stopped.renderRequests();
+		vi.advanceTimersByTime(1000);
+		expect(stopped.renderRequests()).toBe(afterStop);
+
+		const disposed = mountDialog();
+		disposed.dialog.dispose();
+		disposed.dialog.dispose();
+		const afterDispose = disposed.renderRequests();
+		vi.advanceTimersByTime(1000);
+		expect(disposed.renderRequests()).toBe(afterDispose);
+	});
+
+	it("calls requestRender on setDownloadProgress and setStatus", () => {
+		const { dialog, renderRequests } = mountDialog();
+		const initial = renderRequests();
+		dialog.setDownloadProgress(1_000_000, 2_000_000);
+		expect(renderRequests()).toBe(initial + 1);
+		dialog.setStatus("Waiting for the current response to finish...");
+		expect(renderRequests()).toBe(initial + 2);
+		dialog.dispose();
+	});
+
+	it("marks aborted and invokes onAbort on cancel keybinding while ignoring other keys", () => {
+		const { dialog } = mountDialog();
+		let aborts = 0;
+		dialog.onAbort = () => {
+			aborts += 1;
+		};
+
+		dialog.handleInput("a");
+		expect(dialog.aborted).toBe(false);
+		expect(aborts).toBe(0);
+
+		dialog.handleInput("\x1b");
+		expect(dialog.aborted).toBe(true);
+		expect(aborts).toBe(1);
+		dialog.dispose();
+	});
+
+	it("keeps visibleWidth(line) <= width for widths 1..240 across all four phases", () => {
+		const { dialog } = mountDialog();
+		const assertWidths = (phase: string) => {
+			for (let width = 1; width <= 240; width += 1) {
+				for (const line of dialog.render(width)) {
+					expect(visibleWidth(line), `${phase} at width ${width}`).toBeLessThanOrEqual(width);
+				}
+			}
+		};
+
+		assertWidths("phase 1 (plain download)");
+		dialog.setDownloadProgress(1_000_000, 2_000_000);
+		assertWidths("phase 2 (bar download)");
+		dialog.setStatus("Waiting for the current response to finish...");
+		assertWidths("phase 3 (status)");
+		dialog.enterHandoff();
+		assertWidths("phase 4 (handoff)");
+		dialog.dispose();
 	});
 });

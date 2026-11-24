@@ -6,16 +6,19 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getSandboxImageDir } from "../../../config.ts";
 import { acquireSession, type SessionHandle } from "../../shared/session.ts";
 import { discardOutputFile, readExcerpt } from "../../shared/store.ts";
-import { createRuntime } from "../index.ts";
+import { createHost } from "../index.ts";
 import { deadlineAfter } from "../src/cli.ts";
 import {
+	BUILD_IMAGE_OPTION,
 	cleanupOciContainer,
+	DOWNLOAD_IMAGE_OPTION,
 	KEEPALIVE_COMMAND,
 	launcher,
 	type OciDriver,
 	ociExecArguments,
 	ociInspectionOf,
 	ociSandboxArguments,
+	parseEngineInfo,
 	parseOciContainers,
 	parseOciNames,
 	parseOciVolumes,
@@ -23,25 +26,19 @@ import {
 	SCRUB_SCRIPT,
 	WORK_LIMIT_EXIT_CODE,
 } from "../src/driver.ts";
+import { probeHost } from "../src/host.ts";
 import { buildReply } from "../src/reply.ts";
 import { admitCall } from "../src/runner.ts";
 import type { SandboxLanguage, SandboxResult, SandboxRuntime, SessionPaths } from "../src/types.ts";
-import {
-	BUILD_IMAGE_OPTION,
-	checkReadiness,
-	DISABLE_SANDBOX_OPTION,
-	ensureWorkVolume,
-	recoverLeftovers,
-	shutdownRuntime,
-	startRuntime,
-} from "../src/workspace.ts";
+import { ensureWorkVolume, recoverLeftovers, shutdownRuntime } from "../src/workspace.ts";
 import {
 	FAKE_OCI,
 	type FakeState,
 	fakeOciEnvironment,
+	fakeOciHost,
 	fakeOciRuntime,
 	fakeState,
-	startingOciRuntime,
+	startedRuntime,
 	testLimits,
 } from "./fixtures.ts";
 
@@ -95,7 +92,7 @@ async function takeOutput(result: SandboxResult): Promise<string> {
 }
 
 describe("OciDriver readiness & engine discovery", () => {
-	it("prefers podman in auto mode, falls back to docker when podman is unavailable, and reports boundaryDescription", async () => {
+	it("prefers podman in auto mode, falls back to docker when podman is unavailable or unsuitable, and reports boundaryDescription and version", async () => {
 		const bin = join(root, "bin");
 		await mkdir(bin, { recursive: true });
 		const dockerWrapper = join(bin, "docker");
@@ -107,14 +104,14 @@ describe("OciDriver readiness & engine discovery", () => {
 
 		// 1. Only docker in PATH -> auto selects docker
 		const envOnlyDocker = { ...fakeOciEnvironment(state), PATH: bin };
-		const dockerRuntime = createRuntime("polar-sandbox:0.2", envOnlyDocker, handle, {
+		const dockerHost = createHost("polar-sandbox:0.2", envOnlyDocker, {
 			driver: "oci",
 			ociEngine: "auto",
 		});
-		dockerRuntime.limits = { ...testLimits };
-		expect(await checkReadiness(dockerRuntime)).toEqual({ ready: true });
-		expect(dockerRuntime.driver.boundaryDescription).toBe("oci (docker/runc, shared kernel)");
-		expect(dockerRuntime.containerCommand).toBe("docker");
+		dockerHost.limits = { ...testLimits };
+		expect(await probeHost(dockerHost)).toMatchObject({ kind: "ready", version: "28.5.2" });
+		expect(dockerHost.driver.boundaryDescription).toBe("oci (docker/runc, shared kernel)");
+		expect(dockerHost.containerCommand).toBe("docker");
 
 		// 2. Add podman to PATH -> auto prefers podman
 		const podmanWrapper = join(bin, "podman");
@@ -123,41 +120,58 @@ describe("OciDriver readiness & engine discovery", () => {
 			`#!/bin/sh\nexport FAKE_OCI_ENGINE=podman\nexec "${process.execPath}" "${FAKE_OCI}" "$@"\n`,
 		);
 		await chmod(podmanWrapper, 0o755);
-		const podmanRuntime = createRuntime("polar-sandbox:0.2", envOnlyDocker, handle, {
+		const podmanHost = createHost("polar-sandbox:0.2", envOnlyDocker, {
 			driver: "oci",
 			ociEngine: "auto",
 		});
-		podmanRuntime.limits = { ...testLimits };
-		expect(await checkReadiness(podmanRuntime)).toEqual({ ready: true });
-		expect(podmanRuntime.driver.boundaryDescription).toBe("oci (podman/crun, shared kernel)");
-		expect(podmanRuntime.containerCommand).toBe("podman");
+		podmanHost.limits = { ...testLimits };
+		expect(await probeHost(podmanHost)).toMatchObject({ kind: "ready", version: "5.4.0" });
+		expect(podmanHost.driver.boundaryDescription).toBe("oci (podman/crun, shared kernel)");
+		expect(podmanHost.containerCommand).toBe("podman");
+
+		// 2b. Unsuitable podman (< 4.3) in PATH with working docker -> auto falls back to docker
+		await writeFile(
+			podmanWrapper,
+			`#!/bin/sh\nexport FAKE_OCI_ENGINE=podman\nexport FAKE_OCI_PODMAN_VERSION=4.2.1\nexec "${process.execPath}" "${FAKE_OCI}" "$@"\n`,
+		);
+		await chmod(podmanWrapper, 0o755);
+		const fallbackHost = createHost("polar-sandbox:0.2", envOnlyDocker, {
+			driver: "oci",
+			ociEngine: "auto",
+		});
+		fallbackHost.limits = { ...testLimits };
+		expect(await probeHost(fallbackHost)).toMatchObject({ kind: "ready", version: "28.5.2" });
+		expect(fallbackHost.driver.boundaryDescription).toBe("oci (docker/runc, shared kernel)");
+		expect(fallbackHost.containerCommand).toBe("docker");
+
+		// 2c. Hanging podman info gets its own commandTimeoutMs and does not starve docker info in auto mode
+		await writeFile(
+			podmanWrapper,
+			`#!/bin/sh\nexport FAKE_OCI_ENGINE=podman\nexport FAKE_OCI_INFO_HANG=1\nexec "${process.execPath}" "${FAKE_OCI}" "$@"\n`,
+		);
+		await chmod(podmanWrapper, 0o755);
+		const hangingPodmanHost = createHost("polar-sandbox:0.2", envOnlyDocker, {
+			driver: "oci",
+			ociEngine: "auto",
+		});
+		hangingPodmanHost.limits = { ...testLimits, commandTimeoutMs: 1200 };
+		expect(await probeHost(hangingPodmanHost)).toMatchObject({ kind: "ready", version: "28.5.2" });
+		expect(hangingPodmanHost.driver.boundaryDescription).toBe("oci (docker/runc, shared kernel)");
+		expect(hangingPodmanHost.containerCommand).toBe("docker");
 
 		// 3. Explicit --sandbox-oci-runtime=krun or runsc omits "shared kernel"
-		const krunRuntime = startingOciRuntime(
-			state,
-			handle,
-			{ ENGINE: "podman" },
-			{},
-			{ engine: "podman", ociRuntime: "krun" },
-		);
-		expect(await checkReadiness(krunRuntime)).toEqual({ ready: true });
-		expect(krunRuntime.driver.boundaryDescription).toBe("oci (podman/krun)");
+		const krunHost = fakeOciHost(state, { ENGINE: "podman" }, {}, { engine: "podman", ociRuntime: "krun" });
+		expect(await probeHost(krunHost)).toMatchObject({ kind: "ready", version: "5.4.0" });
+		expect(krunHost.driver.boundaryDescription).toBe("oci (podman/krun)");
 
-		const runscRuntime = startingOciRuntime(
-			state,
-			handle,
-			{ ENGINE: "docker" },
-			{},
-			{ engine: "docker", ociRuntime: "runsc" },
-		);
-		expect(await checkReadiness(runscRuntime)).toEqual({ ready: true });
-		expect(runscRuntime.driver.boundaryDescription).toBe("oci (docker/runsc)");
-		expect((runscRuntime.driver as OciDriver).runOptions.gvisor).toBe(true);
+		const runscHost = fakeOciHost(state, { ENGINE: "docker" }, {}, { engine: "docker", ociRuntime: "runsc" });
+		expect(await probeHost(runscHost)).toMatchObject({ kind: "ready", version: "28.5.2" });
+		expect(runscHost.driver.boundaryDescription).toBe("oci (docker/runsc)");
+		expect((runscHost.driver as OciDriver).runOptions.gvisor).toBe(true);
 
 		// 4. Custom Docker runtime name backed by /usr/local/bin/runsc in Runtimes map is detected as gVisor
-		const customAliasRuntime = startingOciRuntime(
+		const customAliasHost = fakeOciHost(
 			state,
-			handle,
 			{
 				ENGINE: "docker",
 				DOCKER_RUNTIMES_JSON: '{"runc":{"path":"runc"},"gvisor-custom":{"path":"/usr/local/bin/runsc"}}',
@@ -165,84 +179,175 @@ describe("OciDriver readiness & engine discovery", () => {
 			{},
 			{ engine: "docker", ociRuntime: "gvisor-custom" },
 		);
-		expect(await checkReadiness(customAliasRuntime)).toEqual({ ready: true });
-		expect(customAliasRuntime.driver.boundaryDescription).toBe("oci (docker/gvisor-custom)");
-		expect((customAliasRuntime.driver as OciDriver).runOptions.gvisor).toBe(true);
+		expect(await probeHost(customAliasHost)).toMatchObject({ kind: "ready", version: "28.5.2" });
+		expect(customAliasHost.driver.boundaryDescription).toBe("oci (docker/gvisor-custom)");
+		expect((customAliasHost.driver as OciDriver).runOptions.gvisor).toBe(true);
 
 		// 5. Podman default runtime backed by /usr/bin/runsc path is detected as gVisor
-		const podmanAliasRuntime = startingOciRuntime(
+		const podmanAliasHost = fakeOciHost(
 			state,
-			handle,
 			{ ENGINE: "podman", OCI_RUNTIME: "gvisor-podman", OCI_RUNTIME_PATH: "/usr/bin/runsc" },
 			{},
 			{ engine: "podman" },
 		);
-		expect(await checkReadiness(podmanAliasRuntime)).toEqual({ ready: true });
-		expect(podmanAliasRuntime.driver.boundaryDescription).toBe("oci (podman/gvisor-podman)");
-		expect((podmanAliasRuntime.driver as OciDriver).runOptions.gvisor).toBe(true);
+		expect(await probeHost(podmanAliasHost)).toMatchObject({ kind: "ready", version: "5.4.0" });
+		expect(podmanAliasHost.driver.boundaryDescription).toBe("oci (podman/gvisor-podman)");
+		expect((podmanAliasHost.driver as OciDriver).runOptions.gvisor).toBe(true);
 	});
 
-	it("refuses rootless Docker and rootless Podman < 4.3 with clear reasons", async () => {
-		const rootlessDocker = startingOciRuntime(
-			state,
-			handle,
-			{ ENGINE: "docker", DOCKER_ROOTLESS: "1" },
-			{},
-			{ engine: "docker" },
-		);
-		expect(await checkReadiness(rootlessDocker)).toEqual({
+	it("parses engine info purely and refuses unsuitable or missing engines with exact reasons", async () => {
+		expect(parseEngineInfo("podman", "not json")).toEqual({
 			ready: false,
-			message: `sandbox is off: ${ROOTLESS_DOCKER_UNSUPPORTED}`,
-			leftovers: [],
+			reason: "podman info returned unreadable JSON",
+		});
+		expect(
+			parseEngineInfo(
+				"podman",
+				JSON.stringify({
+					host: {
+						security: { rootless: true },
+						cgroupControllers: ["memory", "pids"],
+						ociRuntime: { name: "krun", path: "/usr/bin/krun" },
+					},
+					version: { Version: "5.4.0" },
+				}),
+			),
+		).toEqual({
+			ready: true,
+			version: "5.4.0",
+			rootless: true,
+			cpuDelegated: false,
+			detectedRuntime: "krun",
+			gvisor: false,
+		});
+		expect(
+			parseEngineInfo(
+				"docker",
+				JSON.stringify({
+					ServerVersion: "28.5.2",
+					SecurityOptions: ["name=seccomp,profile=builtin"],
+					DefaultRuntime: "runc",
+					Runtimes: { runc: {}, runsc: { path: "/usr/bin/runsc" } },
+				}),
+				"runsc",
+			),
+		).toEqual({
+			ready: true,
+			version: "28.5.2",
+			rootless: false,
+			cpuDelegated: true,
+			detectedRuntime: "runc",
+			gvisor: true,
 		});
 
-		const oldPodman = startingOciRuntime(
+		const rootlessDocker = fakeOciHost(state, { ENGINE: "docker", DOCKER_ROOTLESS: "1" }, {}, { engine: "docker" });
+		expect(await probeHost(rootlessDocker)).toMatchObject({
+			kind: "runtime_not_ready",
+			reason: ROOTLESS_DOCKER_UNSUPPORTED,
+		});
+
+		const oldPodman = fakeOciHost(
 			state,
-			handle,
 			{ ENGINE: "podman", PODMAN_ROOTLESS: "1", PODMAN_VERSION: "4.2.1" },
 			{},
 			{ engine: "podman" },
 		);
-		expect(await checkReadiness(oldPodman)).toEqual({
-			ready: false,
-			message: "sandbox is off: rootless Podman >= 4.3 is required for keep-id UID mapping (found 4.2.1)",
-			leftovers: [],
+		expect(await probeHost(oldPodman)).toMatchObject({
+			kind: "runtime_not_ready",
+			reason: "rootless Podman >= 4.3 is required for keep-id UID mapping (found 4.2.1)",
 		});
 
-		const serverErrorDocker = startingOciRuntime(
+		const serverErrorDocker = fakeOciHost(
 			state,
-			handle,
 			{ ENGINE: "docker", DOCKER_SERVER_ERROR: "Cannot connect to the Docker daemon" },
 			{},
 			{ engine: "docker" },
 		);
-		expect(await checkReadiness(serverErrorDocker)).toEqual({
-			ready: false,
-			message: "sandbox is off: docker info failed: Cannot connect to the Docker daemon",
-			leftovers: [],
+		expect(await probeHost(serverErrorDocker)).toMatchObject({
+			kind: "runtime_not_ready",
+			reason: "docker info failed: Cannot connect to the Docker daemon",
 		});
 
-		const missingRuntimeDocker = startingOciRuntime(
+		const missingRuntimeDocker = fakeOciHost(
 			state,
-			handle,
 			{ ENGINE: "docker", DOCKER_RUNTIMES_JSON: '{"runc":{}}' },
 			{},
 			{ engine: "docker", ociRuntime: "runsc" },
 		);
-		expect(await checkReadiness(missingRuntimeDocker)).toEqual({
-			ready: false,
-			message: "sandbox is off: OCI runtime runsc is not available in docker",
-			leftovers: [],
+		expect(await probeHost(missingRuntimeDocker)).toMatchObject({
+			kind: "runtime_not_ready",
+			reason: "OCI runtime runsc is not available in docker",
+		});
+
+		// Engine discovery across missing / unsuitable combinations
+		const emptyBin = join(root, "empty-oci-bin");
+		await mkdir(emptyBin, { recursive: true });
+		const neitherHost = createHost(
+			"polar-sandbox:0.2",
+			{ ...fakeOciEnvironment(state), PATH: emptyBin },
+			{
+				driver: "oci",
+				ociEngine: "auto",
+			},
+		);
+		neitherHost.limits = { ...testLimits };
+		expect(await probeHost(neitherHost)).toMatchObject({
+			kind: "runtime_missing",
+			reason: "neither podman nor docker is installed",
 		});
 	});
 
-	it("builds with --platform and --build-arg TARGETARCH when selected in UI", async () => {
-		const buildRuntime = startingOciRuntime(state, handle, { IMAGE_MISSING: "1" });
-		buildRuntime.image = "polar-sandbox:0.2";
-		buildRuntime.customImage = false;
-		expect(await checkReadiness(buildRuntime, async () => BUILD_IMAGE_OPTION)).toEqual({ ready: true });
-		const arch = process.arch === "x64" ? "amd64" : "arm64";
+	it("provides pull_image and build_image actions with --build-arg TARGETARCH when the image is missing", async () => {
+		const registry = "registry.example/polar-sandbox@sha256:deadbeef";
 		const imageDir = getSandboxImageDir();
+		const arch = process.arch === "x64" ? "amd64" : "arm64";
+		const pullAndBuildHost = fakeOciHost(
+			state,
+			{ IMAGE_MISSING: "1" },
+			{},
+			{},
+			{ candidates: [registry, "polar-sandbox:0.2"], pull: registry, build: "polar-sandbox:0.2" },
+		);
+		const pullDiag = await probeHost(pullAndBuildHost);
+		expect(pullDiag).toMatchObject({
+			kind: "image_missing",
+			reason:
+				"image polar-sandbox:0.2 is not installed (podman image inspect polar-sandbox:0.2 failed: Error: image polar-sandbox:0.2 not found)",
+		});
+		if (pullDiag.kind !== "image_missing" || pullDiag.remedy.kind !== "actions") {
+			throw new Error("expected image actions");
+		}
+		expect(pullDiag.remedy.actions.map((a) => [a.id, a.label, a.preview])).toEqual([
+			["pull_image", DOWNLOAD_IMAGE_OPTION, [`podman image pull ${registry}`]],
+			[
+				"build_image",
+				BUILD_IMAGE_OPTION,
+				[
+					`podman build --build-arg TARGETARCH=${arch} --tag polar-sandbox:0.2 --file ${join(imageDir, "Containerfile")} ${imageDir}`,
+				],
+			],
+		]);
+		expect(await pullDiag.remedy.actions[0].run({ signal: new AbortController().signal })).toEqual({ ok: true });
+		expect(await state.calls()).toContainEqual(["image", "pull", registry]);
+
+		const buildHost = fakeOciHost(
+			state,
+			{ IMAGE_MISSING: "1" },
+			{},
+			{},
+			{ candidates: ["polar-sandbox:0.2"], build: "polar-sandbox:0.2" },
+		);
+		const diagnosis = await probeHost(buildHost);
+		expect(diagnosis).toMatchObject({
+			kind: "image_missing",
+			reason:
+				"image polar-sandbox:0.2 is not installed (podman image inspect polar-sandbox:0.2 failed: Error: image polar-sandbox:0.2 not found)",
+		});
+		if (diagnosis.kind !== "image_missing" || diagnosis.remedy.kind !== "actions") {
+			throw new Error("expected image actions");
+		}
+		expect(diagnosis.remedy.actions.map((a) => [a.id, a.label])).toEqual([["build_image", BUILD_IMAGE_OPTION]]);
+		expect(await diagnosis.remedy.actions[0].run({ signal: new AbortController().signal })).toEqual({ ok: true });
 		expect(await state.calls()).toContainEqual([
 			"build",
 			"--build-arg",
@@ -253,30 +358,22 @@ describe("OciDriver readiness & engine discovery", () => {
 			join(imageDir, "Containerfile"),
 			imageDir,
 		]);
-
-		const disabled = startingOciRuntime(state, handle, { IMAGE_MISSING: "1" });
-		disabled.image = "polar-sandbox:0.2";
-		expect(await checkReadiness(disabled, async () => DISABLE_SANDBOX_OPTION)).toEqual({
-			ready: false,
-			message:
-				"sandbox is off: image polar-sandbox:0.2 is not installed (podman image inspect polar-sandbox:0.2 failed: Error: image polar-sandbox:0.2 not found)",
-			leftovers: [],
-		});
 	});
 });
 
 describe("OciDriver arguments, volumes, and leftovers", () => {
 	it("constructs rootless Podman vs standard Docker arguments and respects cpu cgroup delegation", async () => {
 		// 1. Rootless Podman with cpu delegated
-		const podmanRuntime = startingOciRuntime(
-			state,
-			handle,
-			{ ENGINE: "podman", PODMAN_ROOTLESS: "1", CPU_DELEGATED: "1" },
-			{},
-			{ engine: "podman", hostUid: 501, hostGid: 501 },
+		const podmanRuntime = await startedRuntime(
+			fakeOciHost(
+				state,
+				{ ENGINE: "podman", PODMAN_ROOTLESS: "1", CPU_DELEGATED: "1" },
+				{},
+				{ engine: "podman", hostUid: 501, hostGid: 501 },
+			),
+			session,
+			warn,
 		);
-		expect(await startRuntime(podmanRuntime, warn)).toEqual({ ready: true });
-		podmanRuntime.state = "open";
 		const podmanDriver = podmanRuntime.driver as OciDriver;
 		expect(podmanDriver.guestUser).toBe("1000:1000");
 
@@ -298,107 +395,88 @@ describe("OciDriver arguments, volumes, and leftovers", () => {
 
 		// 2. Rootless Podman without cpu controller delegated omits --cpus
 		state = await fakeState();
-		const noCpuHandle = await acquireSession("nocpu", root, artifactsRoot());
-		try {
-			const noCpuRuntime = startingOciRuntime(
+		const noCpuRuntime = await startedRuntime(
+			fakeOciHost(
 				state,
-				noCpuHandle,
 				{ ENGINE: "podman", PODMAN_ROOTLESS: "1", CPU_DELEGATED: "0" },
 				{},
 				{ engine: "podman", ociRuntime: "krun" },
-			);
-			expect(await startRuntime(noCpuRuntime, warn)).toEqual({ ready: true });
-			noCpuRuntime.state = "open";
-			const noCpuEcho = JSON.parse((await run("echo_argv", noCpuRuntime)).stdout) as { runArgv: string[] };
-			expect(noCpuEcho.runArgv).not.toContain("--cpus");
-			expect(noCpuEcho.runArgv[noCpuEcho.runArgv.indexOf("--runtime") + 1]).toBe("krun");
-			await shutdownRuntime(noCpuRuntime, "reload", warn);
-		} finally {
-			await noCpuHandle.release();
-		}
+			),
+			{ sessionId: "nocpu", cwd: root, outputDirectory: join(artifactsRoot(), "nocpu") },
+			warn,
+		);
+		const noCpuEcho = JSON.parse((await run("echo_argv", noCpuRuntime)).stdout) as { runArgv: string[] };
+		expect(noCpuEcho.runArgv).not.toContain("--cpus");
+		expect(noCpuEcho.runArgv[noCpuEcho.runArgv.indexOf("--runtime") + 1]).toBe("krun");
+		await shutdownRuntime(noCpuRuntime, "reload", warn);
 
 		// 3. Standard Docker uses hostUid:hostGid and no --userns=keep-id
 		state = await fakeState();
-		const dockerHandle = await acquireSession("docker", root, artifactsRoot());
-		try {
-			const dockerRuntime = startingOciRuntime(
-				state,
-				dockerHandle,
-				{ ENGINE: "docker" },
-				{},
-				{ engine: "docker", hostUid: 1002, hostGid: 1003 },
-			);
-			expect(await startRuntime(dockerRuntime, warn)).toEqual({ ready: true });
-			dockerRuntime.state = "open";
-			const dockerDriver = dockerRuntime.driver as OciDriver;
-			expect(dockerDriver.guestUser).toBe("1002:1003");
-			const calls = await state.calls();
-			const prep = calls.find((call) => call[0] === "run" && call.includes("chown")) ?? [];
-			expect(prep).not.toContain("--userns=keep-id:uid=1000,gid=1000");
-			expect(prep.slice(-3)).toEqual(["chown", "1002:1003", "/work"]);
+		const dockerRuntime = await startedRuntime(
+			fakeOciHost(state, { ENGINE: "docker" }, {}, { engine: "docker", hostUid: 1002, hostGid: 1003 }),
+			{ sessionId: "docker", cwd: root, outputDirectory: join(artifactsRoot(), "docker") },
+			warn,
+		);
+		const dockerDriver = dockerRuntime.driver as OciDriver;
+		expect(dockerDriver.guestUser).toBe("1002:1003");
+		const calls = await state.calls();
+		const prep = calls.find((call) => call[0] === "run" && call.includes("chown")) ?? [];
+		expect(prep).not.toContain("--userns=keep-id:uid=1000,gid=1000");
+		expect(prep.slice(-3)).toEqual(["chown", "1002:1003", "/work"]);
 
-			const dockerEcho = JSON.parse((await run("echo_argv", dockerRuntime)).stdout) as {
-				argv: string[];
-				runArgv: string[];
-			};
-			expect(dockerEcho.runArgv).not.toContain("--userns=keep-id:uid=1000,gid=1000");
-			expect(dockerEcho.runArgv[dockerEcho.runArgv.indexOf("--user") + 1]).toBe("1002:1003");
-			const name = dockerEcho.runArgv[dockerEcho.runArgv.indexOf("--name") + 1];
-			expect(dockerEcho.runArgv).toEqual(
-				ociSandboxArguments(dockerRuntime, name, dockerDriver.runOptions, dockerHandle.paths),
-			);
-			expect(dockerEcho.argv).toEqual(
-				ociExecArguments(name, "python", "1002:1003", dockerRuntime.limits.workMaxBytes),
-			);
-			expect(dockerEcho.runArgv).toContain(`polar-work-docker:/work:nocopy`);
-			await shutdownRuntime(dockerRuntime, "reload", warn);
-		} finally {
-			await dockerHandle.release();
-		}
+		const dockerEcho = JSON.parse((await run("echo_argv", dockerRuntime)).stdout) as {
+			argv: string[];
+			runArgv: string[];
+		};
+		expect(dockerEcho.runArgv).not.toContain("--userns=keep-id:uid=1000,gid=1000");
+		expect(dockerEcho.runArgv[dockerEcho.runArgv.indexOf("--user") + 1]).toBe("1002:1003");
+		const name = dockerEcho.runArgv[dockerEcho.runArgv.indexOf("--name") + 1];
+		expect(dockerEcho.runArgv).toEqual(
+			ociSandboxArguments(dockerRuntime, name, dockerDriver.runOptions, dockerRuntime.handle.paths),
+		);
+		expect(dockerEcho.argv).toEqual(ociExecArguments(name, "python", "1002:1003", dockerRuntime.limits.workMaxBytes));
+		expect(dockerEcho.runArgv).toContain(`polar-work-docker:/work:nocopy`);
+		await shutdownRuntime(dockerRuntime, "reload", warn);
 
 		// 4. gVisor (runsc or custom runtime name with /runsc path) omits --pids-limit in run and sets ulimit -u in exec
 		state = await fakeState();
-		const gvisorHandle = await acquireSession("gvisor", root, artifactsRoot());
-		try {
-			const gvisorRuntime = startingOciRuntime(
+		const gvisorRuntime = await startedRuntime(
+			fakeOciHost(
 				state,
-				gvisorHandle,
 				{
 					ENGINE: "docker",
 					DOCKER_RUNTIMES_JSON: '{"runc":{"path":"runc"},"gvisor":{"path":"/usr/bin/runsc"}}',
 				},
 				{},
 				{ engine: "docker", ociRuntime: "gvisor", hostUid: 1000, hostGid: 1000 },
-			);
-			expect(await startRuntime(gvisorRuntime, warn)).toEqual({ ready: true });
-			gvisorRuntime.state = "open";
-			const gvisorDriver = gvisorRuntime.driver as OciDriver;
-			expect(gvisorDriver.runOptions.gvisor).toBe(true);
+			),
+			{ sessionId: "gvisor", cwd: root, outputDirectory: join(artifactsRoot(), "gvisor") },
+			warn,
+		);
+		const gvisorDriver = gvisorRuntime.driver as OciDriver;
+		expect(gvisorDriver.runOptions.gvisor).toBe(true);
 
-			const gvisorEcho = JSON.parse((await run("echo_argv", gvisorRuntime)).stdout) as {
-				argv: string[];
-				runArgv: string[];
-			};
-			expect(gvisorEcho.runArgv).not.toContain("--pids-limit");
-			expect(gvisorEcho.runArgv[gvisorEcho.runArgv.indexOf("--runtime") + 1]).toBe("gvisor");
-			const gvisorName = gvisorEcho.runArgv[gvisorEcho.runArgv.indexOf("--name") + 1];
-			expect(gvisorEcho.runArgv).toEqual(
-				ociSandboxArguments(gvisorRuntime, gvisorName, gvisorDriver.runOptions, gvisorHandle.paths),
-			);
-			expect(gvisorEcho.argv).toEqual(
-				ociExecArguments(
-					gvisorName,
-					"python",
-					"1000:1000",
-					gvisorRuntime.limits.workMaxBytes,
-					gvisorRuntime.limits.processMax,
-				),
-			);
-			expect(gvisorEcho.argv.at(-1)?.startsWith(`ulimit -u ${gvisorRuntime.limits.processMax}\n`)).toBe(true);
-			await shutdownRuntime(gvisorRuntime, "reload", warn);
-		} finally {
-			await gvisorHandle.release();
-		}
+		const gvisorEcho = JSON.parse((await run("echo_argv", gvisorRuntime)).stdout) as {
+			argv: string[];
+			runArgv: string[];
+		};
+		expect(gvisorEcho.runArgv).not.toContain("--pids-limit");
+		expect(gvisorEcho.runArgv[gvisorEcho.runArgv.indexOf("--runtime") + 1]).toBe("gvisor");
+		const gvisorName = gvisorEcho.runArgv[gvisorEcho.runArgv.indexOf("--name") + 1];
+		expect(gvisorEcho.runArgv).toEqual(
+			ociSandboxArguments(gvisorRuntime, gvisorName, gvisorDriver.runOptions, gvisorRuntime.handle.paths),
+		);
+		expect(gvisorEcho.argv).toEqual(
+			ociExecArguments(
+				gvisorName,
+				"python",
+				"1000:1000",
+				gvisorRuntime.limits.workMaxBytes,
+				gvisorRuntime.limits.processMax,
+			),
+		);
+		expect(gvisorEcho.argv.at(-1)?.startsWith(`ulimit -u ${gvisorRuntime.limits.processMax}\n`)).toBe(true);
+		await shutdownRuntime(gvisorRuntime, "reload", warn);
 	});
 
 	it("recovers leftovers via ps -a + inspect and cleans up volumes of gone sessions", async () => {
@@ -420,8 +498,8 @@ describe("OciDriver arguments, volumes, and leftovers", () => {
 		await state.addVolume("polar-work-ended", ownLabels("ended"));
 		await state.addVolume("polar-work-gone", ownLabels("gone"));
 
-		const runtime = startingOciRuntime(state, handle);
-		expect(await recoverLeftovers(runtime, warn)).toEqual({ clean: true });
+		const host = fakeOciHost(state);
+		expect(await recoverLeftovers(host, session, warn)).toEqual({ clean: true });
 		expect(await state.containers()).toEqual(["polar-sandbox-live-1-bbbbbbbb"]);
 		expect((await state.volumes()).map((v) => v.name).sort()).toEqual([
 			"polar-work-current",
@@ -478,7 +556,7 @@ describe("OciDriver arguments, volumes, and leftovers", () => {
 		);
 
 		await state.addVolume("polar-work-current", ownLabels("current", "/foreign"));
-		expect(await ensureWorkVolume(startingOciRuntime(state, handle))).toEqual({
+		expect(await ensureWorkVolume(fakeOciHost(state), session)).toEqual({
 			reason: `the volume polar-work-current is not this session's: its polar-root label is /foreign, expected ${artifactsRoot()}`,
 		});
 	});

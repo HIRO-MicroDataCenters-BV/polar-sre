@@ -1,14 +1,19 @@
 export {
 	AppleContainerDriver,
 	AppleHotSandbox,
+	type AppleSystemStatus,
 	cleanupContainer,
 	execArguments,
 	inspectionOf,
+	parseAppleCliVersion,
+	parseAppleSystemStatus,
 	parseContainers,
 	parseListing,
 	parseVolumes,
 	sandboxArguments,
 } from "./drivers/apple.ts";
+
+export type { AppleInstallOptions } from "./drivers/apple-install.ts";
 
 export {
 	cleanupK8sPod,
@@ -38,11 +43,14 @@ export {
 	cleanupOciContainer,
 	OciDriver,
 	type OciDriverOptions,
+	type OciEngineInfoResult,
 	OciHotSandbox,
 	type OciRunOptions,
 	ociExecArguments,
 	ociInspectionOf,
 	ociSandboxArguments,
+	type ParsedOciEngineInfo,
+	parseEngineInfo,
 	parseOciContainers,
 	parseOciNames,
 	parseOciOomKilled,
@@ -52,11 +60,16 @@ export {
 
 export {
 	artifactsRootOf,
+	BUILD_IMAGE_OPTION,
 	BUILD_TIMEOUT_MS,
 	COMMAND_STDERR_MAX_BYTES,
 	createVolumeMebibytes,
+	DOWNLOAD_IMAGE_OPTION,
 	GUEST_USER,
+	IMAGE_BUILD_OUTLOOK,
+	IMAGE_DOWNLOAD_OUTLOOK,
 	isObject,
+	isVersionAtLeast,
 	KEEPALIVE_COMMAND,
 	KEEPALIVE_STOP_GRACE_MS,
 	type LauncherOptions,

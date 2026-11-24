@@ -1,4 +1,3 @@
-import type { ChildProcess } from "child_process";
 import type { Readable, Writable } from "stream";
 import type { FinalizedStderr, FinalizedStdout } from "../../shared/reply.ts";
 import type { SessionHandle, SessionPaths } from "../../shared/session.ts";
@@ -36,6 +35,17 @@ export type RuntimeState = "unready" | "open" | "closing" | "closed";
 
 export type ChildKind = "run" | "service";
 
+export interface TrackedChild {
+	readonly kind: ChildKind;
+	kill(): void;
+}
+
+export interface ImageSpec {
+	readonly candidates: readonly string[];
+	readonly pull?: string;
+	readonly build: string;
+}
+
 export interface RunningCall {
 	stop(): void;
 }
@@ -52,22 +62,23 @@ export interface ActiveSandboxHolder {
 export interface SandboxDriverContext {
 	containerCommand: string;
 	image: string;
-	registryImage?: string;
-	customImage?: boolean;
+	readonly imageSpec: ImageSpec;
 	limits: SandboxLimits;
 	environment: NodeJS.ProcessEnv;
-	handle: SessionHandle;
 	state: RuntimeState;
 	owned: Set<string>;
-	children: Map<ChildProcess, ChildKind>;
+	children: Set<TrackedChild>;
 	cliStopped: boolean;
 }
 
-export interface SandboxRuntime extends SandboxDriverContext {
-	starting?: Promise<Readiness>;
+export interface SandboxHost extends SandboxDriverContext {
+	driver: SandboxDriver;
+}
+
+export interface SandboxRuntime extends SandboxHost {
+	handle: SessionHandle;
 	inFlight: Set<string>;
 	running: Set<RunningCall>;
-	driver: SandboxDriver;
 	activeSandbox: ActiveSandboxHolder;
 }
 
@@ -127,16 +138,55 @@ export interface ToolReply {
 	isError: boolean;
 }
 
-export type Readiness = { ready: true } | { ready: false; message: string; leftovers: CleanupError[] };
+export type NotReady = { ready: false; message: string; leftovers: CleanupError[] };
 
-export type ImageOperationKind = "download" | "build";
+export type Activation = { ready: true; runtime: SandboxRuntime } | NotReady;
+
+export type SetupActionId = "install_runtime" | "start_service" | "pull_image" | "build_image";
+
+export type SetupActionMode = "background" | "foreground";
+
+export interface ActionIO {
+	signal: AbortSignal;
+	onLine?: (line: string) => void;
+	onDownloadProgress?: (doneBytes: number, totalBytes?: number) => void;
+	handoffTerminal?: <T>(fn: () => Promise<T>) => Promise<T>;
+}
+
+export type ActionResult = { ok: true; detail?: string } | { ok: false; reason: string; cancelled?: boolean };
+
+export interface SetupAction {
+	id: SetupActionId;
+	label: string;
+	title?: string;
+	preview: string[];
+	mode: SetupActionMode;
+	run(io: ActionIO): Promise<ActionResult>;
+	runQuick?(signal: AbortSignal): Promise<ActionResult>;
+}
+
+export type Remedy =
+	| { kind: "manual"; instructions: string[] }
+	| { kind: "actions"; actions: SetupAction[]; outlook: string[] };
+
+export type RuntimeProbeResult =
+	| { kind: "ready"; version?: string; repair?: Remedy }
+	| { kind: "unsupported"; reason: string }
+	| { kind: "runtime_missing"; reason: string; remedy: Remedy }
+	| { kind: "runtime_not_ready"; reason: string; remedy: Remedy }
+	| { kind: "probe_failed"; reason: string };
+
+export type HostDiagnosis =
+	| { kind: "ready"; image: string; version?: string; repair?: Remedy }
+	| Exclude<RuntimeProbeResult, { kind: "ready" }>
+	| { kind: "image_missing"; reason: string; remedy: Remedy };
+
+export type ImageOperationKind = "download" | "build" | "service";
 
 export interface ImageOperation {
 	output(line: string): void;
 	end(): void;
 }
-
-export type ShowImageOperation = (kind: ImageOperationKind) => ImageOperation;
 
 export interface VolumeFailure {
 	reason: string;
@@ -148,6 +198,7 @@ export interface CommandOutcome {
 	stdout: string;
 	stderr: string;
 	timedOut: boolean;
+	spawnError?: string;
 }
 
 export interface SandboxProcess {
@@ -165,8 +216,10 @@ export type SpawnCallOutcome = { spawned: SandboxProcess } | { gone: string };
 export interface SandboxDriver {
 	readonly name: "apple-container" | "oci" | "k8s";
 	readonly boundaryDescription: string;
+	readonly supportsServiceAutoStart: boolean;
 
-	checkRuntime(deadlineAt: number): Promise<{ ready: true } | { ready: false; reason: string }>;
+	probeRuntime(): Promise<RuntimeProbeResult>;
+	imageRemedy(imageSpec: ImageSpec): Remedy;
 	inspectImage(image: string, deadlineAt: number): Promise<{ found: true } | { found: false; reason: string }>;
 	pullImage(image: string, signal?: AbortSignal, onLine?: (line: string) => void): Promise<CommandOutcome>;
 	buildImage(
@@ -180,9 +233,9 @@ export interface SandboxDriver {
 	deleteSandbox(name: string, deadlineAt: number): Promise<CleanupOutcome>;
 	manualDeleteCommand(names: string[]): string;
 
-	listWorkVolumes(root: string, deadlineAt: number): Promise<OwnedResource[]>;
+	listWorkVolumes(session: SessionPaths, deadlineAt: number): Promise<OwnedResource[]>;
 	ensureWorkVolume(session: SessionPaths, deadlineAt: number): Promise<VolumeFailure | undefined>;
-	deleteWorkVolumes(volumes: OwnedResource[], deadlineAt: number): Promise<void>;
+	deleteWorkVolumes(volumes: OwnedResource[], session: SessionPaths, deadlineAt: number): Promise<void>;
 
 	startSandbox(
 		name: string,

@@ -1,41 +1,35 @@
 import { stat } from "fs/promises";
 import { join } from "path";
 import { setTimeout as sleep } from "timers/promises";
-import { getSandboxImageDir } from "../../../config.ts";
 import type { SessionShutdownEvent } from "../../../core/extensions/types.ts";
-import { type SessionLiveness, sessionLiveness } from "../../shared/session.ts";
-import { commandFailure, deadlineAfter, describeCleanupErrors, remainingMs } from "./cli.ts";
+import { acquireSession, type SessionLiveness, sessionLiveness } from "../../shared/session.ts";
+import { deadlineAfter, describeCleanupErrors, remainingMs } from "./cli.ts";
 import { artifactsRootOf, LEFTOVERS_STAYED, START_ENDED } from "./driver.ts";
 import type {
+	Activation,
 	ChildKind,
 	CleanupError,
+	NotReady,
 	OwnedResource,
-	Readiness,
+	RunningCall,
+	SandboxDriverContext,
+	SandboxHost,
 	SandboxRuntime,
-	ShowImageOperation,
+	SessionPaths,
 	VolumeFailure,
 } from "./types.ts";
 
 export type Recovery = { clean: true } | { leftover: CleanupError[] } | { unknown: string };
 
 export type Warn = (message: string) => void;
-export type SelectMissingImage = (title: string, options: string[]) => Promise<string | undefined>;
-
-export const DOWNLOAD_IMAGE_OPTION = "Download prebuilt image";
-export const BUILD_IMAGE_OPTION = "Build sandbox image locally (~2 min)";
-export const DISABLE_SANDBOX_OPTION = "Disable sandbox for this session";
 
 const TICKET_POLL_MS = 20;
 
-export async function cleanupOwned(
-	runtime: SandboxRuntime,
-	deadlineAt: number,
-	exclude?: string,
-): Promise<CleanupError[]> {
+export async function cleanupOwned(host: SandboxHost, deadlineAt: number, exclude?: string): Promise<CleanupError[]> {
 	const errors: CleanupError[] = [];
-	for (const name of [...runtime.owned]) {
+	for (const name of [...host.owned]) {
 		if (name === exclude) continue;
-		const outcome = await runtime.driver.deleteSandbox(name, deadlineAt);
+		const outcome = await host.driver.deleteSandbox(name, deadlineAt);
 		if (!outcome.removed) errors.push(outcome.error);
 	}
 	return errors;
@@ -48,13 +42,13 @@ export function closeAdmission(runtime: SandboxRuntime): void {
 }
 
 export async function closeIfDrained(runtime: SandboxRuntime): Promise<void> {
-	if (runtime.state !== "closing" || runtime.starting !== undefined || runtime.inFlight.size > 0) return;
+	if (runtime.state !== "closing" || runtime.inFlight.size > 0) return;
 	runtime.state = "closed";
 	await runtime.handle.release();
 }
 
-function off(runtime: SandboxRuntime, reason: string, leftovers: CleanupError[] = []): Readiness {
-	const stayed = leftovers.length === 0 ? "" : `; ${leftoverNotice(runtime, leftovers)}`;
+function off(host: SandboxHost, reason: string, leftovers: CleanupError[] = []): NotReady {
+	const stayed = leftovers.length === 0 ? "" : `; ${leftoverNotice(host, leftovers)}`;
 	return { ready: false, message: `sandbox is off: ${reason}${stayed}`, leftovers };
 }
 
@@ -67,111 +61,52 @@ async function directoryMissing(root: string, sessionId: string): Promise<boolea
 	}
 }
 
-function leftoverNotice(runtime: SandboxRuntime, errors: CleanupError[]): string {
+function leftoverNotice(host: SandboxHost, errors: CleanupError[]): string {
 	const names = errors.map((error) => error.container);
-	return `${describeCleanupErrors(errors)} could not be deleted; delete them with: ${runtime.driver.manualDeleteCommand(names)}`;
+	return `${describeCleanupErrors(errors)} could not be deleted; delete them with: ${host.driver.manualDeleteCommand(names)}`;
 }
 
-export async function checkReadiness(
-	runtime: SandboxRuntime,
-	selectImage?: SelectMissingImage,
-	showOperation?: ShowImageOperation,
-): Promise<Readiness> {
-	const status = await runtime.driver.checkRuntime(deadlineAfter(runtime));
-	if (!status.ready) return off(runtime, status.reason);
-	const candidates =
-		!runtime.customImage && runtime.registryImage !== undefined && runtime.registryImage !== runtime.image
-			? [runtime.registryImage, runtime.image]
-			: [runtime.image];
-	let lastReason = "";
-	for (const candidate of candidates) {
-		const inspected = await runtime.driver.inspectImage(candidate, deadlineAfter(runtime));
-		if (inspected.found) {
-			runtime.image = candidate;
-			return { ready: true };
-		}
-		lastReason = inspected.reason;
-	}
-	if (selectImage === undefined) {
-		return off(runtime, `image ${runtime.image} is not installed (${lastReason})`);
-	}
-	const options =
-		runtime.registryImage !== undefined
-			? [DOWNLOAD_IMAGE_OPTION, BUILD_IMAGE_OPTION, DISABLE_SANDBOX_OPTION]
-			: [BUILD_IMAGE_OPTION, DISABLE_SANDBOX_OPTION];
-	const choice = await selectImage(`Sandbox image ${runtime.image} is not installed`, options);
-	if (runtime.state !== "unready") return off(runtime, START_ENDED);
-	if (choice === DOWNLOAD_IMAGE_OPTION && runtime.registryImage !== undefined) {
-		const operation = showOperation?.("download");
-		const pulled = await runtime.driver
-			.pullImage(runtime.registryImage, undefined, operation ? (line) => operation.output(line) : undefined)
-			.finally(() => operation?.end());
-		if (runtime.state !== "unready") return off(runtime, START_ENDED);
-		if (pulled.code !== 0) {
-			return off(runtime, `image pull ${runtime.registryImage} failed: ${commandFailure(pulled)}`);
-		}
-		runtime.image = runtime.registryImage;
-		return { ready: true };
-	}
-	if (choice === BUILD_IMAGE_OPTION) {
-		const operation = showOperation?.("build");
-		const built = await runtime.driver
-			.buildImage(
-				runtime.image,
-				getSandboxImageDir(),
-				undefined,
-				operation ? (line) => operation.output(line) : undefined,
-			)
-			.finally(() => operation?.end());
-		if (runtime.state !== "unready") return off(runtime, START_ENDED);
-		if (built.code !== 0) {
-			return off(runtime, `image build ${runtime.image} failed: ${commandFailure(built)}`);
-		}
-		return { ready: true };
-	}
-	return off(runtime, `image ${runtime.image} is not installed (${lastReason})`);
-}
-
-export async function startRuntime(
-	runtime: SandboxRuntime,
+/** Acquires the session lock and attaches the session to the host only after activation succeeds. */
+export async function activateRuntime(
+	host: SandboxHost,
+	sessionId: string,
+	cwd: string,
+	image: string,
 	warn: Warn,
-	selectImage?: SelectMissingImage,
-	showOperation?: ShowImageOperation,
-): Promise<Readiness> {
-	const starting = performStart(runtime, warn, selectImage, showOperation);
-	runtime.starting = starting;
+	artifactsRoot?: string,
+): Promise<Activation> {
+	if (host.state !== "unready") return off(host, START_ENDED);
+	const handle = await acquireSession(sessionId, cwd, artifactsRoot);
+	let activated = false;
 	try {
-		return await starting;
+		if (host.state !== "unready") return off(host, START_ENDED);
+		host.image = image;
+		const recovery = await recoverLeftovers(host, handle.paths, warn);
+		if ("unknown" in recovery) return off(host, `runtime state could not be established: ${recovery.unknown}`);
+		if ("leftover" in recovery) return off(host, LEFTOVERS_STAYED, recovery.leftover);
+		const failure = await ensureWorkVolume(host, handle.paths);
+		if (failure !== undefined) {
+			return off(host, failure.reason, failure.leftover === undefined ? [] : [failure.leftover]);
+		}
+		const runtime: SandboxRuntime = Object.assign(host, {
+			handle,
+			inFlight: new Set<string>(),
+			running: new Set<RunningCall>(),
+			activeSandbox: {},
+		});
+		activated = true;
+		return { ready: true, runtime };
 	} finally {
-		runtime.starting = undefined;
-		await closeIfDrained(runtime);
+		if (!activated) await handle.release();
 	}
 }
 
-async function performStart(
-	runtime: SandboxRuntime,
-	warn: Warn,
-	selectImage?: SelectMissingImage,
-	showOperation?: ShowImageOperation,
-): Promise<Readiness> {
-	const readiness = await checkReadiness(runtime, selectImage, showOperation);
-	if (!readiness.ready) return readiness;
-	if (runtime.state !== "unready") return off(runtime, START_ENDED);
-	const recovery = await recoverLeftovers(runtime, warn);
-	if ("unknown" in recovery) return off(runtime, `runtime state could not be established: ${recovery.unknown}`);
-	if ("leftover" in recovery) return off(runtime, LEFTOVERS_STAYED, recovery.leftover);
-	const failure = await ensureWorkVolume(runtime);
-	if (failure === undefined) return { ready: true };
-	return off(runtime, failure.reason, failure.leftover === undefined ? [] : [failure.leftover]);
-}
-
-export async function recoverLeftovers(runtime: SandboxRuntime, warn: Warn): Promise<Recovery> {
-	const session = runtime.handle.paths;
+export async function recoverLeftovers(host: SandboxHost, session: SessionPaths, warn: Warn): Promise<Recovery> {
 	const root = artifactsRootOf(session);
-	const deadlineAt = deadlineAfter(runtime);
+	const deadlineAt = deadlineAfter(host);
 	let listing: OwnedResource[];
 	try {
-		listing = await runtime.driver.listSandboxes(root, deadlineAt);
+		listing = await host.driver.listSandboxes(root, deadlineAt);
 	} catch (error) {
 		return { unknown: error instanceof Error ? error.message : String(error) };
 	}
@@ -190,29 +125,33 @@ export async function recoverLeftovers(runtime: SandboxRuntime, warn: Warn): Pro
 			}
 			if (liveness !== "ended") continue;
 		}
-		const outcome = await runtime.driver.deleteSandbox(sandbox.name, deadlineAt);
+		const outcome = await host.driver.deleteSandbox(sandbox.name, deadlineAt);
 		if (!outcome.removed) errors.push(outcome.error);
 	}
-	await removeVolumesOfGoneSessions(runtime, root, deadlineAt);
+	await removeVolumesOfGoneSessions(host, session, root, deadlineAt);
 	return errors.length > 0 ? { leftover: errors } : { clean: true };
 }
 
-async function removeVolumesOfGoneSessions(runtime: SandboxRuntime, root: string, deadlineAt: number): Promise<void> {
-	const own = runtime.handle.paths.sessionId;
-	const volumes = await runtime.driver.listWorkVolumes(root, deadlineAt);
+async function removeVolumesOfGoneSessions(
+	host: SandboxHost,
+	session: SessionPaths,
+	root: string,
+	deadlineAt: number,
+): Promise<void> {
+	const volumes = await host.driver.listWorkVolumes(session, deadlineAt);
 	const gone: OwnedResource[] = [];
 	for (const volume of volumes) {
 		const owner = volume.sessionId;
-		if (owner === own || !(await directoryMissing(root, owner))) continue;
+		if (owner === session.sessionId || !(await directoryMissing(root, owner))) continue;
 		gone.push(volume);
 	}
 	if (gone.length > 0) {
-		await runtime.driver.deleteWorkVolumes(gone, deadlineAt);
+		await host.driver.deleteWorkVolumes(gone, session, deadlineAt);
 	}
 }
 
-export function ensureWorkVolume(runtime: SandboxRuntime): Promise<VolumeFailure | undefined> {
-	return runtime.driver.ensureWorkVolume(runtime.handle.paths, deadlineAfter(runtime));
+export function ensureWorkVolume(host: SandboxHost, session: SessionPaths): Promise<VolumeFailure | undefined> {
+	return host.driver.ensureWorkVolume(session, deadlineAfter(host));
 }
 
 export async function shutdownRuntime(
@@ -222,35 +161,57 @@ export async function shutdownRuntime(
 ): Promise<void> {
 	const deadlineAt = Date.now() + runtime.limits.shutdownBudgetMs;
 	closeAdmission(runtime);
-	await ticketsDrained(runtime, deadlineAt);
-	if (runtime.starting === undefined && runtime.inFlight.size === 0) {
+	await waitUntil(() => runtime.inFlight.size === 0, deadlineAt);
+	if (runtime.inFlight.size === 0) {
 		const hot = runtime.activeSandbox.current;
 		runtime.activeSandbox.current = undefined;
 		if (hot !== undefined) {
 			await hot.destroy(deadlineAt);
 		}
-		const leftovers = await cleanupOwned(runtime, deadlineAt);
-		if (leftovers.length > 0) warn(`sandbox: ${describeCleanupErrors(leftovers)} could not be deleted at shutdown`);
+		await deleteOwned(runtime, deadlineAt, warn);
 	} else {
 		killChildren(runtime, "run");
 	}
-	if (reason === "quit") {
-		runtime.cliStopped = true;
-		killChildren(runtime);
-	}
+	if (reason === "quit") stopCli(runtime);
 	const programs = runtime.inFlight.size;
 	if (programs > 0) warn(`sandbox: ${programs} program(s) still stopping`);
 	await closeIfDrained(runtime);
 }
 
-async function ticketsDrained(runtime: SandboxRuntime, deadlineAt: number): Promise<void> {
-	while ((runtime.starting !== undefined || runtime.inFlight.size > 0) && remainingMs(deadlineAt) > 0) {
+export async function shutdownHost(
+	host: SandboxHost,
+	isPending: () => boolean,
+	reason: SessionShutdownEvent["reason"],
+	warn: Warn,
+): Promise<void> {
+	const deadlineAt = Date.now() + host.limits.shutdownBudgetMs;
+	const isClosed = () => host.state === "closed";
+	host.state = "closing";
+	await waitUntil(() => !isPending(), deadlineAt);
+	if (isClosed()) return;
+	if (!isPending()) await deleteOwned(host, deadlineAt, warn);
+	if (reason === "quit") stopCli(host);
+}
+
+async function waitUntil(done: () => boolean, deadlineAt: number): Promise<void> {
+	while (!done() && remainingMs(deadlineAt) > 0) {
 		await sleep(Math.min(TICKET_POLL_MS, remainingMs(deadlineAt)));
 	}
 }
 
-function killChildren(runtime: SandboxRuntime, kind?: ChildKind): void {
-	for (const [child, childKind] of runtime.children) {
-		if (kind === undefined || childKind === kind) child.kill("SIGKILL");
+async function deleteOwned(host: SandboxHost, deadlineAt: number, warn: Warn): Promise<void> {
+	const leftovers = await cleanupOwned(host, deadlineAt);
+	if (leftovers.length > 0) warn(`sandbox: ${describeCleanupErrors(leftovers)} could not be deleted at shutdown`);
+}
+
+function stopCli(context: SandboxDriverContext): void {
+	context.cliStopped = true;
+	killChildren(context);
+}
+
+function killChildren(context: SandboxDriverContext, kind?: ChildKind): void {
+	for (const entry of [...context.children]) {
+		if (kind !== undefined && entry.kind !== kind) continue;
+		entry.kill();
 	}
 }

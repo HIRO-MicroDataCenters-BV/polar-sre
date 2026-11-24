@@ -5,9 +5,8 @@ import { homedir } from "os";
 import { join } from "path";
 import { setTimeout as sleep } from "timers/promises";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { acquireSession, type SessionHandle } from "../../shared/session.ts";
 import { readManifest } from "../../shared/store.ts";
-import { createRuntime, DEFAULT_IMAGE } from "../index.ts";
+import { createHost, DEFAULT_IMAGE } from "../index.ts";
 import { containerCommand } from "../src/cli.ts";
 import {
 	inspectionOf,
@@ -23,10 +22,18 @@ import {
 	sessionLabels,
 	workVolumeName,
 } from "../src/driver.ts";
+import { formatDiagnosisWarning, probeHost } from "../src/host.ts";
 import { buildReply } from "../src/reply.ts";
 import { admitCall } from "../src/runner.ts";
-import type { OciEngineChoice, SandboxLimits, SandboxRequest, SandboxRuntime, SessionPaths } from "../src/types.ts";
-import { BUILD_IMAGE_OPTION, recoverLeftovers, shutdownRuntime, startRuntime } from "../src/workspace.ts";
+import type {
+	Activation,
+	OciEngineChoice,
+	SandboxLimits,
+	SandboxRequest,
+	SandboxRuntime,
+	SessionPaths,
+} from "../src/types.ts";
+import { activateRuntime, recoverLeftovers, shutdownRuntime } from "../src/workspace.ts";
 
 const REAL = process.env.SANDBOX_REAL_RUNTIME === "1";
 const IMAGE = process.env.POLAR_SANDBOX_IMAGE ?? DEFAULT_IMAGE;
@@ -50,7 +57,6 @@ const limits: SandboxLimits = {
 };
 
 let root: string;
-let handle: SessionHandle;
 let session: SessionPaths;
 let runtime: SandboxRuntime;
 const timings: { step: string; ms: number }[] = [];
@@ -66,17 +72,29 @@ async function timed<T>(step: string, work: () => Promise<T>): Promise<T> {
 	}
 }
 
-async function startedRuntime(sessionHandle: SessionHandle) {
-	const started = createRuntime(IMAGE, process.env, sessionHandle, {
+function start(sessionId: string): Promise<Activation> {
+	const host = createHost(IMAGE, process.env, {
 		ociEngine: TEST_OCI_ENGINE,
 		ociRuntime: process.env.SANDBOX_TEST_OCI_RUNTIME,
 	});
-	started.limits = { ...limits };
-	const readiness = await timed(`start ${sessionHandle.paths.sessionId}`, () =>
-		startRuntime(started, warn, async () => BUILD_IMAGE_OPTION),
-	);
-	if (readiness.ready) started.state = "open";
-	return { runtime: started, readiness };
+	host.limits = { ...limits };
+	return timed(`start ${sessionId}`, async () => {
+		let diagnosis = await probeHost(host);
+		if (diagnosis.kind === "image_missing" && diagnosis.remedy.kind === "actions") {
+			const build = diagnosis.remedy.actions.find((action) => action.id === "build_image");
+			if (build !== undefined) {
+				const built = await build.run({ signal: new AbortController().signal });
+				if (!built.ok) return { ready: false, message: `sandbox is off: ${built.reason}`, leftovers: [] };
+				diagnosis = await probeHost(host);
+			}
+		}
+		if (diagnosis.kind !== "ready") {
+			return { ready: false, message: formatDiagnosisWarning(diagnosis), leftovers: [] };
+		}
+		const activation = await activateRuntime(host, sessionId, root, diagnosis.image, warn, root);
+		if (activation.ready) activation.runtime.state = "open";
+		return activation;
+	});
 }
 
 async function call(
@@ -181,8 +199,10 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 	beforeAll(async () => {
 		await mkdir(join(homedir(), ".cache"), { recursive: true });
 		root = await mkdtemp(join(homedir(), ".cache", "polar-sandbox-real-"));
-		handle = await acquireSession(`real-${randomUUID().slice(0, 8)}`, root, root);
-		session = handle.paths;
+		const started = await start(`real-${randomUUID().slice(0, 8)}`);
+		if (!started.ready) throw new Error(started.message);
+		runtime = started.runtime;
+		session = runtime.handle.paths;
 		const lines: string[] = [];
 		for (let index = 0; index < 200_000; index += 1) {
 			const status = index % 7 === 0 ? 503 : 200;
@@ -191,9 +211,6 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 			);
 		}
 		await writeFile(join(session.outputDirectory, "k8s_logs-1.txt"), `${lines.join("\n")}\n`);
-		const started = await startedRuntime(handle);
-		runtime = started.runtime;
-		expect(started.readiness).toEqual({ ready: true });
 		expect(runtime.state).toBe("open");
 		expect(runtime.owned.size).toBe(0);
 	}, 600_000);
@@ -203,10 +220,10 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 			await shutdownRuntime(runtime, "reload", warn);
 			await runtime.driver.deleteWorkVolumes(
 				[{ name: workVolumeName(session.sessionId), sessionId: session.sessionId }],
+				session,
 				Date.now() + 30_000,
 			);
 		}
-		if (handle !== undefined) await handle.release();
 		if (root !== undefined) await rm(root, { recursive: true, force: true });
 		console.table(timings);
 	});
@@ -396,8 +413,8 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 		const name = `polar-sandbox-kill9-${session.sessionId}`;
 		const args =
 			runtime.driver.name === "apple-container"
-				? sandboxArguments(runtime, name)
-				: ociSandboxArguments(runtime, name, (runtime.driver as OciDriver).runOptions);
+				? sandboxArguments(runtime, name, session)
+				: ociSandboxArguments(runtime, name, (runtime.driver as OciDriver).runOptions, session);
 		const parent = spawn(
 			process.execPath,
 			[
@@ -495,7 +512,7 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 			name: workVolumeName(session.sessionId),
 			labels: { "polar-session": session.sessionId, "polar-root": root },
 		});
-		const volumes = await runtime.driver.listWorkVolumes(root, Date.now() + 30_000);
+		const volumes = await runtime.driver.listWorkVolumes(session, Date.now() + 30_000);
 		expect(volumes).toContainEqual({ name: workVolumeName(session.sessionId), sessionId: session.sessionId });
 		expect((await runtime.driver.deleteSandbox(name, Date.now() + 30_000)).removed).toBe(true);
 	}, 60_000);
@@ -519,13 +536,13 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 		const name = `polar-sandbox-${session.sessionId}-999`;
 		await sleeper(name);
 		expect(await containersOf(session.sessionId)).toEqual([name]);
-		expect(await timed("recovery", () => recoverLeftovers(runtime, warn))).toEqual({ clean: true });
+		expect(await timed("recovery", () => recoverLeftovers(runtime, session, warn))).toEqual({ clean: true });
 		expect(await containersOf(session.sessionId)).toEqual([]);
 	}, 60_000);
 
 	it("refuses to mount a volume with a foreign root label", async () => {
-		const foreignHandle = await acquireSession(`real-foreign-${randomUUID().slice(0, 8)}`, root, root);
-		const volume = workVolumeName(foreignHandle.paths.sessionId);
+		const foreignSessionId = `real-foreign-${randomUUID().slice(0, 8)}`;
+		const volume = workVolumeName(foreignSessionId);
 		try {
 			const createArgs =
 				runtime.driver.name === "apple-container"
@@ -535,7 +552,7 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 							"-s",
 							"64M",
 							"--label",
-							`polar-session=${foreignHandle.paths.sessionId}`,
+							`polar-session=${foreignSessionId}`,
 							"--label",
 							"polar-root=/elsewhere",
 							volume,
@@ -544,20 +561,19 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 							"volume",
 							"create",
 							"--label",
-							`polar-session=${foreignHandle.paths.sessionId}`,
+							`polar-session=${foreignSessionId}`,
 							"--label",
 							"polar-root=/elsewhere",
 							volume,
 						];
 			const created = await containerCommand(runtime, createArgs);
 			expect(created.code, created.stderr).toBe(0);
-			const { runtime: refused, readiness } = await startedRuntime(foreignHandle);
-			expect(readiness).toEqual({
+			expect(await start(foreignSessionId)).toEqual({
 				ready: false,
 				message: `sandbox is off: the volume ${volume} is not this session's: its polar-root label is /elsewhere, expected ${root}`,
 				leftovers: [],
 			});
-			expect(refused.state).toBe("unready");
+			expect(await exists(join(root, foreignSessionId, "lock"))).toBe(false);
 			const inspected = await containerCommand(runtime, ["volume", "inspect", volume]);
 			expect(inspected.code).toBe(0);
 			const parsedVol =
@@ -565,22 +581,22 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 					? parseListing(inspected.stdout, "name")
 					: parseOciVolumes(inspected.stdout);
 			expect(parsedVol?.[0].labels).toMatchObject({ "polar-root": "/elsewhere" });
-			expect(await containersOf(foreignHandle.paths.sessionId)).toEqual([]);
+			expect(await containersOf(foreignSessionId)).toEqual([]);
 		} finally {
 			await runtime.driver.deleteWorkVolumes(
-				[{ name: volume, sessionId: foreignHandle.paths.sessionId }],
+				[{ name: volume, sessionId: foreignSessionId }],
+				session,
 				Date.now() + 30_000,
 			);
-			await foreignHandle.release();
 		}
 	}, 120_000);
 
 	it("deletes the container and closes the file at shutdown with a running program", async () => {
-		const ownHandle = await acquireSession(`real-shutdown-${randomUUID().slice(0, 8)}`, root, root);
-		const paths = ownHandle.paths;
-		const { runtime: closing, readiness } = await startedRuntime(ownHandle);
+		const started = await start(`real-shutdown-${randomUUID().slice(0, 8)}`);
+		if (!started.ready) throw new Error(started.message);
+		const closing = started.runtime;
+		const paths = closing.handle.paths;
 		try {
-			expect(readiness).toEqual({ ready: true });
 			const request: SandboxRequest = { language: "bash", code: "echo started; sleep 60" };
 			const admitted = admitCall(closing, request, undefined, "call-1");
 			if (admitted === undefined) throw new Error("the call was not admitted");
@@ -608,9 +624,10 @@ describe.skipIf(!REAL)("sandbox on the real runtime", () => {
 		} finally {
 			await runtime.driver.deleteWorkVolumes(
 				[{ name: workVolumeName(paths.sessionId), sessionId: paths.sessionId }],
+				session,
 				Date.now() + 30_000,
 			);
-			await ownHandle.release();
+			await closing.handle.release();
 		}
 	}, 120_000);
 });

@@ -3,6 +3,7 @@ import { randomBytes } from "crypto";
 import { once } from "events";
 import { tmpdir } from "os";
 import { join } from "path";
+import { getSandboxImageDir } from "../../../../config.ts";
 import {
 	CLI_STOPPED,
 	commandFailure,
@@ -18,23 +19,39 @@ import {
 	type CommandOutcome,
 	DATA_PATH,
 	type HotSandbox,
+	type ImageSpec,
 	type Inspection,
 	type OwnedResource,
+	type Remedy,
+	type RuntimeProbeResult,
 	type SandboxDriver,
 	type SandboxDriverContext,
 	type SandboxLanguage,
 	type SandboxStartOutcome,
 	type SessionPaths,
+	type SetupAction,
 	type SpawnCallOutcome,
+	type TrackedChild,
 	type VolumeFailure,
 } from "../types.ts";
 import {
+	type AppleInstallOptions,
+	createInstallRuntimeAction,
+	INSTALL_CONTAINER_OUTLOOK,
+	probeAppleInstallPlatform,
+} from "./apple-install.ts";
+import {
 	artifactsRootOf,
+	BUILD_IMAGE_OPTION,
 	BUILD_TIMEOUT_MS,
 	COMMAND_STDERR_MAX_BYTES,
 	createVolumeMebibytes,
+	DOWNLOAD_IMAGE_OPTION,
 	GUEST_USER,
+	IMAGE_BUILD_OUTLOOK,
+	IMAGE_DOWNLOAD_OUTLOOK,
 	isObject,
+	isVersionAtLeast,
 	KEEPALIVE_COMMAND,
 	KEEPALIVE_STOP_GRACE_MS,
 	LEFTOVERS_STAYED,
@@ -42,6 +59,7 @@ import {
 	launcher,
 	limitMebibytes,
 	ownedInRoot,
+	parseSemver,
 	ROOT_LABEL,
 	type RunProcess,
 	SCRUB_SCRIPT,
@@ -53,6 +71,43 @@ import {
 } from "./shared.ts";
 
 const OOM_LINE_GLOBAL = /(?:Memory cgroup out of memory|Out of memory): Killed process[^\n]*/g;
+const MIN_CONTAINER_MAJOR = 1;
+const MIN_CONTAINER_MINOR = 5;
+const START_SERVICE_OPTION = "Start container service";
+const SERVICE_START_OUTLOOK = "Start the container service — the first start downloads a Linux kernel, about 680 MB.";
+const SERVICE_START_TIMEOUT_MS = 1_800_000;
+
+const UPDATE_CONTAINER_INSTRUCTIONS = [
+	"Update Apple container to >= 1.5.0 from https://github.com/apple/container/releases",
+	"container system stop && container system start --enable-kernel-install",
+];
+
+export interface AppleSystemStatus {
+	status?: string;
+	clientVersion?: string;
+	serverVersion?: string;
+}
+
+export function parseAppleSystemStatus(text: string): AppleSystemStatus | undefined {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(text);
+	} catch {
+		return undefined;
+	}
+	if (!isObject(parsed)) return undefined;
+	const status = typeof parsed.status === "string" && parsed.status !== "" ? parsed.status : undefined;
+	const client = isObject(parsed.client) ? parsed.client : undefined;
+	const server = isObject(parsed.server) ? parsed.server : undefined;
+	const clientVersion = typeof client?.version === "string" && client.version !== "" ? client.version : undefined;
+	const serverVersion = typeof server?.version === "string" && server.version !== "" ? server.version : undefined;
+	return { status, clientVersion, serverVersion };
+}
+
+export function parseAppleCliVersion(text: string): string | undefined {
+	const match = /\b(\d+\.\d+(?:\.\d+)?)\b/.exec(firstLine(text));
+	return match === null ? undefined : match[1];
+}
 
 export function parseListing(text: string, key: "id" | "name"): ListedResource[] | undefined {
 	let parsed: unknown;
@@ -114,11 +169,7 @@ export async function cleanupContainer(
 	return { removed: false, error: { container: name, message } };
 }
 
-export function sandboxArguments(
-	runtime: SandboxDriverContext,
-	name: string,
-	session: SessionPaths = runtime.handle.paths,
-): string[] {
+export function sandboxArguments(runtime: SandboxDriverContext, name: string, session: SessionPaths): string[] {
 	const { limits } = runtime;
 	return [
 		"run",
@@ -245,12 +296,13 @@ export class AppleHotSandbox implements HotSandbox {
 			const [error] = await once(child, "error");
 			return { gone: (error as Error).message };
 		}
-		this.runtime.children.set(child, "run");
+		const tracked: TrackedChild = { kind: "run", kill: () => child.kill("SIGKILL") };
+		this.runtime.children.add(tracked);
 		let graceTimer: NodeJS.Timeout | undefined;
 		const closed = new Promise<number | null>((resolve) => {
 			child.once("close", (code) => {
 				clearTimeout(graceTimer);
-				this.runtime.children.delete(child);
+				this.runtime.children.delete(tracked);
 				resolve(code);
 			});
 		});
@@ -316,17 +368,201 @@ export class AppleHotSandbox implements HotSandbox {
 export class AppleContainerDriver implements SandboxDriver {
 	readonly name = "apple-container" as const;
 	readonly boundaryDescription = "apple-container (microVM)";
+	readonly supportsServiceAutoStart = true;
 	private readonly runtime: SandboxDriverContext;
+	private readonly installOptions: AppleInstallOptions | undefined;
 
-	constructor(runtime: SandboxDriverContext) {
+	constructor(runtime: SandboxDriverContext, installOptions?: AppleInstallOptions) {
 		this.runtime = runtime;
+		this.installOptions = installOptions;
 	}
 
-	async checkRuntime(deadlineAt: number): Promise<{ ready: true } | { ready: false; reason: string }> {
-		const status = await containerCommand(this.runtime, ["system", "status"], remainingMs(deadlineAt));
-		if (status.code !== 0)
-			return { ready: false, reason: `container system status failed: ${commandFailure(status)}` };
-		return { ready: true };
+	async probeRuntime(): Promise<RuntimeProbeResult> {
+		const status = await containerCommand(this.runtime, ["system", "status", "--format", "json"]);
+		if (status.spawnError === "ENOENT") {
+			const platform = await probeAppleInstallPlatform(this.runtime, this.installOptions);
+			if (platform.kind === "unsupported") {
+				return { kind: "unsupported", reason: platform.reason };
+			}
+			if (platform.kind === "manual") {
+				return {
+					kind: "runtime_missing",
+					reason: "Apple container is not installed",
+					remedy: { kind: "manual", instructions: platform.instructions },
+				};
+			}
+			return {
+				kind: "runtime_missing",
+				reason: "Apple container is not installed",
+				remedy: {
+					kind: "actions",
+					actions: [createInstallRuntimeAction(this.runtime, this.installOptions)],
+					outlook: [INSTALL_CONTAINER_OUTLOOK, SERVICE_START_OUTLOOK, this.imageOutlook()],
+				},
+			};
+		}
+		if (status.timedOut || status.spawnError !== undefined) {
+			return { kind: "probe_failed", reason: `container system status failed: ${commandFailure(status)}` };
+		}
+		const parsed = parseAppleSystemStatus(status.stdout);
+		for (const version of [parsed?.clientVersion, parsed?.serverVersion]) {
+			if (version !== undefined && parseSemver(version) === undefined) {
+				return {
+					kind: "probe_failed",
+					reason: `container system status returned an unreadable version "${version}"`,
+				};
+			}
+		}
+		let cliVersion: string | undefined;
+		let cliVersionError = "container --version returned an unreadable version";
+		if (parsed === undefined || parsed.clientVersion === undefined) {
+			const versionOutcome = await containerCommand(this.runtime, ["--version"]);
+			if (versionOutcome.timedOut || versionOutcome.code !== 0) {
+				cliVersionError = `container --version failed: ${commandFailure(versionOutcome)}`;
+			} else {
+				cliVersion = parseAppleCliVersion(versionOutcome.stdout);
+			}
+		}
+		const clientVersion = parsed?.clientVersion ?? cliVersion;
+		const outdated = (detail: string): RuntimeProbeResult => ({
+			kind: "runtime_not_ready",
+			reason: `Apple container >= 1.5.0 is required (${detail})`,
+			remedy: { kind: "manual", instructions: UPDATE_CONTAINER_INSTRUCTIONS },
+		});
+		if (clientVersion !== undefined && !isVersionAtLeast(clientVersion, MIN_CONTAINER_MAJOR, MIN_CONTAINER_MINOR)) {
+			return outdated(`found ${clientVersion}`);
+		}
+		if (
+			parsed?.serverVersion !== undefined &&
+			!isVersionAtLeast(parsed.serverVersion, MIN_CONTAINER_MAJOR, MIN_CONTAINER_MINOR)
+		) {
+			return outdated(
+				clientVersion !== undefined
+					? `client ${clientVersion}, service ${parsed.serverVersion}`
+					: `found ${parsed.serverVersion}`,
+			);
+		}
+		if (parsed === undefined) {
+			const reason =
+				status.code !== 0
+					? `container system status failed: ${commandFailure(status)}`
+					: "container system status returned unreadable JSON";
+			return { kind: "probe_failed", reason };
+		}
+		if (status.code !== 0 && (parsed.status === "unregistered" || parsed.status === "not running")) {
+			if (clientVersion === undefined) {
+				return { kind: "probe_failed", reason: cliVersionError };
+			}
+			return {
+				kind: "runtime_not_ready",
+				reason: "Apple container service is not running",
+				remedy: this.startServiceRemedy(true),
+			};
+		}
+		if (status.code === 0 && parsed.status === "running") {
+			if (parsed.clientVersion === undefined || parsed.serverVersion === undefined) {
+				return { kind: "probe_failed", reason: "container system status returned missing version fields" };
+			}
+			const version =
+				parsed.serverVersion !== parsed.clientVersion
+					? `${parsed.clientVersion} (service ${parsed.serverVersion})`
+					: parsed.clientVersion;
+			return { kind: "ready", version, repair: this.startServiceRemedy(false) };
+		}
+		if (status.code !== 0) {
+			return { kind: "probe_failed", reason: `container system status failed: ${commandFailure(status)}` };
+		}
+		return {
+			kind: "probe_failed",
+			reason: `container system status reported unknown status "${String(parsed.status)}"`,
+		};
+	}
+
+	private startServiceRemedy(includeQuick: boolean): Remedy {
+		return {
+			kind: "actions",
+			actions: [this.startServiceAction(includeQuick)],
+			outlook: includeQuick ? [SERVICE_START_OUTLOOK, this.imageOutlook()] : [SERVICE_START_OUTLOOK],
+		};
+	}
+
+	private imageOutlook(): string {
+		return this.runtime.imageSpec.pull !== undefined ? IMAGE_DOWNLOAD_OUTLOOK : IMAGE_BUILD_OUTLOOK;
+	}
+
+	private startServiceAction(includeQuick: boolean): SetupAction {
+		const args = ["system", "start", "--enable-kernel-install"];
+		const action: SetupAction = {
+			id: "start_service",
+			label: START_SERVICE_OPTION,
+			preview: [["container", ...args].join(" ")],
+			mode: "background",
+			run: async (io) => {
+				const started = await containerCommand(this.runtime, args, {
+					timeoutMs: SERVICE_START_TIMEOUT_MS,
+					signal: io.signal,
+					onLine: io.onLine,
+				});
+				if (io.signal.aborted) return { ok: false, cancelled: true, reason: "cancelled" };
+				if (started.code !== 0) {
+					return { ok: false, reason: `container system start failed: ${commandFailure(started)}` };
+				}
+				return { ok: true };
+			},
+		};
+		if (includeQuick) {
+			action.runQuick = async (signal) => {
+				const started = await containerCommand(this.runtime, ["system", "start", "--disable-kernel-install"], {
+					signal,
+				});
+				if (signal.aborted) return { ok: false, cancelled: true, reason: "cancelled" };
+				if (started.code !== 0) {
+					return { ok: false, reason: `container system start failed: ${commandFailure(started)}` };
+				}
+				return { ok: true };
+			};
+		}
+		return action;
+	}
+
+	imageRemedy(imageSpec: ImageSpec): Remedy {
+		const contextDir = getSandboxImageDir();
+		const actions: SetupAction[] = [];
+		const { pull, build } = imageSpec;
+		if (pull !== undefined) {
+			const pullArgs = this.pullImageArguments(pull);
+			actions.push({
+				id: "pull_image",
+				label: DOWNLOAD_IMAGE_OPTION,
+				preview: [["container", ...pullArgs].join(" ")],
+				mode: "background",
+				run: async (io) => {
+					const pulled = await this.pullImage(pull, io.signal, io.onLine);
+					if (io.signal.aborted) return { ok: false, cancelled: true, reason: "cancelled" };
+					if (pulled.code !== 0) {
+						return { ok: false, reason: `image pull ${pull} failed: ${commandFailure(pulled)}` };
+					}
+					return { ok: true };
+				},
+			});
+		}
+		const buildArgs = this.buildImageArguments(build, contextDir);
+		actions.push({
+			id: "build_image",
+			label: BUILD_IMAGE_OPTION,
+			preview: [["container", ...buildArgs].join(" ")],
+			mode: "background",
+			run: async (io) => {
+				const built = await this.buildImage(build, contextDir, io.signal, io.onLine);
+				if (io.signal.aborted) return { ok: false, cancelled: true, reason: "cancelled" };
+				if (built.code !== 0) {
+					return { ok: false, reason: `image build ${build} failed: ${commandFailure(built)}` };
+				}
+				return { ok: true };
+			},
+		});
+		const outlook = [this.imageOutlook()];
+		return { kind: "actions", actions, outlook };
 	}
 
 	async inspectImage(image: string, deadlineAt: number): Promise<{ found: true } | { found: false; reason: string }> {
@@ -337,7 +573,7 @@ export class AppleContainerDriver implements SandboxDriver {
 
 	pullImage(image: string, signal?: AbortSignal, onLine?: (line: string) => void): Promise<CommandOutcome> {
 		// Limit pull to arm64; without --arch, container fetches and unpacks every platform in a multi-arch index.
-		return containerCommand(this.runtime, ["image", "pull", "--arch", "arm64", image], {
+		return containerCommand(this.runtime, this.pullImageArguments(image), {
 			timeoutMs: BUILD_TIMEOUT_MS,
 			signal,
 			onLine,
@@ -350,11 +586,19 @@ export class AppleContainerDriver implements SandboxDriver {
 		signal?: AbortSignal,
 		onLine?: (line: string) => void,
 	): Promise<CommandOutcome> {
-		return containerCommand(
-			this.runtime,
-			["build", "--arch", "arm64", "--tag", image, "--file", join(contextDir, "Containerfile"), contextDir],
-			{ timeoutMs: BUILD_TIMEOUT_MS, signal, onLine },
-		);
+		return containerCommand(this.runtime, this.buildImageArguments(image, contextDir), {
+			timeoutMs: BUILD_TIMEOUT_MS,
+			signal,
+			onLine,
+		});
+	}
+
+	private pullImageArguments(image: string): string[] {
+		return ["image", "pull", "--arch", "arm64", image];
+	}
+
+	private buildImageArguments(image: string, contextDir: string): string[] {
+		return ["build", "--arch", "arm64", "--tag", image, "--file", join(contextDir, "Containerfile"), contextDir];
 	}
 
 	async listSandboxes(root: string, deadlineAt: number): Promise<OwnedResource[]> {
@@ -378,7 +622,7 @@ export class AppleContainerDriver implements SandboxDriver {
 		return `container delete --force ${names.join(" ")}`;
 	}
 
-	async listWorkVolumes(root: string, deadlineAt: number): Promise<OwnedResource[]> {
+	async listWorkVolumes(session: SessionPaths, deadlineAt: number): Promise<OwnedResource[]> {
 		if (remainingMs(deadlineAt) === 0) return [];
 		const listed = await containerCommand(
 			this.runtime,
@@ -386,7 +630,7 @@ export class AppleContainerDriver implements SandboxDriver {
 			remainingMs(deadlineAt),
 		);
 		const volumes = listed.code === 0 ? parseVolumes(listed.stdout) : undefined;
-		return ownedInRoot(volumes ?? [], root);
+		return ownedInRoot(volumes ?? [], artifactsRootOf(session));
 	}
 
 	async ensureWorkVolume(session: SessionPaths, deadlineAt: number): Promise<VolumeFailure | undefined> {
@@ -428,7 +672,7 @@ export class AppleContainerDriver implements SandboxDriver {
 		return failure;
 	}
 
-	async deleteWorkVolumes(volumes: OwnedResource[], deadlineAt: number): Promise<void> {
+	async deleteWorkVolumes(volumes: OwnedResource[], _session: SessionPaths, deadlineAt: number): Promise<void> {
 		for (const volume of volumes) {
 			if (remainingMs(deadlineAt) === 0) return;
 			await containerCommand(this.runtime, ["volume", "delete", volume.name], remainingMs(deadlineAt));
@@ -455,13 +699,14 @@ export class AppleContainerDriver implements SandboxDriver {
 			return { failed: (error as Error).message };
 		}
 		this.runtime.owned.add(name);
-		this.runtime.children.set(child, "run");
+		const tracked: TrackedChild = { kind: "run", kill: () => child.kill("SIGKILL") };
+		this.runtime.children.add(tracked);
 		child.stdin.on("error", () => {});
 		const stderr = new StreamCapture(COMMAND_STDERR_MAX_BYTES);
 		child.stderr.on("data", (chunk: Buffer) => stderr.retain(chunk));
 		const keepaliveClosed = new Promise<number | null>((resolve) => {
 			child.once("close", (code) => {
-				this.runtime.children.delete(child);
+				this.runtime.children.delete(tracked);
 				resolve(code);
 			});
 		});

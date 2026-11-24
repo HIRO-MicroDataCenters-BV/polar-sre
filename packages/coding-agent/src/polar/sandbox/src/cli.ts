@@ -1,12 +1,13 @@
 import { spawn } from "child_process";
 import { tmpdir } from "os";
 import { StringDecoder } from "string_decoder";
-import type { CleanupError, CommandOutcome, SandboxDriverContext } from "./types.ts";
+import { killProcessGroup } from "../../shared/process.ts";
+import type { CleanupError, CommandOutcome, SandboxDriverContext, TrackedChild } from "./types.ts";
 
 export const CLI_STOPPED = "sandbox is stopping; no command starts";
 const COMMAND_OUTPUT_MAX_BYTES = 16 * 1024 * 1024;
-const DIAGNOSTIC_MAX_BYTES = 4 * 1024;
-const DIAGNOSTIC_MAX_LINES = 64;
+export const DIAGNOSTIC_MAX_BYTES = 4 * 1024;
+export const DIAGNOSTIC_MAX_LINES = 64;
 
 export interface ListedResource {
 	name: string;
@@ -54,41 +55,60 @@ export function containerCommand(
 	if (runtime.cliStopped) return Promise.resolve({ code: null, stdout: "", stderr: CLI_STOPPED, timedOut: false });
 	if (signal?.aborted) return Promise.resolve({ code: null, stdout: "", stderr: "cancelled", timedOut: false });
 	return new Promise((resolve) => {
+		// The command leads its own process group, so stopping it also stops the helpers it started.
 		const child = spawn(command, args, {
 			cwd: tmpdir(),
 			env,
+			detached: true,
 			stdio: ["ignore", "pipe", "pipe"],
 		});
-		if (child.pid !== undefined) runtime.children.set(child, "service");
+		const { pid } = child;
 		const stdout = new StreamCapture(COMMAND_OUTPUT_MAX_BYTES);
 		const stderr = new StreamCapture(COMMAND_OUTPUT_MAX_BYTES);
+		const stdoutLines = options.onLine ? new LineSplitter(options.onLine) : undefined;
+		const stderrLines = options.onLine ? new LineSplitter(options.onLine) : undefined;
 		let timedOut = false;
 		let settled = false;
-		const onAbort = () => {
-			child.kill("SIGKILL");
-		};
-		signal?.addEventListener("abort", onAbort, { once: true });
-		const timer = setTimeout(
-			() => {
-				timedOut = true;
-				child.kill("SIGKILL");
-			},
-			Math.max(1, timeoutMs),
-		);
-		const settle = (code: number | null, error?: Error) => {
+		let graceTimer: NodeJS.Timeout | undefined;
+		const settle = (code: number | null, error?: NodeJS.ErrnoException) => {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
-			signal?.removeEventListener("abort", onAbort);
+			clearTimeout(graceTimer);
+			signal?.removeEventListener("abort", stop);
+			if (tracked !== undefined) runtime.children.delete(tracked);
+			stdoutLines?.end();
+			stderrLines?.end();
 			resolve({
 				code,
 				stdout: stdout.text(),
 				stderr: error === undefined ? stderr.text() : error.message,
 				timedOut,
+				spawnError: error?.code,
 			});
 		};
-		const stdoutLines = options.onLine ? new LineSplitter(options.onLine) : undefined;
-		const stderrLines = options.onLine ? new LineSplitter(options.onLine) : undefined;
+		const forceKill = () => {
+			if (pid !== undefined) killProcessGroup(pid, "SIGKILL");
+			// A process that left the group may still hold the pipes, and "close" would wait for it.
+			child.stdout.destroy();
+			child.stderr.destroy();
+			settle(child.exitCode);
+		};
+		const tracked: TrackedChild | undefined = pid === undefined ? undefined : { kind: "service", kill: forceKill };
+		if (tracked !== undefined) runtime.children.add(tracked);
+		const stop = () => {
+			if (pid === undefined || graceTimer !== undefined) return;
+			killProcessGroup(pid, "SIGTERM");
+			graceTimer = setTimeout(forceKill, runtime.limits.killGraceMs);
+		};
+		signal?.addEventListener("abort", stop, { once: true });
+		const timer = setTimeout(
+			() => {
+				timedOut = true;
+				stop();
+			},
+			Math.max(1, timeoutMs),
+		);
 		child.stdout.on("data", (chunk: Buffer) => {
 			stdout.retain(chunk);
 			stdoutLines?.write(chunk);
@@ -98,12 +118,8 @@ export function containerCommand(
 			stderrLines?.write(chunk);
 		});
 		child.once("error", (error) => settle(null, error));
-		child.once("close", (code) => {
-			runtime.children.delete(child);
-			stdoutLines?.end();
-			stderrLines?.end();
-			settle(code);
-		});
+		// "exit" can precede the last output, so a command that ends on its own settles on "close".
+		child.once("close", (code) => settle(code));
 	});
 }
 

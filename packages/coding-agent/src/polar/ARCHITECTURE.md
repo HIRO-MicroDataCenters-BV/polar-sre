@@ -111,25 +111,31 @@ packages/coding-agent/src/polar/
 │
 ├── sandbox/                         # Isolated local VM / container sandbox extension (`run_code`)
 │   ├── ARCHITECTURE.md              # Sandbox architecture and internal layer boundaries
-│   ├── index.ts                     # --sandbox-driver / --sandbox-image / --sandbox-registry-image / --sandbox-oci-* / --sandbox-k8s-pvc flags, startup readiness, shutdown, tool registration
+│   ├── index.ts                     # --sandbox-driver / --sandbox-image / --sandbox-registry-image / --sandbox-oci-* / --sandbox-k8s-pvc flags, /sandbox command, session_start/shutdown wiring, run_code tool definition
 │   ├── image/
 │   │   ├── Containerfile
 │   │   ├── requirements.in
 │   │   └── requirements.txt
 │   ├── src/
-│   │   ├── types.ts                 # Domain types and `SandboxDriver` / `HotSandbox` contracts
-│   │   ├── cli.ts                   # Layer 1: Stateless CLI execution and diagnostic primitives
+│   │   ├── types.ts                 # Domain types, HostDiagnosis/Remedy/SetupAction, SandboxDriver & HotSandbox contracts
+│   │   ├── cli.ts                   # Layer 1: Stateless CLI execution in a process group and diagnostic primitives
 │   │   ├── driver.ts                # Layer 2: Driver barrel exports
 │   │   ├── drivers/
-│   │   │   ├── shared.ts            # Shared guest constants, launcher, and UnsupportedSandboxDriver
+│   │   │   ├── shared.ts            # Shared guest constants, launcher, version helper, and UnsupportedSandboxDriver
 │   │   │   ├── apple.ts             # AppleContainerDriver & AppleHotSandbox (`container` microVM)
+│   │   │   ├── apple-install.ts     # Pinned Apple container .pkg download, SHA-256 & pkgutil verification, sudo installer launch, and platform probe
 │   │   │   ├── oci.ts               # OciDriver & OciHotSandbox (`podman` / `docker`)
 │   │   │   └── k8s.ts               # K8sDriver & K8sHotSandbox (`kubectl` Pod)
-│   │   ├── workspace.ts             # Layer 3: Readiness check, image lookup/pull/build UX, orphan GC, /work volume setup
-│   │   ├── runner.ts                # Layer 4: Lazy hot VM lifecycle, `spawnCall` supervision, OOM delta & work_limit check, scrub
-│   │   ├── reply.ts                 # Layer 5: Sandbox reply formatting (with OOM, work_limit, inspection, and cleanup notices)
+│   │   ├── host.ts                  # Layer 3: Host diagnosis (`probeHost` -> `HostDiagnosis`), `ImageSpec` resolution, diagnosis texts
+│   │   ├── setup.ts                 # Layer 3: Machine lock, quick service start, and host setup task with rank progression and cancellation
+│   │   ├── workspace.ts             # Layer 4: Session activation under the session lock (orphan GC, /work volume setup) and shutdown
+│   │   ├── runner.ts                # Layer 5: Lazy hot VM lifecycle, `spawnCall` supervision, OOM delta & work_limit check, scrub
+│   │   ├── reply.ts                 # Layer 6: Sandbox reply formatting (with OOM, work_limit, inspection, and cleanup notices)
+│   │   ├── preferences.ts           # Atomic read and merge update of `sandbox.json` in `getAgentDir()`
+│   │   ├── controller.ts            # Sandbox state of the session (`off`/`activating`/`active`/`disabled`/`closing`/`closed`), host probe, setup task, activation, footer status, run_code registration, shutdown
+│   │   ├── command.ts               # `/sandbox` command screens, menus, installer download dialog, and terminal handoff
 │   │   ├── progress.ts              # CLI pull progress parser (`container` and `docker` output)
-│   │   └── indicator.ts             # TUI single-line progress widget for image pull and build
+│   │   └── indicator.ts             # TUI single-line progress widget (`"download" | "build" | "service"`) and `ForegroundActionDialog`
 │   └── test/
 │
 └── test/                            # Cross-extension architectural tests
@@ -154,8 +160,8 @@ Enforced by `test/independence.test.ts` and `test/composition.test.ts`:
    - Tool names, descriptions, prompt snippets, prompt guidelines, parameter descriptions, status lines, notices, and replies of an extension do not reference tool names belonging to other extensions (`list_files`, `run_code`, `k8s_*`, `loki_*`, etc.).
    - Producers reference saved files by their full path in the session directory and may mention Pi's built-in `read` tool. Only `sandbox` references `/data/<file>`.
 4. **Graceful Disablement**
-   - Missing or incomplete operator configuration at `session_start` notifies the operator, sets a footer status (for example, `kubeconfig: off, run /kubeconfig` for `k8s`, or sets no footer status at all, as in `sandbox`), acquires no session lock, and leaves that extension's tools unregistered while the session and other extensions continue normally.
-   - Producer extensions may support deferred activation and live target switching during the session via an operator command.
+   - Missing or incomplete operator configuration or host readiness at `session_start` notifies the operator, sets a footer status (for example, `kubeconfig: off, run /kubeconfig` for `k8s`, or `sandbox: off, run /sandbox` for `sandbox`), acquires no session lock, and leaves that extension's tools unregistered while the session and other extensions continue normally.
+   - Extensions may support deferred activation and live target switching during the session via an operator command.
 5. **Streaming Output**
    - Primary output streams directly into an `OpenFile.sink` managed by `shared/store.ts` rather than buffering full payloads in memory.
 6. **Storage Finalization Before Formatting**

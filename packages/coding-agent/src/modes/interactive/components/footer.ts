@@ -266,7 +266,7 @@ export class FooterComponent implements Component {
 			// Need to truncate right side
 			const availableForRight = width - statsLeftWidth - minPadding;
 			if (availableForRight > 0) {
-				const truncatedRight = truncateToWidth(rightSide, availableForRight, "");
+				const truncatedRight = truncateToWidth(rightSide, availableForRight, theme.fg("dim", "..."));
 				const truncatedRightWidth = visibleWidth(truncatedRight);
 				const padding = " ".repeat(Math.max(0, width - statsLeftWidth - truncatedRightWidth));
 				statsLine = statsLeft + padding + truncatedRight;
@@ -286,15 +286,32 @@ export class FooterComponent implements Component {
 		const pwdLine = truncateToWidth(theme.fg("dim", pwd), width, theme.fg("dim", "..."));
 		const lines = [pwdLine, dimStatsLeft + dimRemainder];
 
-		// Add extension statuses on a single line, sorted by key alphabetically
+		// Add extension statuses sorted by key, wrapping across lines when needed
 		const extensionStatuses = this.footerData.getExtensionStatuses();
 		if (extensionStatuses.size > 0) {
 			const sortedStatuses = Array.from(extensionStatuses.entries())
 				.sort(([a], [b]) => a.localeCompare(b))
-				.map(([, text]) => sanitizeStatusText(text));
-			const statusLine = sortedStatuses.join(" ");
-			// Truncate to terminal width with dim ellipsis for consistency with footer style
-			lines.push(truncateToWidth(statusLine, width, theme.fg("dim", "...")));
+				.map(([, text]) => sanitizeStatusText(text))
+				.filter((text) => visibleWidth(text) > 0);
+			let currentLine = "";
+			for (const status of sortedStatuses) {
+				const fitted =
+					visibleWidth(status) > width ? truncateToWidth(status, width, theme.fg("dim", "...")) : status;
+				if (!currentLine) {
+					currentLine = fitted;
+					continue;
+				}
+				const candidate = `${currentLine} · ${fitted}`;
+				if (visibleWidth(candidate) <= width) {
+					currentLine = candidate;
+				} else {
+					lines.push(currentLine);
+					currentLine = fitted;
+				}
+			}
+			if (currentLine) {
+				lines.push(currentLine);
+			}
 		}
 
 		return lines;

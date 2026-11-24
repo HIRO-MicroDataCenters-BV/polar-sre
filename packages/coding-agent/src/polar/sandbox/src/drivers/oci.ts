@@ -3,6 +3,7 @@ import { randomBytes } from "crypto";
 import { once } from "events";
 import { tmpdir } from "os";
 import { join } from "path";
+import { getSandboxImageDir } from "../../../../config.ts";
 import {
 	CLI_STOPPED,
 	commandFailure,
@@ -17,23 +18,32 @@ import {
 	type CommandOutcome,
 	DATA_PATH,
 	type HotSandbox,
+	type ImageSpec,
 	type Inspection,
 	type OciEngine,
 	type OciEngineChoice,
 	type OwnedResource,
+	type Remedy,
+	type RuntimeProbeResult,
 	type SandboxDriver,
 	type SandboxDriverContext,
 	type SandboxLanguage,
 	type SandboxStartOutcome,
 	type SessionPaths,
+	type SetupAction,
 	type SpawnCallOutcome,
+	type TrackedChild,
 	type VolumeFailure,
 } from "../types.ts";
 import {
 	artifactsRootOf,
+	BUILD_IMAGE_OPTION,
 	BUILD_TIMEOUT_MS,
 	COMMAND_STDERR_MAX_BYTES,
+	DOWNLOAD_IMAGE_OPTION,
 	GUEST_USER,
+	IMAGE_BUILD_OUTLOOK,
+	IMAGE_DOWNLOAD_OUTLOOK,
 	isObject,
 	KEEPALIVE_COMMAND,
 	KEEPALIVE_STOP_GRACE_MS,
@@ -181,7 +191,7 @@ export function ociSandboxArguments(
 	runtime: SandboxDriverContext,
 	name: string,
 	options: OciRunOptions,
-	session: SessionPaths = runtime.handle.paths,
+	session: SessionPaths,
 ): string[] {
 	const { limits } = runtime;
 	const mem = `${limitMebibytes(limits.memoryBytes)}m`;
@@ -292,6 +302,87 @@ function isRunsc(value: unknown): boolean {
 	return typeof value === "string" && (value === "runsc" || value.endsWith("/runsc"));
 }
 
+export interface ParsedOciEngineInfo {
+	ready: true;
+	version?: string;
+	rootless: boolean;
+	cpuDelegated: boolean;
+	detectedRuntime: string;
+	gvisor: boolean;
+}
+
+export type OciEngineInfoResult = ParsedOciEngineInfo | { ready: false; reason: string };
+
+export function parseEngineInfo(engine: OciEngine, stdout: string, ociRuntime?: string): OciEngineInfoResult {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(stdout);
+	} catch {
+		return { ready: false, reason: `${engine} info returned unreadable JSON` };
+	}
+	if (!isObject(parsed)) {
+		return { ready: false, reason: `${engine} info returned unreadable JSON` };
+	}
+	if (engine === "docker") {
+		if (Array.isArray(parsed.ServerErrors) && parsed.ServerErrors.length > 0) {
+			return { ready: false, reason: `docker info failed: ${String(parsed.ServerErrors[0])}` };
+		}
+		const securityOptions = Array.isArray(parsed.SecurityOptions) ? parsed.SecurityOptions : [];
+		const isRootless = securityOptions.some(
+			(opt) => typeof opt === "string" && (opt === "rootless" || opt.includes("name=rootless")),
+		);
+		if (isRootless) {
+			return { ready: false, reason: ROOTLESS_DOCKER_UNSUPPORTED };
+		}
+		if (ociRuntime !== undefined && isObject(parsed.Runtimes) && !(ociRuntime in parsed.Runtimes)) {
+			return { ready: false, reason: `OCI runtime ${ociRuntime} is not available in docker` };
+		}
+		const defaultRuntime =
+			typeof parsed.DefaultRuntime === "string" && parsed.DefaultRuntime !== "" ? parsed.DefaultRuntime : "runc";
+		const activeRuntime = ociRuntime ?? defaultRuntime;
+		const runtimeEntry =
+			isObject(parsed.Runtimes) && isObject(parsed.Runtimes[activeRuntime])
+				? parsed.Runtimes[activeRuntime]
+				: undefined;
+		const version =
+			typeof parsed.ServerVersion === "string" && parsed.ServerVersion !== "" ? parsed.ServerVersion : undefined;
+		return {
+			ready: true,
+			...(version === undefined ? {} : { version }),
+			rootless: false,
+			cpuDelegated: true,
+			detectedRuntime: defaultRuntime,
+			gvisor: isRunsc(activeRuntime) || isRunsc(runtimeEntry?.path),
+		};
+	}
+
+	const host = isObject(parsed.host) ? parsed.host : {};
+	const security = isObject(host.security) ? host.security : {};
+	const isRootless = security.rootless !== false;
+	const versionObj = isObject(parsed.version) ? parsed.version : {};
+	const version = typeof versionObj.Version === "string" && versionObj.Version !== "" ? versionObj.Version : undefined;
+	if (isRootless && version !== undefined && !isPodmanVersionAtLeast(version, 4, 3)) {
+		return {
+			ready: false,
+			reason: `rootless Podman >= 4.3 is required for keep-id UID mapping (found ${version})`,
+		};
+	}
+	const controllers = Array.isArray(host.cgroupControllers) ? host.cgroupControllers : undefined;
+	const cpuDelegated = controllers === undefined || controllers.includes("cpu");
+	const ociRuntimeObj = isObject(host.ociRuntime) ? host.ociRuntime : {};
+	const defaultRuntime =
+		typeof ociRuntimeObj.name === "string" && ociRuntimeObj.name !== "" ? ociRuntimeObj.name : "crun";
+	const activeRuntime = ociRuntime ?? defaultRuntime;
+	return {
+		ready: true,
+		...(version === undefined ? {} : { version }),
+		rootless: isRootless,
+		cpuDelegated,
+		detectedRuntime: defaultRuntime,
+		gvisor: isRunsc(activeRuntime) || (ociRuntime === undefined && isRunsc(ociRuntimeObj.path)),
+	};
+}
+
 export class OciHotSandbox implements HotSandbox {
 	readonly name: string;
 	private readonly runtime: SandboxDriverContext;
@@ -370,12 +461,13 @@ export class OciHotSandbox implements HotSandbox {
 			const [error] = await once(child, "error");
 			return { gone: (error as Error).message };
 		}
-		this.runtime.children.set(child, "run");
+		const tracked: TrackedChild = { kind: "run", kill: () => child.kill("SIGKILL") };
+		this.runtime.children.add(tracked);
 		let graceTimer: NodeJS.Timeout | undefined;
 		const closed = new Promise<number | null>((resolve) => {
 			child.once("close", (code) => {
 				clearTimeout(graceTimer);
-				this.runtime.children.delete(child);
+				this.runtime.children.delete(tracked);
 				resolve(code);
 			});
 		});
@@ -454,6 +546,7 @@ export class OciHotSandbox implements HotSandbox {
 
 export class OciDriver implements SandboxDriver {
 	readonly name = "oci" as const;
+	readonly supportsServiceAutoStart = false;
 	private readonly runtime: SandboxDriverContext;
 	private readonly engineChoice: OciEngineChoice;
 	private readonly ociRuntime: string | undefined;
@@ -505,37 +598,99 @@ export class OciDriver implements SandboxDriver {
 		};
 	}
 
-	async checkRuntime(deadlineAt: number): Promise<{ ready: true } | { ready: false; reason: string }> {
+	async probeRuntime(): Promise<RuntimeProbeResult> {
 		if (this.engineChoice !== "auto" && this.engineChoice !== "podman" && this.engineChoice !== "docker") {
 			return {
-				ready: false,
+				kind: "unsupported",
 				reason: `invalid --sandbox-oci-engine "${String(this.engineChoice)}"; expected auto, podman, or docker`,
 			};
 		}
-		const candidates: OciEngine[] = this.engineChoice === "auto" ? ["podman", "docker"] : [this.engineChoice];
-		let lastReason = "";
+		const pinned = this.runtime.state !== "unready";
+		const candidates: OciEngine[] = pinned
+			? [this.engine]
+			: this.engineChoice === "auto"
+				? ["podman", "docker"]
+				: [this.engineChoice];
+		const reasons: string[] = [];
 		for (const candidate of candidates) {
 			const command = this.customCommand ?? candidate;
-			const info = await containerCommand(
-				this.runtime,
-				["info", "--format", "{{json .}}"],
-				remainingMs(deadlineAt),
-				undefined,
-				command,
-			);
-			if (info.code !== 0) {
-				if (lastReason === "" || !info.stderr.includes("ENOENT")) {
-					lastReason = `${candidate} info failed: ${commandFailure(info)}`;
-				}
+			const info = await containerCommand(this.runtime, ["info", "--format", "{{json .}}"], { command });
+			if (info.spawnError === "ENOENT") {
 				continue;
 			}
-			const checked = this.inspectEngineInfo(candidate, info.stdout);
-			if (!checked.ready) return checked;
-			this.engine = candidate;
-			this.runtime.containerCommand = command;
-			return { ready: true };
+			if (info.timedOut || info.code !== 0) {
+				reasons.push(`${candidate} info failed: ${commandFailure(info)}`);
+				continue;
+			}
+			const parsed = parseEngineInfo(candidate, info.stdout, this.ociRuntime);
+			if (!parsed.ready) {
+				reasons.push(parsed.reason);
+				continue;
+			}
+			if (!pinned) {
+				this.engine = candidate;
+				this.runtime.containerCommand = command;
+				this.rootless = parsed.rootless;
+				this.cpuDelegated = parsed.cpuDelegated;
+				this.detectedRuntime = parsed.detectedRuntime;
+				this.gvisor = parsed.gvisor;
+			}
+			return parsed.version === undefined ? { kind: "ready" } : { kind: "ready", version: parsed.version };
 		}
-		return { ready: false, reason: lastReason };
+		if (reasons.length === 0) {
+			const reason =
+				candidates.length > 1 ? "neither podman nor docker is installed" : `${candidates[0]} is not installed`;
+			return {
+				kind: "runtime_missing",
+				reason,
+				remedy: { kind: "manual", instructions: ["Install rootless Podman >= 4.3 or standard Docker."] },
+			};
+		}
+		return {
+			kind: "runtime_not_ready",
+			reason: reasons.join("; "),
+			remedy: { kind: "manual", instructions: ["Start or configure rootless Podman >= 4.3 or standard Docker."] },
+		};
+	}
+
+	imageRemedy(imageSpec: ImageSpec): Remedy {
+		const contextDir = getSandboxImageDir();
+		const actions: SetupAction[] = [];
+		const { pull, build } = imageSpec;
+		if (pull !== undefined) {
+			const pullArgs = this.pullImageArguments(pull);
+			actions.push({
+				id: "pull_image",
+				label: DOWNLOAD_IMAGE_OPTION,
+				preview: [[this.engine, ...pullArgs].join(" ")],
+				mode: "background",
+				run: async (io) => {
+					const pulled = await this.pullImage(pull, io.signal, io.onLine);
+					if (io.signal.aborted) return { ok: false, cancelled: true, reason: "cancelled" };
+					if (pulled.code !== 0) {
+						return { ok: false, reason: `image pull ${pull} failed: ${commandFailure(pulled)}` };
+					}
+					return { ok: true };
+				},
+			});
+		}
+		const buildArgs = this.buildImageArguments(build, contextDir);
+		actions.push({
+			id: "build_image",
+			label: BUILD_IMAGE_OPTION,
+			preview: [[this.engine, ...buildArgs].join(" ")],
+			mode: "background",
+			run: async (io) => {
+				const built = await this.buildImage(build, contextDir, io.signal, io.onLine);
+				if (io.signal.aborted) return { ok: false, cancelled: true, reason: "cancelled" };
+				if (built.code !== 0) {
+					return { ok: false, reason: `image build ${build} failed: ${commandFailure(built)}` };
+				}
+				return { ok: true };
+			},
+		});
+		const outlook = [pull !== undefined ? IMAGE_DOWNLOAD_OUTLOOK : IMAGE_BUILD_OUTLOOK];
+		return { kind: "actions", actions, outlook };
 	}
 
 	async inspectImage(image: string, deadlineAt: number): Promise<{ found: true } | { found: false; reason: string }> {
@@ -545,7 +700,7 @@ export class OciDriver implements SandboxDriver {
 	}
 
 	pullImage(image: string, signal?: AbortSignal, onLine?: (line: string) => void): Promise<CommandOutcome> {
-		return containerCommand(this.runtime, ["image", "pull", image], {
+		return containerCommand(this.runtime, this.pullImageArguments(image), {
 			timeoutMs: BUILD_TIMEOUT_MS,
 			signal,
 			onLine,
@@ -558,21 +713,29 @@ export class OciDriver implements SandboxDriver {
 		signal?: AbortSignal,
 		onLine?: (line: string) => void,
 	): Promise<CommandOutcome> {
+		return containerCommand(this.runtime, this.buildImageArguments(image, contextDir), {
+			timeoutMs: BUILD_TIMEOUT_MS,
+			signal,
+			onLine,
+		});
+	}
+
+	private pullImageArguments(image: string): string[] {
+		return ["image", "pull", image];
+	}
+
+	private buildImageArguments(image: string, contextDir: string): string[] {
 		const arch = hostLinuxArch();
-		return containerCommand(
-			this.runtime,
-			[
-				"build",
-				"--build-arg",
-				`TARGETARCH=${arch}`,
-				"--tag",
-				image,
-				"--file",
-				join(contextDir, "Containerfile"),
-				contextDir,
-			],
-			{ timeoutMs: BUILD_TIMEOUT_MS, signal, onLine },
-		);
+		return [
+			"build",
+			"--build-arg",
+			`TARGETARCH=${arch}`,
+			"--tag",
+			image,
+			"--file",
+			join(contextDir, "Containerfile"),
+			contextDir,
+		];
 	}
 
 	async listSandboxes(root: string, deadlineAt: number): Promise<OwnedResource[]> {
@@ -601,8 +764,9 @@ export class OciDriver implements SandboxDriver {
 		return `${this.engine} rm --force ${names.join(" ")}`;
 	}
 
-	async listWorkVolumes(root: string, deadlineAt: number): Promise<OwnedResource[]> {
+	async listWorkVolumes(session: SessionPaths, deadlineAt: number): Promise<OwnedResource[]> {
 		if (remainingMs(deadlineAt) === 0) return [];
+		const root = artifactsRootOf(session);
 		const listed = await containerCommand(
 			this.runtime,
 			["volume", "ls", "--filter", `label=${ROOT_LABEL}=${root}`, "--format", "{{.Name}}"],
@@ -648,7 +812,7 @@ export class OciDriver implements SandboxDriver {
 		return failure;
 	}
 
-	async deleteWorkVolumes(volumes: OwnedResource[], deadlineAt: number): Promise<void> {
+	async deleteWorkVolumes(volumes: OwnedResource[], _session: SessionPaths, deadlineAt: number): Promise<void> {
 		for (const volume of volumes) {
 			if (remainingMs(deadlineAt) === 0) return;
 			await containerCommand(this.runtime, ["volume", "rm", volume.name], remainingMs(deadlineAt));
@@ -675,13 +839,14 @@ export class OciDriver implements SandboxDriver {
 			return { failed: (error as Error).message };
 		}
 		this.runtime.owned.add(name);
-		this.runtime.children.set(child, "run");
+		const tracked: TrackedChild = { kind: "run", kill: () => child.kill("SIGKILL") };
+		this.runtime.children.add(tracked);
 		child.stdin.on("error", () => {});
 		const stderr = new StreamCapture(COMMAND_STDERR_MAX_BYTES);
 		child.stderr.on("data", (chunk: Buffer) => stderr.retain(chunk));
 		const keepaliveClosed = new Promise<number | null>((resolve) => {
 			child.once("close", (code) => {
-				this.runtime.children.delete(child);
+				this.runtime.children.delete(tracked);
 				resolve(code);
 			});
 		});
@@ -738,67 +903,6 @@ export class OciDriver implements SandboxDriver {
 			failed: startup.reason,
 			leftover: cleanup.removed ? undefined : cleanup.error,
 		};
-	}
-
-	private inspectEngineInfo(engine: OciEngine, stdout: string): { ready: true } | { ready: false; reason: string } {
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(stdout);
-		} catch {
-			return { ready: false, reason: `${engine} info returned unreadable JSON` };
-		}
-		if (!isObject(parsed)) {
-			return { ready: false, reason: `${engine} info returned unreadable JSON` };
-		}
-		if (engine === "docker") {
-			if (Array.isArray(parsed.ServerErrors) && parsed.ServerErrors.length > 0) {
-				return { ready: false, reason: `docker info failed: ${String(parsed.ServerErrors[0])}` };
-			}
-			const securityOptions = Array.isArray(parsed.SecurityOptions) ? parsed.SecurityOptions : [];
-			const isRootless = securityOptions.some(
-				(opt) => typeof opt === "string" && (opt === "rootless" || opt.includes("name=rootless")),
-			);
-			if (isRootless) {
-				return { ready: false, reason: ROOTLESS_DOCKER_UNSUPPORTED };
-			}
-			if (this.ociRuntime !== undefined && isObject(parsed.Runtimes) && !(this.ociRuntime in parsed.Runtimes)) {
-				return { ready: false, reason: `OCI runtime ${this.ociRuntime} is not available in docker` };
-			}
-			const defaultRuntime =
-				typeof parsed.DefaultRuntime === "string" && parsed.DefaultRuntime !== "" ? parsed.DefaultRuntime : "runc";
-			const activeRuntime = this.ociRuntime ?? defaultRuntime;
-			const runtimeEntry =
-				isObject(parsed.Runtimes) && isObject(parsed.Runtimes[activeRuntime])
-					? parsed.Runtimes[activeRuntime]
-					: undefined;
-			this.rootless = false;
-			this.cpuDelegated = true;
-			this.detectedRuntime = defaultRuntime;
-			this.gvisor = isRunsc(activeRuntime) || isRunsc(runtimeEntry?.path);
-			return { ready: true };
-		}
-
-		const host = isObject(parsed.host) ? parsed.host : {};
-		const security = isObject(host.security) ? host.security : {};
-		const isRootless = security.rootless !== false;
-		const versionObj = isObject(parsed.version) ? parsed.version : {};
-		const versionStr = typeof versionObj.Version === "string" ? versionObj.Version : undefined;
-		if (isRootless && versionStr !== undefined && !isPodmanVersionAtLeast(versionStr, 4, 3)) {
-			return {
-				ready: false,
-				reason: `rootless Podman >= 4.3 is required for keep-id UID mapping (found ${versionStr})`,
-			};
-		}
-		const controllers = Array.isArray(host.cgroupControllers) ? host.cgroupControllers : undefined;
-		this.rootless = isRootless;
-		this.cpuDelegated = controllers === undefined || controllers.includes("cpu");
-		const ociRuntimeObj = isObject(host.ociRuntime) ? host.ociRuntime : {};
-		const defaultRuntime =
-			typeof ociRuntimeObj.name === "string" && ociRuntimeObj.name !== "" ? ociRuntimeObj.name : "crun";
-		const activeRuntime = this.ociRuntime ?? defaultRuntime;
-		this.detectedRuntime = defaultRuntime;
-		this.gvisor = isRunsc(activeRuntime) || (this.ociRuntime === undefined && isRunsc(ociRuntimeObj.path));
-		return { ready: true };
 	}
 
 	private async prepareWorkVolume(session: SessionPaths, volume: string): Promise<VolumeFailure | undefined> {

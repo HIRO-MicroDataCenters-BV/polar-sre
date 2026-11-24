@@ -22,7 +22,7 @@ node packages/coding-agent/dist/bundle/cli.js --help
 Common execution modes:
 
 ```bash
-# Interactive TUI (configure provider with /login and cluster context with /kubeconfig)
+# Interactive TUI (configure provider with /login, cluster context with /kubeconfig, and sandbox with /sandbox)
 polar-sre
 
 # Single-shot non-interactive investigation
@@ -38,9 +38,9 @@ polar-sre --mode rpc --session-dir /sessions
 |---|---|---|
 | `--k8s-kubeconfig <paths>` | `$KUBECONFIG` or `~/.kube/config` | Kubeconfig file or platform-delimited path list for `kubectl` |
 | `--k8s-context <name>` | *(saved or off)* | Initial Kubernetes context (or select interactively via `/kubeconfig`) |
-| `--sandbox-driver <name>` | `auto` | Sandbox backend: `auto`, `apple-container`, `oci`, or `k8s` |
+| `--sandbox-driver <name>` | `auto` | Sandbox backend: `auto`, `apple-container`, `oci`, or `k8s` (inspect or set up via `/sandbox`) |
 | `--sandbox-image <ref>` | `polar-sandbox:0.2` | Guest image for `run_code` (`POLAR_SANDBOX_K8S_IMAGE` in `k8s` mode unless overridden) |
-| `--sandbox-registry-image <ref>` | *(configured build default)* | Prebuilt registry image offered for pull when missing locally |
+| `--sandbox-registry-image <ref>` | *(configured build default)* | Prebuilt registry image offered for pull in `/sandbox` when missing locally |
 | `--sandbox-oci-engine <name>` | `auto` | Linux container engine: `auto` (`podman` then `docker`), `podman`, or `docker` |
 | `--sandbox-oci-runtime <name>` | *(engine default)* | Optional Linux OCI runtime (for example `krun` or `runsc`) |
 | `--sandbox-k8s-pvc <name>` | `$POLAR_SANDBOX_K8S_PVC` | Shared PVC name enabling the `k8s` sandbox driver |
