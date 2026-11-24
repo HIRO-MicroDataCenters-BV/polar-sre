@@ -62,7 +62,7 @@ For minimal extension development (`builtin:files` plus explicit `-e builtin:<na
 
 1. **LLM provider:** Run `/login` inside the TUI or export a provider API key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, etc.).
 2. **Kubernetes context:** Run `/kubeconfig` inside the TUI to pick a context interactively (persisted in `~/.polar-sre/agent/k8s.json`), or pass `--k8s-kubeconfig <path>` and `--k8s-context <context>` on startup.
-3. **Analytics sandbox:** Run `/sandbox` inside the TUI to inspect host readiness, download or build the sandbox image in the background, or disable/enable the sandbox (persisted in `~/.polar-sre/agent/sandbox.json`).
+3. **Analytics sandbox:** Run `/sandbox` inside the TUI to inspect host readiness, start the macOS `container` service (and download its default Linux kernel), download or build the sandbox image in the background, toggle service auto-start on macOS, or disable/enable the sandbox (persisted in `~/.polar-sre/agent/sandbox.json`).
 
 ## Local Sandbox Setup
 
@@ -72,8 +72,8 @@ For minimal extension development (`builtin:files` plus explicit `-e builtin:<na
 
 Uses Apple's native `container` CLI (`Virtualization.framework` Linux microVM):
 
-1. Install `container` and verify the runtime is started (`container system status`).
-2. Launch Polar. If the runtime or guest image (`polar-sandbox:0.2`) is not ready, Polar starts without blocking, shows `sandbox: off, run /sandbox` in the footer, and `/sandbox` offers to download the prebuilt image (when a registry image is configured) or build it locally (`~2 min`) in the background and activate `run_code` in the running session.
+1. Install Apple `container` (`>= 1.5.0`).
+2. Launch Polar. If the `container` service is stopped or the guest image (`polar-sandbox:0.2`) is not ready, Polar starts without blocking, shows `sandbox: off, run /sandbox` in the footer, and `/sandbox` offers to start the service (installing the default Linux kernel if needed), download the prebuilt image (when a registry image is configured) or build it locally (`~2 min`) in the background, and activate `run_code` in the running session. Starting the service through `/sandbox` enables automatic service start on subsequent Polar launches (configurable in `/sandbox`).
 
 ### Linux (`oci`)
 

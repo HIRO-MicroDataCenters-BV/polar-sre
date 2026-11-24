@@ -3,7 +3,7 @@ import type { ExtensionContext, SessionShutdownEvent } from "../../../core/exten
 import { formatDiagnosisWarning, probeHost, SANDBOX_OFF_STATUS } from "./host.ts";
 import { showImageOperation } from "./indicator.ts";
 import { readSandboxPreferences, updateSandboxPreferences } from "./preferences.ts";
-import { runHostSetup, type SetupTaskResult } from "./setup.ts";
+import { defaultDiagnosisAction, runHostSetup, runQuickSetup, type SetupTaskResult } from "./setup.ts";
 import type {
 	Activation,
 	HostDiagnosis,
@@ -43,6 +43,7 @@ export class SandboxController {
 	private pending: Promise<void> | undefined;
 	private runtime: SandboxRuntime | undefined;
 	private setupAbort: AbortController | undefined;
+	private operationAbort: AbortController | undefined;
 	private activeWidget: ImageOperation | undefined;
 	private statusShown = false;
 	private shutdownReason: SessionShutdownEvent["reason"] = "reload";
@@ -100,8 +101,18 @@ export class SandboxController {
 				this.state = "disabled";
 				return;
 			}
-			const diagnosis = await probeHost(this.host);
+			let diagnosis = await probeHost(this.host);
 			if (this.state !== "off") return;
+			if (preferences.autoStartService === true && defaultDiagnosisAction(diagnosis)?.runQuick !== undefined) {
+				const quickAbort = new AbortController();
+				this.operationAbort = quickAbort;
+				try {
+					diagnosis = await runQuickSetup(this.host, diagnosis, quickAbort.signal);
+				} finally {
+					if (this.operationAbort === quickAbort) this.operationAbort = undefined;
+				}
+				if (this.state !== "off") return;
+			}
 			if (diagnosis.kind === "ready") {
 				await this.activate(diagnosis.image, ctx, { notifyOnFailure: true, notifyOnReady: false });
 			} else {
@@ -109,6 +120,21 @@ export class SandboxController {
 				this.notify(ctx, formatDiagnosisWarning(diagnosis), "warning");
 			}
 		});
+	}
+
+	async isServiceAutoStartEnabled(): Promise<boolean> {
+		const preferences = await readSandboxPreferences();
+		return preferences.autoStartService === true;
+	}
+
+	async setServiceAutoStart(enabled: boolean, ctx: ExtensionContext): Promise<void> {
+		if (!this.isAlive()) return;
+		try {
+			await updateSandboxPreferences({ autoStartService: enabled });
+		} catch (error) {
+			const reason = error instanceof Error ? error.message : String(error);
+			this.notify(ctx, `sandbox: failed to save preferences: ${reason}`, "warning");
+		}
 	}
 
 	async activateFromCommand(image: string, ctx: ExtensionContext): Promise<Activation | undefined> {
@@ -182,8 +208,7 @@ export class SandboxController {
 	async disable(ctx: ExtensionContext): Promise<void> {
 		if (!this.isAlive()) return;
 		this.state = "disabled";
-		this.clearWidget();
-		this.setupAbort?.abort();
+		this.abortPendingOperations();
 		try {
 			await updateSandboxPreferences({ disabled: true });
 		} catch (error) {
@@ -213,9 +238,14 @@ export class SandboxController {
 		this.state = "closed";
 	}
 
-	private async stopCurrent(reason: SessionShutdownEvent["reason"], warn: Warn): Promise<SandboxRuntime | undefined> {
+	private abortPendingOperations(): void {
 		this.clearWidget();
 		this.setupAbort?.abort();
+		this.operationAbort?.abort();
+	}
+
+	private async stopCurrent(reason: SessionShutdownEvent["reason"], warn: Warn): Promise<SandboxRuntime | undefined> {
+		this.abortPendingOperations();
 		if (this.runtime !== undefined) {
 			const runtime = this.runtime;
 			this.runtime = undefined;
@@ -235,6 +265,19 @@ export class SandboxController {
 
 	private async applySetupResult(result: SetupTaskResult, ctx: ExtensionContext): Promise<void> {
 		if (!this.canApplySetupResult()) return;
+
+		if (result.completedActions.includes("start_service")) {
+			try {
+				const preferences = await readSandboxPreferences();
+				if (preferences.autoStartService === undefined && this.canApplySetupResult()) {
+					await updateSandboxPreferences({ autoStartService: true });
+				}
+			} catch (error) {
+				const reason = error instanceof Error ? error.message : String(error);
+				this.notify(ctx, `sandbox: failed to save preferences: ${reason}`, "warning");
+			}
+			if (!this.canApplySetupResult()) return;
+		}
 
 		if (this.state === "off") {
 			if (result.diagnosis.kind === "ready") {

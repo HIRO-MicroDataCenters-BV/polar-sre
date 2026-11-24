@@ -9,7 +9,12 @@ import { acquireSession, type SessionHandle } from "../../shared/session.ts";
 import { createHost, DEFAULT_IMAGE, REGISTRY_IMAGE } from "../index.ts";
 import { containerCommand } from "../src/cli.ts";
 import { SandboxController } from "../src/controller.ts";
-import { BUILD_IMAGE_OPTION, DOWNLOAD_IMAGE_OPTION } from "../src/driver.ts";
+import {
+	BUILD_IMAGE_OPTION,
+	DOWNLOAD_IMAGE_OPTION,
+	IMAGE_BUILD_OUTLOOK,
+	IMAGE_DOWNLOAD_OUTLOOK,
+} from "../src/driver.ts";
 import { buildImageSpec, probeHost } from "../src/host.ts";
 import { admitCall } from "../src/runner.ts";
 import type { SandboxDriver, SandboxRuntime, SessionPaths } from "../src/types.ts";
@@ -33,6 +38,7 @@ import {
 } from "./fixtures.ts";
 
 let root: string;
+let savedAgentDir: string | undefined;
 let handle: SessionHandle;
 let session: SessionPaths;
 let state: FakeState;
@@ -40,7 +46,9 @@ let notices: string[];
 const warn = (message: string) => notices.push(message);
 
 beforeEach(async () => {
+	savedAgentDir = process.env.POLAR_CODING_AGENT_DIR;
 	root = await mkdtemp(join(tmpdir(), "sandbox-workspace-"));
+	process.env.POLAR_CODING_AGENT_DIR = join(root, "agent");
 	handle = await acquireSession("current", root, artifactsRoot());
 	session = handle.paths;
 	state = await fakeState();
@@ -49,6 +57,8 @@ beforeEach(async () => {
 
 afterEach(async () => {
 	await handle.release();
+	if (savedAgentDir === undefined) delete process.env.POLAR_CODING_AGENT_DIR;
+	else process.env.POLAR_CODING_AGENT_DIR = savedAgentDir;
 	await rm(root, { recursive: true, force: true });
 	await rm(state.directory, { recursive: true, force: true });
 });
@@ -118,34 +128,99 @@ describe("start", () => {
 			},
 		});
 
-		// Row 2: exit != 0, status is "unregistered" or "not running", container --version >= 1.5.0 -> runtime_not_ready
-		expect(await probeHost(fakeHost(state, { SERVICE_STOPPED: "1" }))).toEqual({
-			kind: "runtime_not_ready",
-			reason: "Apple container service is not running",
-			remedy: {
-				kind: "manual",
-				instructions: ["container system start --enable-kernel-install"],
-			},
-		});
-		expect(await probeHost(fakeHost(state, { SERVICE_STATUS: "not running", STATUS_EXIT: "1" }))).toEqual({
-			kind: "runtime_not_ready",
-			reason: "Apple container service is not running",
-			remedy: {
-				kind: "manual",
-				instructions: ["container system start --enable-kernel-install"],
-			},
-		});
+		// Row 2: exit != 0, status is "unregistered" or "not running", container --version >= 1.5.0 -> runtime_not_ready with start_service (including runQuick)
+		for (const knobs of [{ SERVICE_STOPPED: "1" }, { SERVICE_STATUS: "not running", STATUS_EXIT: "1" }] as Record<
+			string,
+			string
+		>[]) {
+			const stoppedDiag = await probeHost(fakeHost(state, knobs));
+			expect(stoppedDiag).toMatchObject({
+				kind: "runtime_not_ready",
+				reason: "Apple container service is not running",
+				remedy: {
+					kind: "actions",
+					outlook: [
+						"Start the container service — the first start downloads a Linux kernel, about 680 MB.",
+						IMAGE_BUILD_OUTLOOK,
+					],
+				},
+			});
+			if (stoppedDiag.kind !== "runtime_not_ready" || stoppedDiag.remedy.kind !== "actions") {
+				throw new Error("expected start_service action");
+			}
+			expect(stoppedDiag.remedy.actions).toHaveLength(1);
+			const [startAction] = stoppedDiag.remedy.actions;
+			expect(startAction.id).toBe("start_service");
+			expect(startAction.label).toBe("Start container service");
+			expect(startAction.preview).toEqual(["container system start --enable-kernel-install"]);
+			expect(startAction.mode).toBe("background");
+			expect(startAction.runQuick).toBeDefined();
+		}
 
-		// Row 3: running, client and server version >= 1.5.0 -> ready with version (including client/server mismatch)
-		expect(await probeHost(fakeHost(state))).toEqual({
+		const startState = await fakeState();
+		try {
+			const pullSpec = {
+				candidates: ["registry.example/polar-sandbox:test", "polar-sandbox:test"],
+				pull: "registry.example/polar-sandbox:test",
+				build: "polar-sandbox:test",
+			};
+			const startDiag = await probeHost(
+				fakeHost(startState, { SERVICE_STOPPED: "1", KERNEL_MISSING: "1" }, {}, pullSpec),
+			);
+			if (startDiag.kind !== "runtime_not_ready" || startDiag.remedy.kind !== "actions") {
+				throw new Error("expected start_service action");
+			}
+			expect(startDiag.remedy.outlook).toEqual([
+				"Start the container service — the first start downloads a Linux kernel, about 680 MB.",
+				IMAGE_DOWNLOAD_OUTLOOK,
+			]);
+			const serviceLines: string[] = [];
+			const startResult = await startDiag.remedy.actions[0].run({
+				signal: new AbortController().signal,
+				onLine: (line) => serviceLines.push(line),
+			});
+			expect(startResult).toEqual({ ok: true });
+			expect(serviceLines).toEqual([
+				"Launching container-apiserver...",
+				"Testing access to container-apiserver...",
+				"Verifying machine API server is running...",
+				"Installing kernel...",
+			]);
+			expect((await startState.calls()).at(-1)).toEqual(["system", "start", "--enable-kernel-install"]);
+		} finally {
+			await rm(startState.directory, { recursive: true, force: true });
+		}
+
+		// Row 3: running, client and server version >= 1.5.0 -> ready with version (including client/server mismatch) and repair (start_service without runQuick)
+		const readyDiag = await probeHost(fakeHost(state));
+		expect(readyDiag).toMatchObject({
 			kind: "ready",
 			image: "polar-sandbox:test",
 			version: "1.7.1",
+			repair: {
+				kind: "actions",
+				outlook: ["Start the container service — the first start downloads a Linux kernel, about 680 MB."],
+			},
 		});
-		expect(await probeHost(fakeHost(state, { CLIENT_VERSION: "1.7.1", SERVER_VERSION: "1.5.0" }))).toEqual({
+		if (readyDiag.kind !== "ready" || readyDiag.repair?.kind !== "actions") {
+			throw new Error("expected repair action on ready Apple diagnosis");
+		}
+		expect(readyDiag.repair.actions).toHaveLength(1);
+		expect(readyDiag.repair.actions[0].id).toBe("start_service");
+		expect(readyDiag.repair.actions[0].label).toBe("Start container service");
+		expect(readyDiag.repair.actions[0].preview).toEqual(["container system start --enable-kernel-install"]);
+		expect(readyDiag.repair.actions[0].mode).toBe("background");
+		expect(readyDiag.repair.actions[0].runQuick).toBeUndefined();
+
+		const mismatchDiag = await probeHost(fakeHost(state, { CLIENT_VERSION: "1.7.1", SERVER_VERSION: "1.5.0" }));
+		expect(mismatchDiag).toMatchObject({
 			kind: "ready",
 			image: "polar-sandbox:test",
 			version: "1.7.1 (service 1.5.0)",
+			repair: {
+				kind: "actions",
+				outlook: ["Start the container service — the first start downloads a Linux kernel, about 680 MB."],
+			},
 		});
 
 		// Row 4: client or server version < 1.5.0 (including unreadable JSON when container --version < 1.5.0)
@@ -260,7 +335,7 @@ describe("start", () => {
 		// 1. No flags: searches REGISTRY_IMAGE then polar-sandbox:0.2, pulls REGISTRY_IMAGE, builds polar-sandbox:0.2
 		const row1 = hostFor(local, { IMAGE_PRESENT: local });
 		expect(row1.imageSpec).toEqual({ candidates: [REGISTRY_IMAGE, local], pull: REGISTRY_IMAGE, build: local });
-		expect(await probeHost(row1)).toEqual({ kind: "ready", image: local, version: "1.7.1" });
+		expect(await probeHost(row1)).toMatchObject({ kind: "ready", image: local, version: "1.7.1" });
 		expect(await callsOf("image")).toEqual([
 			["image", "inspect", REGISTRY_IMAGE as string],
 			["image", "inspect", local],
@@ -270,7 +345,7 @@ describe("start", () => {
 		state = await fakeState();
 		const row2 = hostFor(local, { IMAGE_PRESENT: registry }, { registryImage: registry });
 		expect(row2.imageSpec).toEqual({ candidates: [registry, local], pull: registry, build: local });
-		expect(await probeHost(row2)).toEqual({ kind: "ready", image: registry, version: "1.7.1" });
+		expect(await probeHost(row2)).toMatchObject({ kind: "ready", image: registry, version: "1.7.1" });
 		expect(await callsOf("image")).toEqual([["image", "inspect", registry]]);
 
 		// 3. --sandbox-image C: searches C, pulls C (does NOT pull built-in REGISTRY_IMAGE), builds C
@@ -296,7 +371,7 @@ describe("start", () => {
 		expect(pullResult3).toEqual({ ok: true });
 		expect(shownLines).toEqual([`pulled ${custom}`]);
 		expect((await callsOf("image")).at(-1)).toEqual(["image", "pull", "--arch", "arm64", custom]);
-		expect(await probeHost(row3)).toEqual({ kind: "ready", image: custom, version: "1.7.1" });
+		expect(await probeHost(row3)).toMatchObject({ kind: "ready", image: custom, version: "1.7.1" });
 
 		// 4. Both flags (--sandbox-image C and --sandbox-registry-image R): searches R then C, pulls R, builds C
 		state = await fakeState();
@@ -314,7 +389,7 @@ describe("start", () => {
 		]);
 		expect(await diag4.remedy.actions[0].run({ signal: new AbortController().signal })).toEqual({ ok: true });
 		// After pulling R, probing row4 finds R in candidates [R, C]
-		expect(await probeHost(row4)).toEqual({ kind: "ready", image: registry, version: "1.7.1" });
+		expect(await probeHost(row4)).toMatchObject({ kind: "ready", image: registry, version: "1.7.1" });
 
 		// 5. Without registry image: offers only build_image
 		state = await fakeState();
@@ -331,7 +406,7 @@ describe("start", () => {
 		expect(await callsOf("build")).toEqual([
 			["build", "--arch", "arm64", "--tag", local, "--file", join(imageDir, "Containerfile"), imageDir],
 		]);
-		expect(await probeHost(noRegistryHost)).toEqual({ kind: "ready", image: local, version: "1.7.1" });
+		expect(await probeHost(noRegistryHost)).toMatchObject({ kind: "ready", image: local, version: "1.7.1" });
 	});
 
 	it("treats an unknown listing as not established", async () => {
@@ -599,7 +674,7 @@ describe("start", () => {
 		host.limits = { ...testLimits };
 
 		const diagnosis = await probeHost(host);
-		expect(diagnosis).toEqual({ kind: "ready", image: registry, version: "1.7.1" });
+		expect(diagnosis).toMatchObject({ kind: "ready", image: registry, version: "1.7.1" });
 		if (diagnosis.kind !== "ready") throw new Error("expected ready");
 
 		const activation = await activateRuntime(host, "failed-prep", root, diagnosis.image, warn, artifactsRoot());
@@ -613,7 +688,7 @@ describe("start", () => {
 		expect(await exists(join(artifactsRoot(), "failed-prep", "lock"))).toBe(false);
 
 		host.environment.FAKE_CONTAINER_IMAGE_PRESENT = local;
-		expect(await probeHost(host)).toEqual({ kind: "ready", image: local, version: "1.7.1" });
+		expect(await probeHost(host)).toMatchObject({ kind: "ready", image: local, version: "1.7.1" });
 	});
 });
 

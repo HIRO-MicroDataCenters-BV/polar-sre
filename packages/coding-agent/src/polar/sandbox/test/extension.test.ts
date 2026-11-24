@@ -840,8 +840,10 @@ describe("sandbox extension", () => {
 		await disableSession.shutdown();
 	});
 
-	it("shows driver details, isolation boundary, image, and version when sandbox is ready", async () => {
-		// 1. Apple: client version and mismatched client/server versions
+	it("shows driver details, isolation boundary, image, version, and service auto-start toggle when sandbox is ready", async () => {
+		const prefsPath = () => join(process.env.POLAR_CODING_AGENT_DIR!, "sandbox.json");
+
+		// 1. Apple: client version, mismatched client/server versions, and auto-start toggle
 		await setKnobs({ CLIENT_VERSION: "1.7.1", SERVER_VERSION: "1.7.1" });
 		const apple = loadExtension({}, { selectChoice: "Cancel" });
 		await apple.startSession();
@@ -851,7 +853,18 @@ describe("sandbox extension", () => {
 		expect(appleTitle).toContain("Boundary: apple-container (microVM)");
 		expect(appleTitle).toContain(`Image: ${REGISTRY_IMAGE}`);
 		expect(appleTitle).toContain("Version: 1.7.1");
-		expect(appleItems).toEqual(["Disable sandbox", "Cancel"]);
+		expect(appleItems).toEqual(["Enable service auto-start", "Disable sandbox", "Cancel"]);
+
+		// Toggle auto-start on -> writes autoStartService: true
+		apple.setSelectChoice("Enable service auto-start");
+		await apple.runCommand("sandbox");
+		expect(JSON.parse(await readFile(prefsPath(), "utf8")).autoStartService).toBe(true);
+
+		// Toggle auto-start off -> menu offers Disable service auto-start and writes autoStartService: false
+		apple.setSelectChoice("Disable service auto-start");
+		await apple.runCommand("sandbox");
+		expect(apple.selects.at(-1)?.[1]).toEqual(["Disable service auto-start", "Disable sandbox", "Cancel"]);
+		expect(JSON.parse(await readFile(prefsPath(), "utf8")).autoStartService).toBe(false);
 
 		// Mismatched client and server versions
 		await setKnobs({ CLIENT_VERSION: "1.7.1", SERVER_VERSION: "1.6.0" });
@@ -945,6 +958,38 @@ describe("sandbox extension", () => {
 		expect(res.isError).toBe(false);
 		expect(text(res)).toContain("recovered-ok");
 		await pi.shutdown();
+
+		// Apple: service stops in an active session before the first run_code call
+		await rm(state.directory, { recursive: true, force: true });
+		state = await fakeState();
+		process.env.FAKE_CONTAINER_STATE = state.directory;
+		await setKnobs({});
+		const activeApple = loadExtension();
+		await activeApple.startSession();
+		expect(activeApple.tools.map((t) => t.name)).toEqual(["run_code"]);
+		expect(activeApple.footer.get("sandbox")).toBeUndefined();
+
+		await setKnobs({ SERVICE_STOPPED: "1", START_FAIL: "1", START_FAIL_MESSAGE: "apiserver failed" });
+		activeApple.setSelectChoice("Start container service");
+		await activeApple.runCommand("sandbox");
+		const [stoppedTitle, stoppedItems] = activeApple.selects.at(-1) ?? ["", []];
+		expect(stoppedTitle).toContain("Apple container service is not running");
+		expect(stoppedItems).toContain("Start container service");
+		expect(activeApple.footer.get("sandbox")).toBeUndefined();
+		await until(() =>
+			activeApple.notices.some(([msg, level]) => level === "warning" && msg.includes("apiserver failed")),
+		);
+		expect(activeApple.footer.get("sandbox")).toBeUndefined();
+
+		await setKnobs({ SERVICE_STOPPED: "1" });
+		activeApple.setSelectChoice("Start container service");
+		await activeApple.runCommand("sandbox");
+		await until(() => activeApple.notices.some(([msg, level]) => level === "info" && msg === "sandbox: ready"));
+		expect(activeApple.footer.get("sandbox")).toBeUndefined();
+		const appleRun = await activeApple.execute("call-1", { language: "bash", code: "stdout:service-recovered-ok" });
+		expect(appleRun.isError).toBe(false);
+		expect(text(appleRun)).toContain("service-recovered-ok");
+		await activeApple.shutdown();
 
 		// OCI: when podman info fails after activation, OciDriver stays pinned to podman
 		const podmanState = await fakeState();
@@ -1324,6 +1369,236 @@ describe("sandbox extension", () => {
 		expect(pullCalls.length).toBe(1);
 		expect(pi.tools).toEqual([]);
 		expect(pi.footer.get("sandbox")).toBe("sandbox: off, run /sandbox");
+		await pi.shutdown();
+	});
+
+	it("auto-starts a stopped Apple container service on session_start when autoStartService is enabled without pulling images", async () => {
+		const prefsPath = () => join(process.env.POLAR_CODING_AGENT_DIR!, "sandbox.json");
+		await mkdir(process.env.POLAR_CODING_AGENT_DIR!, { recursive: true });
+		await writeFile(prefsPath(), JSON.stringify({ autoStartService: true }));
+
+		// 1. Service stopped, image present -> quick start runs --disable-kernel-install and activates run_code silently
+		await setKnobs({ SERVICE_STOPPED: "1" });
+		const ready = loadExtension();
+		await ready.startSession();
+		expect(ready.tools.map((tool) => tool.name)).toEqual(["run_code"]);
+		expect(ready.notices).toEqual([]);
+		expect(ready.footer.get("sandbox")).toBeUndefined();
+		const calls = await state.calls();
+		expect(calls).toContainEqual(["system", "start", "--disable-kernel-install"]);
+		expect(calls.some((call) => call.includes("--enable-kernel-install"))).toBe(false);
+		const executed = await ready.execute("call-1", { language: "bash", code: "stdout:autostart-ok" });
+		expect(executed.isError).toBe(false);
+		expect(text(executed)).toContain("autostart-ok");
+		await ready.shutdown();
+
+		// 2. Variant without image -> quick start starts service, does not pull image, sets status and warns about image
+		await rm(state.directory, { recursive: true, force: true });
+		state = await fakeState();
+		process.env.FAKE_CONTAINER_STATE = state.directory;
+		await setKnobs({ SERVICE_STOPPED: "1", IMAGE_MISSING: "1" });
+		const missingImage = loadExtension();
+		await missingImage.startSession();
+		expect(missingImage.tools).toEqual([]);
+		expect(missingImage.footer.get("sandbox")).toBe("sandbox: off, run /sandbox");
+		expect(missingImage.notices).toHaveLength(1);
+		expect(missingImage.notices[0]?.[0]).toContain(`image ${DEFAULT_IMAGE} is not installed`);
+		const missingCalls = await state.calls();
+		expect(missingCalls).toContainEqual(["system", "start", "--disable-kernel-install"]);
+		expect(missingCalls.some((call) => call[0] === "image" && call[1] === "pull")).toBe(false);
+		await missingImage.shutdown();
+
+		// 3. Busy machine lock on start -> sets off status and single warning, does not call system start
+		const lockHolderState = await fakeState();
+		try {
+			const lockHolderBin = join(root, "holder-bin");
+			await mkdir(lockHolderBin, { recursive: true });
+			const holderWrapper = join(lockHolderBin, "container");
+			await writeFile(
+				holderWrapper,
+				`#!/bin/sh\nexport FAKE_CONTAINER_STATE=${shellWord(lockHolderState.directory)}\nexport FAKE_CONTAINER_IMAGE_MISSING='1'\nexport FAKE_CONTAINER_PULL_HANG='1'\nexport FAKE_CONTAINER_PULL_SPAWN_HOLDER='1'\nexec "${process.execPath}" "${FAKE_CONTAINER}" "$@"\n`,
+			);
+			await chmod(holderWrapper, 0o755);
+			const savedPath = process.env.PATH;
+			process.env.PATH = `${lockHolderBin}${delimiter}${savedPath ?? ""}`;
+			const holderSession = loadExtension({}, { sessionId: randomUUID(), selectChoice: DOWNLOAD_IMAGE_OPTION });
+			await holderSession.startSession();
+			await holderSession.runCommand("sandbox");
+			await until(
+				async () =>
+					(await readFile(join(lockHolderState.directory, "holders.jsonl"), "utf8").catch(() => "")).trim() !== "",
+			);
+			process.env.PATH = savedPath;
+
+			await rm(state.directory, { recursive: true, force: true });
+			state = await fakeState();
+			process.env.FAKE_CONTAINER_STATE = state.directory;
+			await setKnobs({ SERVICE_STOPPED: "1" });
+			const lockedStart = loadExtension({}, { sessionId: randomUUID() });
+			await lockedStart.startSession();
+			expect(lockedStart.tools).toEqual([]);
+			expect(lockedStart.footer.get("sandbox")).toBe("sandbox: off, run /sandbox");
+			expect(lockedStart.notices).toEqual([["sandbox is off: Apple container service is not running", "warning"]]);
+			expect((await state.calls()).some((call) => call[0] === "system" && call[1] === "start")).toBe(false);
+			await lockedStart.shutdown();
+			await holderSession.shutdown();
+		} finally {
+			await rm(lockHolderState.directory, { recursive: true, force: true });
+		}
+
+		// 4. session_shutdown during a hanging quick start -> CLI process killed, lock released, no post-invalidation calls
+		const agentDir = process.env.POLAR_CODING_AGENT_DIR!;
+		await rm(state.directory, { recursive: true, force: true });
+		state = await fakeState();
+		process.env.FAKE_CONTAINER_STATE = state.directory;
+		await setKnobs({ SERVICE_STOPPED: "1", START_HANG: "1", START_SPAWN_HOLDER: "1" });
+		const setupLockDir = join(agentDir, "sandbox-setup.lock");
+		const holderPids = async (): Promise<number[]> => {
+			const raw = await readFile(join(state.directory, "holders.jsonl"), "utf8").catch(() => "");
+			return raw
+				.split("\n")
+				.filter((line) => line !== "")
+				.map((line) => Number(JSON.parse(line)));
+		};
+		const hangingQuick = loadExtension({}, { sessionId: randomUUID() });
+		const startingQuick = hangingQuick.startSession();
+		await until(async () => (await holderPids()).length === 1);
+		const [quickHolderPid] = await holderPids();
+		expect(await exists(setupLockDir)).toBe(true);
+
+		await hangingQuick.shutdown("reload");
+		hangingQuick.invalidate();
+		await startingQuick;
+		expect(processExists(quickHolderPid)).toBe(false);
+		expect(await exists(setupLockDir)).toBe(false);
+		expect(hangingQuick.tools).toEqual([]);
+		expect(hangingQuick.notices).toEqual([]);
+
+		// 5. START_FAIL during quick start -> warning includes the quick start failure reason
+		await rm(state.directory, { recursive: true, force: true });
+		state = await fakeState();
+		process.env.FAKE_CONTAINER_STATE = state.directory;
+		await setKnobs({ SERVICE_STOPPED: "1", START_FAIL: "1", START_FAIL_MESSAGE: "launchd bootstrap failed" });
+		const startFailed = loadExtension();
+		await startFailed.startSession();
+		expect(startFailed.tools).toEqual([]);
+		expect(startFailed.footer.get("sandbox")).toBe("sandbox: off, run /sandbox");
+		expect(startFailed.notices).toHaveLength(1);
+		expect(startFailed.notices[0]?.[0]).toContain("Apple container service is not running");
+		expect(startFailed.notices[0]?.[0]).toContain("launchd bootstrap failed");
+		await startFailed.shutdown();
+	});
+
+	it("falls back to initial diagnosis without throwing when the agent directory is not writable during quick start", async () => {
+		const agentDir = process.env.POLAR_CODING_AGENT_DIR!;
+		await mkdir(agentDir, { recursive: true, mode: 0o700 });
+		await writeFile(join(agentDir, "sandbox.json"), JSON.stringify({ autoStartService: true }));
+		await setKnobs({ SERVICE_STOPPED: "1" });
+		await chmod(agentDir, 0o500);
+		try {
+			const roStart = loadExtension({}, { sessionId: randomUUID() });
+			await expect(roStart.startSession()).resolves.toBeUndefined();
+			expect(roStart.tools).toEqual([]);
+			expect(roStart.footer.get("sandbox")).toBe("sandbox: off, run /sandbox");
+			expect(roStart.notices).toEqual([["sandbox is off: Apple container service is not running", "warning"]]);
+			await roStart.shutdown();
+		} finally {
+			await chmod(agentDir, 0o700);
+		}
+	});
+
+	it("starts a stopped Apple container service through /sandbox and saves autoStartService: true unless explicitly set to false", async () => {
+		const prefsPath = () => join(process.env.POLAR_CODING_AGENT_DIR!, "sandbox.json");
+
+		// 1. autoStartService not set -> startSession warns, /sandbox starts service with --enable-kernel-install and writes autoStartService: true
+		await setKnobs({ SERVICE_STOPPED: "1" });
+		const first = loadExtension({}, { selectChoice: "Start container service" });
+		await first.startSession();
+		expect(first.tools).toEqual([]);
+		expect(first.footer.get("sandbox")).toBe("sandbox: off, run /sandbox");
+		expect(first.notices).toEqual([["sandbox is off: Apple container service is not running", "warning"]]);
+		expect((await state.calls()).some((call) => call[0] === "system" && call[1] === "start")).toBe(false);
+
+		await first.runCommand("sandbox");
+		await until(() => first.tools.length === 1);
+		expect(first.tools.map((tool) => tool.name)).toEqual(["run_code"]);
+		expect(first.footer.get("sandbox")).toBeUndefined();
+		expect(first.notices).toContainEqual(["sandbox: ready", "info"]);
+		expect(await state.calls()).toContainEqual(["system", "start", "--enable-kernel-install"]);
+		expect(JSON.parse(await readFile(prefsPath(), "utf8")).autoStartService).toBe(true);
+		await first.shutdown();
+
+		// 2. Explicit autoStartService: false -> value remains false after starting service through /sandbox
+		await rm(state.directory, { recursive: true, force: true });
+		state = await fakeState();
+		process.env.FAKE_CONTAINER_STATE = state.directory;
+		await writeFile(prefsPath(), JSON.stringify({ autoStartService: false }));
+		await setKnobs({ SERVICE_STOPPED: "1" });
+		const explicitFalse = loadExtension({}, { selectChoice: "Start container service" });
+		await explicitFalse.startSession();
+		expect(explicitFalse.tools).toEqual([]);
+		expect((await state.calls()).some((call) => call[0] === "system" && call[1] === "start")).toBe(false);
+
+		await explicitFalse.runCommand("sandbox");
+		await until(() => explicitFalse.tools.length === 1);
+		expect(await state.calls()).toContainEqual(["system", "start", "--enable-kernel-install"]);
+		expect(JSON.parse(await readFile(prefsPath(), "utf8")).autoStartService).toBe(false);
+		await explicitFalse.shutdown();
+	});
+
+	it("repairs a missing Linux kernel through /sandbox after activation fails on a ready Apple host", async () => {
+		await setKnobs({ KERNEL_MISSING: "1" });
+		const pi = loadExtension({}, { selectChoice: "Start container service" });
+		await pi.startSession();
+		expect(pi.tools).toEqual([]);
+		expect(pi.footer.get("sandbox")).toBe("sandbox: off, run /sandbox");
+		expect(pi.notices).toHaveLength(1);
+		expect(pi.notices[0]?.[0]).toContain("default kernel not configured for architecture arm64");
+		expect(await exists(lockPath())).toBe(false);
+
+		await pi.runCommand("sandbox");
+		const [title, items] = pi.selects.at(-1) ?? ["", []];
+		expect(title).toContain("default kernel not configured for architecture arm64");
+		expect(title).toContain("Start the container service — the first start downloads a Linux kernel, about 680 MB.");
+		expect(items).toContain("Start container service");
+
+		await until(() => pi.tools.length === 1);
+		expect(await state.calls()).toContainEqual(["system", "start", "--enable-kernel-install"]);
+		expect(pi.footer.get("sandbox")).toBeUndefined();
+		expect(pi.notices).toContainEqual(["sandbox: ready", "info"]);
+		const executed = await pi.execute("call-1", { language: "bash", code: "stdout:kernel-repaired" });
+		expect(executed.isError).toBe(false);
+		expect(text(executed)).toContain("kernel-repaired");
+		await pi.shutdown();
+	});
+
+	it("runs a multi-step setup chain in /sandbox when both the service is stopped and the image is missing", async () => {
+		await setKnobs({ SERVICE_STOPPED: "1", IMAGE_MISSING: "1" });
+		const pi = loadExtension({}, { selectChoice: "Start container service" });
+		await pi.startSession();
+		expect(pi.tools).toEqual([]);
+		expect(pi.footer.get("sandbox")).toBe("sandbox: off, run /sandbox");
+
+		await pi.runCommand("sandbox");
+		expect(pi.selects).toHaveLength(1);
+		expect(pi.selects[0]?.[0]).toContain(
+			"Setup will:\n  1. Start the container service — the first start downloads a Linux kernel, about 680 MB.\n  2. Download the sandbox image — 240 MB.",
+		);
+		await until(() => pi.tools.length === 1);
+		const calls = await state.calls();
+		const startIndex = calls.findIndex(
+			(call) => call[0] === "system" && call[1] === "start" && call[2] === "--enable-kernel-install",
+		);
+		const pullIndex = calls.findIndex(
+			(call) => call[0] === "image" && call[1] === "pull" && call.includes(REGISTRY_IMAGE ?? ""),
+		);
+		expect(startIndex).toBeGreaterThanOrEqual(0);
+		expect(pullIndex).toBeGreaterThan(startIndex);
+		expect(pi.footer.get("sandbox")).toBeUndefined();
+		expect(pi.notices).toContainEqual(["sandbox: ready", "info"]);
+		const executed = await pi.execute("call-1", { language: "bash", code: "stdout:chain-ok" });
+		expect(executed.isError).toBe(false);
+		expect(text(executed)).toContain("chain-ok");
 		await pi.shutdown();
 	});
 });

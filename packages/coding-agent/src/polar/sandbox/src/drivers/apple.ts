@@ -67,13 +67,14 @@ import {
 const OOM_LINE_GLOBAL = /(?:Memory cgroup out of memory|Out of memory): Killed process[^\n]*/g;
 const MIN_CONTAINER_MAJOR = 1;
 const MIN_CONTAINER_MINOR = 5;
+const START_SERVICE_OPTION = "Start container service";
+const SERVICE_START_OUTLOOK = "Start the container service — the first start downloads a Linux kernel, about 680 MB.";
+const SERVICE_START_TIMEOUT_MS = 1_800_000;
 
 const INSTALL_CONTAINER_INSTRUCTIONS = [
 	"Install Apple container (>= 1.5.0) from https://github.com/apple/container/releases",
 	"container system start --enable-kernel-install",
 ];
-
-const START_SERVICE_INSTRUCTIONS = ["container system start --enable-kernel-install"];
 
 const UPDATE_CONTAINER_INSTRUCTIONS = [
 	"Update Apple container to >= 1.5.0 from https://github.com/apple/container/releases",
@@ -437,7 +438,7 @@ export class AppleContainerDriver implements SandboxDriver {
 			return {
 				kind: "runtime_not_ready",
 				reason: "Apple container service is not running",
-				remedy: { kind: "manual", instructions: START_SERVICE_INSTRUCTIONS },
+				remedy: this.startServiceRemedy(true),
 			};
 		}
 		if (status.code === 0 && parsed.status === "running") {
@@ -448,7 +449,7 @@ export class AppleContainerDriver implements SandboxDriver {
 				parsed.serverVersion !== parsed.clientVersion
 					? `${parsed.clientVersion} (service ${parsed.serverVersion})`
 					: parsed.clientVersion;
-			return { kind: "ready", version };
+			return { kind: "ready", version, repair: this.startServiceRemedy(false) };
 		}
 		if (status.code !== 0) {
 			return { kind: "probe_failed", reason: `container system status failed: ${commandFailure(status)}` };
@@ -457,6 +458,53 @@ export class AppleContainerDriver implements SandboxDriver {
 			kind: "probe_failed",
 			reason: `container system status reported unknown status "${String(parsed.status)}"`,
 		};
+	}
+
+	private startServiceRemedy(includeQuick: boolean): Remedy {
+		return {
+			kind: "actions",
+			actions: [this.startServiceAction(includeQuick)],
+			outlook: includeQuick ? [SERVICE_START_OUTLOOK, this.imageOutlook()] : [SERVICE_START_OUTLOOK],
+		};
+	}
+
+	private imageOutlook(): string {
+		return this.runtime.imageSpec.pull !== undefined ? IMAGE_DOWNLOAD_OUTLOOK : IMAGE_BUILD_OUTLOOK;
+	}
+
+	private startServiceAction(includeQuick: boolean): SetupAction {
+		const args = ["system", "start", "--enable-kernel-install"];
+		const action: SetupAction = {
+			id: "start_service",
+			label: START_SERVICE_OPTION,
+			preview: [["container", ...args].join(" ")],
+			mode: "background",
+			run: async (io) => {
+				const started = await containerCommand(this.runtime, args, {
+					timeoutMs: SERVICE_START_TIMEOUT_MS,
+					signal: io.signal,
+					onLine: io.onLine,
+				});
+				if (io.signal.aborted) return { ok: false, cancelled: true, reason: "cancelled" };
+				if (started.code !== 0) {
+					return { ok: false, reason: `container system start failed: ${commandFailure(started)}` };
+				}
+				return { ok: true };
+			},
+		};
+		if (includeQuick) {
+			action.runQuick = async (signal) => {
+				const started = await containerCommand(this.runtime, ["system", "start", "--disable-kernel-install"], {
+					signal,
+				});
+				if (signal.aborted) return { ok: false, cancelled: true, reason: "cancelled" };
+				if (started.code !== 0) {
+					return { ok: false, reason: `container system start failed: ${commandFailure(started)}` };
+				}
+				return { ok: true };
+			};
+		}
+		return action;
 	}
 
 	imageRemedy(imageSpec: ImageSpec): Remedy {
@@ -495,7 +543,7 @@ export class AppleContainerDriver implements SandboxDriver {
 				return { ok: true };
 			},
 		});
-		const outlook = [pull !== undefined ? IMAGE_DOWNLOAD_OUTLOOK : IMAGE_BUILD_OUTLOOK];
+		const outlook = [this.imageOutlook()];
 		return { kind: "actions", actions, outlook };
 	}
 

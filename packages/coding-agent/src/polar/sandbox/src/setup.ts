@@ -1,12 +1,15 @@
 import { mkdir } from "fs/promises";
 import { join } from "path";
 import lockfile from "proper-lockfile";
+import { setTimeout as sleep } from "timers/promises";
 import { getAgentDir } from "../../../config.ts";
 import { probeHost } from "./host.ts";
 import type { ActionIO, HostDiagnosis, SandboxHost, SetupAction, SetupActionId } from "./types.ts";
 
 const LOCK_STALE_MS = 30_000;
 const LOCK_UPDATE_MS = 1_000;
+const LOCK_POLL_MS = 50;
+const QUICK_LOCK_WAIT_MS = 3_000;
 const LOCK_TARGET_NAME = "sandbox-setup";
 
 export type SetupStopReason =
@@ -56,6 +59,19 @@ export function diagnosisActions(diagnosis: HostDiagnosis): SetupAction[] {
 	}
 }
 
+export function defaultDiagnosisAction(diagnosis: HostDiagnosis): SetupAction | undefined {
+	switch (diagnosis.kind) {
+		case "runtime_missing":
+		case "runtime_not_ready":
+		case "image_missing":
+			return diagnosis.remedy.kind === "actions" ? diagnosis.remedy.actions[0] : undefined;
+		case "ready":
+		case "unsupported":
+		case "probe_failed":
+			return undefined;
+	}
+}
+
 function diagnosisRank(diagnosis: HostDiagnosis): number | undefined {
 	switch (diagnosis.kind) {
 		case "runtime_missing":
@@ -81,25 +97,38 @@ function isLockBusyError(error: unknown): boolean {
 	);
 }
 
+export interface MachineLockOptions {
+	waitMs?: number;
+	signal?: AbortSignal;
+}
+
 export async function withMachineLock<T>(
 	onCompromised: (error: Error) => void,
 	fn: () => Promise<T>,
+	options?: MachineLockOptions,
 ): Promise<MachineLockOutcome<T>> {
 	const dir = getAgentDir();
 	await mkdir(dir, { recursive: true, mode: 0o700 });
 	const lockTarget = join(dir, LOCK_TARGET_NAME);
+	const deadlineAt = Date.now() + (options?.waitMs ?? 0);
 	let release: (() => Promise<void>) | undefined;
-	try {
-		release = await lockfile.lock(lockTarget, {
-			realpath: false,
-			retries: 0,
-			stale: LOCK_STALE_MS,
-			update: LOCK_UPDATE_MS,
-			onCompromised,
-		});
-	} catch (error) {
-		if (isLockBusyError(error)) return { locked: false };
-		throw error;
+	while (true) {
+		if (options?.signal?.aborted) return { locked: false };
+		try {
+			release = await lockfile.lock(lockTarget, {
+				realpath: false,
+				retries: 0,
+				stale: LOCK_STALE_MS,
+				update: LOCK_UPDATE_MS,
+				onCompromised,
+			});
+			break;
+		} catch (error) {
+			if (!isLockBusyError(error)) throw error;
+			const remaining = deadlineAt - Date.now();
+			if (remaining <= 0 || options?.signal?.aborted) return { locked: false };
+			await sleep(Math.min(LOCK_POLL_MS, remaining));
+		}
 	}
 	try {
 		return { locked: true, value: await fn() };
@@ -109,6 +138,51 @@ export async function withMachineLock<T>(
 		} catch {
 			// Ignore unlock errors if the lock was already compromised or removed.
 		}
+	}
+}
+
+export async function runQuickSetup(
+	host: SandboxHost,
+	initialDiagnosis: HostDiagnosis,
+	signal?: AbortSignal,
+): Promise<HostDiagnosis> {
+	const quickAbort = new AbortController();
+	const onParentAbort = () => quickAbort.abort();
+	if (signal?.aborted) quickAbort.abort();
+	else signal?.addEventListener("abort", onParentAbort, { once: true });
+
+	try {
+		let entered = false;
+		let locked: MachineLockOutcome<HostDiagnosis>;
+		try {
+			locked = await withMachineLock(
+				() => {
+					quickAbort.abort();
+				},
+				async (): Promise<HostDiagnosis> => {
+					entered = true;
+					const current = await probeHost(host);
+					if (quickAbort.signal.aborted) return current;
+					const action = defaultDiagnosisAction(current);
+					if (action?.runQuick === undefined) return current;
+					const outcome = await action.runQuick(quickAbort.signal);
+					if (quickAbort.signal.aborted) return current;
+					const next = await probeHost(host);
+					if (!outcome.ok && !outcome.cancelled && next.kind !== "ready" && next.kind === current.kind) {
+						return { ...next, reason: `${next.reason} (${outcome.reason})` };
+					}
+					return next;
+				},
+				{ waitMs: QUICK_LOCK_WAIT_MS, signal: quickAbort.signal },
+			);
+		} catch (error) {
+			if (!entered) return initialDiagnosis;
+			throw error;
+		}
+		if (!locked.locked) return initialDiagnosis;
+		return locked.value;
+	} finally {
+		signal?.removeEventListener("abort", onParentAbort);
 	}
 }
 

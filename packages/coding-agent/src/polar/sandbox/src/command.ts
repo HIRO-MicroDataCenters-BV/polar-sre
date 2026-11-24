@@ -4,6 +4,8 @@ import type { HostDiagnosis, Remedy, SetupAction } from "./types.ts";
 
 const ENABLE_SANDBOX = "Enable sandbox";
 const DISABLE_SANDBOX = "Disable sandbox";
+const ENABLE_SERVICE_AUTO_START = "Enable service auto-start";
+const DISABLE_SERVICE_AUTO_START = "Disable service auto-start";
 const CANCEL_SETUP = "Cancel setup";
 const KEEP_RUNNING = "Keep running";
 const SHOW_COMMANDS = "Show commands";
@@ -119,10 +121,21 @@ export async function runSandboxCommand(controller: SandboxController, ctx: Exte
 					host.image,
 					diagnosis.version,
 				);
-				const choice = await ctx.ui.select(title, [DISABLE_SANDBOX, CANCEL]);
+				let toggleOption: string | undefined;
+				let autoStartEnabled = false;
+				if (host.driver.supportsServiceAutoStart) {
+					autoStartEnabled = await controller.isServiceAutoStartEnabled();
+					if (!controller.isAlive()) return;
+					toggleOption = autoStartEnabled ? DISABLE_SERVICE_AUTO_START : ENABLE_SERVICE_AUTO_START;
+				}
+				const items =
+					toggleOption !== undefined ? [toggleOption, DISABLE_SANDBOX, CANCEL] : [DISABLE_SANDBOX, CANCEL];
+				const choice = await ctx.ui.select(title, items);
 				if (!controller.isAlive() || choice === undefined || choice === CANCEL) return;
 				if (choice === DISABLE_SANDBOX) {
 					await controller.disable(ctx);
+				} else if (toggleOption !== undefined && choice === toggleOption) {
+					await controller.setServiceAutoStart(!autoStartEnabled, ctx);
 				}
 				return;
 			}

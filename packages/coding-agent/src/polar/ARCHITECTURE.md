@@ -126,7 +126,7 @@ packages/coding-agent/src/polar/
 │   │   │   ├── oci.ts               # OciDriver & OciHotSandbox (`podman` / `docker`)
 │   │   │   └── k8s.ts               # K8sDriver & K8sHotSandbox (`kubectl` Pod)
 │   │   ├── host.ts                  # Layer 3: Host diagnosis (`probeHost` -> `HostDiagnosis`), `ImageSpec` resolution, diagnosis texts
-│   │   ├── setup.ts                 # Layer 3: Machine lock and host setup task with rank progression and cancellation
+│   │   ├── setup.ts                 # Layer 3: Machine lock, quick service start, and host setup task with rank progression and cancellation
 │   │   ├── workspace.ts             # Layer 4: Session activation under the session lock (orphan GC, /work volume setup) and shutdown
 │   │   ├── runner.ts                # Layer 5: Lazy hot VM lifecycle, `spawnCall` supervision, OOM delta & work_limit check, scrub
 │   │   ├── reply.ts                 # Layer 6: Sandbox reply formatting (with OOM, work_limit, inspection, and cleanup notices)
