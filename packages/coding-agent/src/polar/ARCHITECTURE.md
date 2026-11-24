@@ -111,7 +111,7 @@ packages/coding-agent/src/polar/
 │
 ├── sandbox/                         # Isolated local VM / container sandbox extension (`run_code`)
 │   ├── ARCHITECTURE.md              # Sandbox architecture and internal layer boundaries
-│   ├── index.ts                     # --sandbox-driver / --sandbox-image / --sandbox-registry-image / --sandbox-oci-* / --sandbox-k8s-pvc flags, session_start/shutdown wiring, run_code tool definition
+│   ├── index.ts                     # --sandbox-driver / --sandbox-image / --sandbox-registry-image / --sandbox-oci-* / --sandbox-k8s-pvc flags, /sandbox command, session_start/shutdown wiring, run_code tool definition
 │   ├── image/
 │   │   ├── Containerfile
 │   │   ├── requirements.in
@@ -126,12 +126,15 @@ packages/coding-agent/src/polar/
 │   │   │   ├── oci.ts               # OciDriver & OciHotSandbox (`podman` / `docker`)
 │   │   │   └── k8s.ts               # K8sDriver & K8sHotSandbox (`kubectl` Pod)
 │   │   ├── host.ts                  # Layer 3: Host diagnosis (`probeHost` -> `HostDiagnosis`), `ImageSpec` resolution, diagnosis texts
+│   │   ├── setup.ts                 # Layer 3: Machine lock and host setup task with rank progression and cancellation
 │   │   ├── workspace.ts             # Layer 4: Session activation under the session lock (orphan GC, /work volume setup) and shutdown
 │   │   ├── runner.ts                # Layer 5: Lazy hot VM lifecycle, `spawnCall` supervision, OOM delta & work_limit check, scrub
 │   │   ├── reply.ts                 # Layer 6: Sandbox reply formatting (with OOM, work_limit, inspection, and cleanup notices)
-│   │   ├── controller.ts            # Sandbox state of the session: host probe, activation under the session lock, footer status, run_code registration, shutdown
+│   │   ├── preferences.ts           # Atomic read and merge update of `sandbox.json` in `getAgentDir()`
+│   │   ├── controller.ts            # Sandbox state of the session (`off`/`activating`/`active`/`disabled`/`closing`/`closed`), host probe, setup task, activation, footer status, run_code registration, shutdown
+│   │   ├── command.ts               # `/sandbox` command screens and menus
 │   │   ├── progress.ts              # CLI pull progress parser (`container` and `docker` output)
-│   │   └── indicator.ts             # TUI single-line progress widget for image pull and build
+│   │   └── indicator.ts             # TUI single-line progress widget (`"download" | "build" | "service"`)
 │   └── test/
 │
 └── test/                            # Cross-extension architectural tests

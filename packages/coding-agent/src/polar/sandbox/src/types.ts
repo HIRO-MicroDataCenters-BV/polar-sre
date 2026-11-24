@@ -180,7 +180,7 @@ export type HostDiagnosis =
 	| Exclude<RuntimeProbeResult, { kind: "ready" }>
 	| { kind: "image_missing"; reason: string; remedy: Remedy };
 
-export type ImageOperationKind = "download" | "build";
+export type ImageOperationKind = "download" | "build" | "service";
 
 export interface ImageOperation {
 	output(line: string): void;

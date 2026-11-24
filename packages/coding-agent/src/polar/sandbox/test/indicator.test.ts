@@ -191,4 +191,28 @@ describe("showImageOperation", () => {
 		vi.advanceTimersByTime(1000);
 		expect(build.renderRequests()).toBe(ticksBeforeEnd);
 	});
+
+	it("renders Starting status line for service kind without switching to bar and makes end() idempotent", () => {
+		let setWidgetCalls = 0;
+		let widget: (Component & { dispose?(): void }) | undefined;
+		const ui = {
+			setWidget(_key: string, factory: ((tui: TUI, theme: Theme) => Component & { dispose?(): void }) | undefined) {
+				setWidgetCalls += 1;
+				widget?.dispose?.();
+				widget = factory?.({ requestRender() {} } as unknown as TUI, { fg: (_color, text) => text } as Theme);
+			},
+		};
+		const operation = showImageOperation(ui as unknown as ExtensionUIContext, "service" as ImageOperationKind);
+		expect(setWidgetCalls).toBe(1);
+		operation.output("[1/2] Installing kernel... 50% (340/680 MB)");
+		const rendered = widget?.render(80)[0]?.replace(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/, "⠋") ?? "";
+		expect(rendered).toContain(" ⠋ Starting   ");
+		expect(rendered).toContain("Installing kernel...");
+		expect(BAR.test(rendered)).toBe(false);
+
+		operation.end();
+		expect(setWidgetCalls).toBe(2);
+		operation.end();
+		expect(setWidgetCalls).toBe(2);
+	});
 });

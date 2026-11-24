@@ -29,6 +29,7 @@ The `sandbox` extension (`builtin:sandbox`) registers the `run_code` tool, execu
     5. When no registry image is configured (or on `k8s`): `pull` is `undefined` and only `[build]` is searched.
   - `probeHost(host)` runs `host.driver.probeRuntime` and inspects `host.imageSpec.candidates` in order without mutating `host.image` or `host.imageSpec` and without showing startup dialogs.
   - When the runtime or image is not ready, `session_start` sets the footer status `sandbox: off, run /sandbox` (`ctx.ui.setStatus("sandbox", ...)`) and emits a single warning notification (`sandbox is off: <reason>`). For a missing image, the driver builds an `actions` `Remedy` (`pull_image` when `imageSpec.pull` is set, and `build_image` from `getSandboxImageDir()`, `10 min` timeout; on `apple-container` passes `--arch arm64`).
+  - Operator command `/sandbox` (`command.ts`) inspects `HostDiagnosis`, previews CLI commands, runs setup actions under the machine lock (`setup.ts`) in the background with cancellation (`Cancel setup` / `Keep running` / `Disable sandbox`), activates `run_code` in the live session upon readiness, and toggles `disabled` (`Disable sandbox` / `Enable sandbox`) in `sandbox.json` (`preferences.ts`). When `disabled: true`, `session_start` skips host probing and leaves the footer status empty; `Disable sandbox` in an active session immediately destroys the VM, releases the session lock, and re-registers `run_code` with `exposure: "hidden"`.
 - **Operator Output Quotas:** `fileMaxBytes` is `4 GiB` and `sessionMaxBytes` is `16 GiB`.
 - **Lazy Hot Sandbox VM / Container:**
   - The sandbox is started lazily on the first `run_code` call in the session (`driver.startSandbox`), not at `session_start`.
@@ -44,12 +45,12 @@ The `sandbox` extension (`builtin:sandbox`) registers the `run_code` tool, execu
 
 ## 2. File Structure & Layers
 
-Each numbered layer in `packages/coding-agent/src/polar/sandbox/src/` imports only from lower layers; `controller.ts` imports Layers 3 and 4 and is wired to the session events in `index.ts`; `progress.ts` and `indicator.ts` sit alongside the core layers:
+Each numbered layer in `packages/coding-agent/src/polar/sandbox/src/` imports only from lower layers; `controller.ts` and `command.ts` coordinate Layers 3 and 4 with `preferences.ts` and `indicator.ts`, and are wired to the session events and `/sandbox` command in `index.ts`:
 
 ```text
 packages/coding-agent/src/polar/sandbox/
 ├── ARCHITECTURE.md                  # VM sandbox architecture and layer boundaries
-├── index.ts                         # --sandbox-driver / --sandbox-image / --sandbox-registry-image / --sandbox-oci-* / --sandbox-k8s-pvc flags, session_start/shutdown wiring, run_code tool definition
+├── index.ts                         # --sandbox-driver / --sandbox-image / --sandbox-registry-image / --sandbox-oci-* / --sandbox-k8s-pvc flags, /sandbox command, session_start/shutdown wiring, run_code tool definition
 ├── image/
 │   ├── Containerfile                # Multi-arch guest image definition (default tag: polar-sandbox:0.2)
 │   ├── requirements.in
@@ -64,12 +65,15 @@ packages/coding-agent/src/polar/sandbox/
 │   │   ├── oci.ts                   # OciDriver & OciHotSandbox (`podman` / `docker`)
 │   │   └── k8s.ts                   # K8sDriver & K8sHotSandbox (`kubectl` Pod)
 │   ├── host.ts                      # Layer 3: Host diagnosis (`probeHost` -> `HostDiagnosis`), `ImageSpec` resolution, diagnosis texts
+│   ├── setup.ts                     # Layer 3: Machine lock and host setup task with rank progression and cancellation
 │   ├── workspace.ts                 # Layer 4: Session activation under the session lock (orphan GC, /work volume setup) and shutdown
 │   ├── runner.ts                    # Layer 5: Admission, lazy HotSandbox lifecycle, call supervision, OOM, work_limit & scrub
 │   ├── reply.ts                     # Layer 6: Reply budget calculation, stdout/stderr store finalization, formatting
-│   ├── controller.ts                # Sandbox state of the session: host probe, activation under the session lock, footer status, run_code registration, shutdown
+│   ├── preferences.ts               # Atomic read and merge update of `sandbox.json` in `getAgentDir()`
+│   ├── controller.ts                # Sandbox state of the session: host probe, setup task, activation, disable/enable, footer status, run_code registration, shutdown
+│   ├── command.ts                   # `/sandbox` command screens and menus
 │   ├── progress.ts                  # CLI pull progress parser (`ProgressReader` -> `ImageProgress`)
-│   └── indicator.ts                 # TUI progress line widget (`showImageOperation`)
+│   └── indicator.ts                 # TUI progress line widget (`showImageOperation`: `"download" | "build" | "service"`)
 └── test/
     ├── fake-container.mjs           # Stateful stand-in for the `container` CLI in tests
     ├── fake-oci.mjs                 # Stateful stand-in for the `podman` / `docker` CLI in tests
@@ -92,13 +96,14 @@ packages/coding-agent/src/polar/sandbox/
    - `src/drivers/shared.ts`: shared guest constants, the guest script `launcher`, volume/label/version helpers, and `UnsupportedSandboxDriver`.
    - `src/driver.ts`: barrel module re-exporting the concrete drivers and shared helpers.
    - `src/drivers/apple.ts` (`AppleContainerDriver` & `AppleHotSandbox`): macOS microVM implementation via `container` — `probeRuntime` over `container system status --format json` and `container --version` (`>= 1.5.0`, reporting `client.version` or `${client.version} (service ${server.version})` on mismatch), `imageRemedy` with `--arch arm64`, `/work` volume lifecycle (`-s 4096M`), container force-deletion with post-delete verification, and boot-log OOM delta detection (`logs --boot`).
-   - `src/drivers/oci.ts` (`OciDriver` & `OciHotSandbox`): Linux OCI implementation via `podman` or `docker` — pure `parseEngineInfo` (`version.Version` for Podman, `ServerVersion` for Docker), discovers the engine (`podman` then falling back to `docker` in `auto` mode if `podman` is missing or unsuitable, reporting reasons only for installed engines), rejects rootless Docker and rootless Podman `< 4.3`, checks `cpu` cgroup delegation in Podman, detects gVisor (`runsc`) to switch process limiting from `--pids-limit` to `launcher` `ulimit -u`, prepares `/work` (`:nocopy`) with `chown`, enforces the soft `work_limit` (`exit 199`), and detects OOM by `oom_kill` delta in `/sys/fs/cgroup/memory.events` or container `State.OOMKilled`.
+   - `src/drivers/oci.ts` (`OciDriver` & `OciHotSandbox`): Linux OCI implementation via `podman` or `docker` — pure `parseEngineInfo` (`version.Version` for Podman, `ServerVersion` for Docker), discovers the engine (`podman` then falling back to `docker` in `auto` mode if `podman` is missing or unsuitable, reporting reasons only for installed engines) while `runtime.state === "unready"` and pins the chosen engine and launch parameters once activated, rejects rootless Docker and rootless Podman `< 4.3`, checks `cpu` cgroup delegation in Podman, detects gVisor (`runsc`) to switch process limiting from `--pids-limit` to `launcher` `ulimit -u`, prepares `/work` (`:nocopy`) with `chown`, enforces the soft `work_limit` (`exit 199`), and detects OOM by `oom_kill` delta in `/sys/fs/cgroup/memory.events` or container `State.OOMKilled`.
    - `src/drivers/k8s.ts` (`K8sDriver` & `K8sHotSandbox`): Kubernetes Pod implementation via `kubectl` with an isolated ServiceAccount kubeconfig atomically written to `/tmp` and `KUBECONFIG` stripped from child process environments — verifies `POLAR_SANDBOX_K8S_*` and self-Pod UID in `probeRuntime`, refuses a `sessionId` that cannot name a Pod in `ensureWorkVolume` and `startSandbox` (and starts no `polar-work-ls-*` Pod for it in `listWorkVolumes`), runs the combined `/work` writability + `NetworkPolicy` deny-all probe Pod (`polar-netprobe-*`) in `ensureWorkVolume` (after `recoverLeftovers`), creates sandbox Pods under Pod Security `restricted` (`restartPolicy: Never`, `stdin: true` without `kubectl attach`, `ownerReferences`, `nodeSelector`, `polar-root-hash` label + `polar-root` annotation), deletes the Pod immediately on `kill()`, and performs two-step OOM detection on exit `137` or `128` (`state.terminated.reason === "OOMKilled"` with status-lag polling when the Pod is dead, or `/sys/fs/cgroup/memory.events` `oom_kill` delta when the Pod remains alive).
 
-3. **`src/host.ts` (Layer 3 — Host Readiness & Diagnosis)**
-   - `buildImageSpec`: resolves `ImageSpec` (`candidates`, `pull?`, `build`) from `--sandbox-image` and `--sandbox-registry-image` so that every image action produces a candidate searched by `probeHost`.
-   - `probeHost`: probes a `SandboxHost` without mutating `host.image` or `host.imageSpec`, calling `host.driver.probeRuntime` and checking `host.imageSpec.candidates` in order to return a `HostDiagnosis` (`ready` with `image`, `version?`, `repair?`, or `unsupported` / `runtime_missing` / `runtime_not_ready` / `image_missing` / `probe_failed`).
+3. **`src/host.ts` & `src/setup.ts` (Layer 3 — Host Readiness, Diagnosis & Setup)**
+   - `buildImageSpec` (`host.ts`): resolves `ImageSpec` (`candidates`, `pull?`, `build`) from `--sandbox-image` and `--sandbox-registry-image` so that every image action produces a candidate searched by `probeHost`.
+   - `probeHost` (`host.ts`): probes a `SandboxHost` without mutating `host.image` or `host.imageSpec`, calling `host.driver.probeRuntime` and checking `host.imageSpec.candidates` in order to return a `HostDiagnosis` (`ready` with `image`, `version?`, `repair?`, or `unsupported` / `runtime_missing` / `runtime_not_ready` / `image_missing` / `probe_failed`).
    - Provides `SANDBOX_OFF_STATUS` (`"sandbox: off, run /sandbox"`) and `formatDiagnosisWarning`.
+   - `runHostSetup` (`setup.ts`): acquires the inter-process machine lock (`proper-lockfile` in `getAgentDir()`, `realpath: false`, `stale: 30_000`, `onCompromised` cancels the task), re-probes the host so stale action choices return the new diagnosis instead of running silently, and executes the setup action chain with strict rank progression (`runtime_missing (0) < runtime_not_ready (1) < image_missing (2) < ready (3)`).
 
 4. **`src/workspace.ts` (Layer 4 — Session Workspace & Recovery)**
    - `activateRuntime`: acquires the session lock (`acquireSession`), verifies `host.state === "unready"`, records the chosen tag in `host.image` (leaving `host.imageSpec` intact), runs `recoverLeftovers(host, handle.paths, warn)` and `ensureWorkVolume(host, handle.paths)`, and attaches the session fields (`handle`, `inFlight`, `running`, `activeSandbox`) to the same `host` object via `Object.assign` only after activation succeeds. On any failure or exception, releases `handle` in `finally` without attaching it to `host`.
@@ -117,15 +122,18 @@ packages/coding-agent/src/polar/sandbox/
    - Formats the reply with status line `[run_code <status>] <language>: <first-line>`, `stdout` head excerpt, `[stderr]...[/stderr]` tail excerpt, and notices (`outputLimitNotice`, `cleanupNotice`, `inspectionNotice`, `statusMessage`).
    - Saved file notices point to `"read" tool` (when `<= 16 MiB`) and `"run_code" tool from /data/<file>`.
 
-7. **`src/controller.ts` (Session Controller)**
-   - `SandboxController` holds the sandbox state of one session: `off` → `activating` → `active` → `closing` → `closed`, and tracks the current transitional operation in `pending` (`Promise<void> | undefined`). It is created at `session_start` over a `SandboxHost` and owns the `SandboxRuntime` once the session is active.
-   - Start (from `off` when no `pending` operation is running): runs `probeHost` on the host without startup dialogs; a host that is not ready stays `off`, sets `ctx.ui.setStatus("sandbox", "sandbox: off, run /sandbox")`, emits one warning notification, and acquires no session lock. A ready host is activated via `activateRuntime` with the image from `HostDiagnosis`, then opens the runtime, registers `run_code`, and clears the footer status. A failed activation returns the state to `off`, sets the `off` footer status, and emits a warning.
-   - Notifications (`ctx.ui.notify`), footer status updates (`ctx.ui.setStatus`), activation `warn`, and `registerRunCode` during start/activation are guarded by `isAlive()` (`state !== "closing" && state !== "closed"`). If activation finishes after the session began shutting down, the controller closes the late `runtime` through `shutdownRuntime` and registers nothing. Shutdown cleanup warnings (from `shutdownRuntime`, including for a late runtime, and `shutdownHost`) are shown while the `session_shutdown` handler has not yet returned (`state !== "closed"`).
-   - Shutdown: moves to `closing`, calls `shutdownRuntime` for an active session or `shutdownHost` (waiting on `pending`) otherwise, and moves to `closed` when the handler returns.
+7. **`src/preferences.ts`, `src/controller.ts` & `src/command.ts` (Session Controller & `/sandbox` Command)**
+   - `src/preferences.ts`: reads and atomically updates `sandbox.json` in `getAgentDir()` (`disabled`, `autoStartService`) via a `0600` temporary file and `rename`.
+   - `SandboxController` (`src/controller.ts`) holds the sandbox state of one session: `off` → `activating` → `active` → `closing` → `closed` plus `disabled`, and tracks the current transitional operation in `pending` (`Promise<void> | undefined`). It is constructed with a `createHost: () => SandboxHost` factory and a `registerRunCode` callback (supporting `exposure: "hidden"` on disablement).
+   - Start (from `off` when no `pending` operation is running): reads `sandbox.json` (moving to `disabled` without probing if `disabled: true`), otherwise runs `probeHost` without startup dialogs; a host that is not ready stays `off`, sets `ctx.ui.setStatus("sandbox", "sandbox: off, run /sandbox")`, emits one warning notification, and acquires no session lock. A ready host is activated via `activateRuntime` with the image from `HostDiagnosis`, then opens the runtime, registers `run_code`, and clears the footer status.
+   - Setup task & disable/enable: runs `runHostSetup` in the background while mounting the `sandbox-image` progress widget per step, activates and notifies `sandbox: ready` when setup completes in `off` (or updates `runtime.image` to the image from `HostDiagnosis` and notifies `sandbox: ready` without touching footer status when recovering in `active`), and supports live `Disable sandbox` (cancelling pending setup, shutting down the active runtime, releasing the session lock, hiding `run_code`, and clearing footer status) and `Enable sandbox` (recreating a fresh `SandboxHost` via `createHost()`).
+   - Notifications (`ctx.ui.notify`), footer status updates (`ctx.ui.setStatus`), activation `warn`, and `registerRunCode` are guarded by `isAlive()` (`state !== "closing" && state !== "closed"`). If activation finishes after the session began shutting down or was disabled, the controller closes the late `runtime` through `shutdownRuntime` and registers nothing.
+   - Shutdown: moves to `closing`, immediately disposes any active progress widget, aborts any running setup task, waits for `pending` and closes the active runtime or host within `shutdownBudgetMs`, and moves to `closed` when the handler returns.
+   - `src/command.ts` (`runSandboxCommand`): implements the `/sandbox` screens and menus over `SandboxController`.
 
-8. **`src/progress.ts` & `src/indicator.ts` (UI Helpers — Image Progress Widget)**
+8. **`src/progress.ts` & `src/indicator.ts` (UI Helpers — Progress Widget)**
    - `src/progress.ts` (`ProgressReader`): pure parser (no TUI/theme imports) extracting step, completion fraction, and byte/layer counts from `container image pull` and non-TTY `docker pull` output lines, falling back to the latest sanitized text line.
-   - `src/indicator.ts` (`showImageOperation`): mounts and disposes the `sandbox-image` TUI widget above the editor, rendering either a fixed-column progress bar or a right-aligned elapsed-time status line.
+   - `src/indicator.ts` (`showImageOperation`): mounts and idempotently disposes the `sandbox-image` TUI widget above the editor for `"download"`, `"build"`, and `"service"` operations, rendering either a fixed-column progress bar or a right-aligned elapsed-time status line.
 
 ---
 

@@ -8,8 +8,10 @@ import { fileURLToPath } from "url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
 	ExtensionAPI,
+	ExtensionCommandContext,
 	ExtensionContext,
 	ExtensionToolContext,
+	RegisteredCommand,
 	ToolCallEventResult,
 	ToolDefinition,
 	ToolLoadout,
@@ -50,9 +52,12 @@ const PODS = Array.from({ length: POD_COUNT }, (_, index) => `web-${index + 1} 1
 const RUN_CODE_LINE_COUNT = 3000;
 const LONG_LINE_BYTES = 60_000;
 
+type CommandOption = Omit<RegisteredCommand, "name" | "sourceInfo">;
+
 interface LoadedExtension {
 	name: ExtensionName;
 	tools: ToolDefinition<TObject>[];
+	commands: Map<string, CommandOption>;
 	handlers: Map<string, EventHandler[]>;
 }
 
@@ -63,6 +68,7 @@ interface Session {
 	shutdown: ReturnType<typeof vi.fn>;
 	notices: [string, string | undefined][];
 	statuses: [string, string | undefined][];
+	selects: [string, string[]][];
 	replies: [string, string][];
 }
 
@@ -123,14 +129,17 @@ function shellWord(value: string): string {
 
 function loadExtension(name: ExtensionName, flagValues: Record<string, string>): LoadedExtension {
 	const flags: Record<string, string> = { "sandbox-driver": "apple-container", ...flagValues };
-	const tools: ToolDefinition<TObject>[] = [];
+	const toolRegistry = new Map<string, ToolDefinition<TObject>>();
+	const commands = new Map<string, CommandOption>();
 	const flagDefaults = new Map<string, unknown>();
 	const handlers = new Map<string, EventHandler[]>();
 	const pi = {
 		registerTool: (tool: ToolDefinition<TObject>) => {
-			tools.push(tool);
+			toolRegistry.set(tool.name, tool);
 		},
-		registerCommand: () => {},
+		registerCommand: (commandName: string, options: CommandOption) => {
+			commands.set(commandName, options);
+		},
 		registerFlag: (flag: string, options: { default?: unknown }) => {
 			flagDefaults.set(flag, options.default);
 		},
@@ -140,7 +149,14 @@ function loadExtension(name: ExtensionName, flagValues: Record<string, string>):
 		},
 	};
 	FACTORIES[name](pi as unknown as ExtensionAPI);
-	return { name, tools, handlers };
+	return {
+		name,
+		get tools() {
+			return [...toolRegistry.values()].filter((tool) => tool.exposure !== "hidden");
+		},
+		commands,
+		handlers,
+	};
 }
 
 async function emit(session: Session, extension: LoadedExtension, event: { type: string; reason: string }) {
@@ -155,9 +171,12 @@ async function startSession(
 	const id = randomUUID();
 	const notices: [string, string | undefined][] = [];
 	const statuses: [string, string | undefined][] = [];
+	const selects: [string, string[]][] = [];
 	const shutdown = vi.fn();
 	const ctx = {
 		cwd,
+		hasUI: true,
+		mode: "tui",
 		sessionManager: { getSessionId: () => id },
 		ui: {
 			notify: (message: string, type?: string) => {
@@ -166,10 +185,15 @@ async function startSession(
 			setStatus: (key: string, text: string | undefined) => {
 				statuses.push([key, text]);
 			},
+			setWidget: () => {},
+			select: async (title: string, items: string[]) => {
+				selects.push([title, items]);
+				return "Cancel";
+			},
 		},
 		shutdown,
 	} as unknown as ExtensionContext;
-	const session: Session = { id, extensions: [], ctx, shutdown, notices, statuses, replies: [] };
+	const session: Session = { id, extensions: [], ctx, shutdown, notices, statuses, selects, replies: [] };
 	sessions.push(session);
 	session.extensions = names.map((name) => loadExtension(name, flagValues));
 	for (const extension of session.extensions) {
@@ -293,6 +317,9 @@ function textsOf(session: Session): Text[] {
 	for (const [tool, text] of session.replies) texts.push([`reply of ${tool}`, text]);
 	for (const [message, type] of session.notices) texts.push([`${type ?? "info"} notice`, message]);
 	for (const [key, text] of session.statuses) texts.push([`status ${key}`, text ?? ""]);
+	for (const [title, items] of session.selects) {
+		texts.push(["select title", title], ...items.map((item): Text => ["select option", item]));
+	}
 	return texts;
 }
 
@@ -347,8 +374,15 @@ async function k8sAlone(): Promise<Session[]> {
 	return [k8s, off];
 }
 
+async function runCommand(session: Session, name: string, args = ""): Promise<void> {
+	const command = session.extensions.map((ext) => ext.commands.get(name)).find((candidate) => candidate !== undefined);
+	if (command === undefined) throw new Error(`/${name} is not registered in ${labelOf(session)}`);
+	await command.handler(args, session.ctx as unknown as ExtensionCommandContext);
+}
+
 async function sandboxAlone(): Promise<Session[]> {
 	const sandbox = await startSession(["sandbox"]);
+	await runCommand(sandbox, "sandbox");
 	const run = (code: string) => callTool(sandbox, "run_code", { language: "bash", code });
 	savedFileOf(sandbox, await run(`stdout_lines:${RUN_CODE_LINE_COUNT}`));
 	savedFileOf(sandbox, await run(`stdout_bytes:${LONG_LINE_BYTES}`));
@@ -376,6 +410,7 @@ async function sandboxAlone(): Promise<Session[]> {
 	]);
 	await installFake("container", { IMAGE_MISSING: "1" });
 	const off = await startSession(["sandbox"], K8S_FLAGS, { sandboxOff: true });
+	await runCommand(off, "sandbox");
 	await shutDown(off);
 	return [sandbox, off];
 }

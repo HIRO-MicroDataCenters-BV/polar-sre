@@ -11,8 +11,21 @@ const knob = (name, fallback) =>
 	process.env[`FAKE_OCI_${name}`] ?? process.env[`FAKE_CONTAINER_${name}`] ?? fallback;
 const containersDir = join(stateRoot, "containers");
 const volumesDir = join(stateRoot, "volumes");
+const imagesStatePath = join(stateRoot, "images.json");
 mkdirSync(containersDir, { recursive: true });
 mkdirSync(volumesDir, { recursive: true });
+
+function recordedImages() {
+	if (!existsSync(imagesStatePath)) return new Set();
+	return new Set(JSON.parse(readFileSync(imagesStatePath, "utf8")));
+}
+
+function recordImage(image) {
+	if (typeof image !== "string" || image === "") return;
+	const images = recordedImages();
+	images.add(image);
+	writeFileSync(imagesStatePath, JSON.stringify([...images]));
+}
 
 const engine = knob("ENGINE", "podman");
 const argv = process.argv.slice(2);
@@ -407,8 +420,14 @@ async function main() {
 		case "image": {
 			const [sub, img] = args;
 			if (sub === "pull") {
+				if (knob("PULL_HANG") === "1") await sleep(60_000);
 				if (knob("PULL_FAIL") === "1") fail(`pull ${img} failed`);
+				if (knob("PULL_NO_RECORD") !== "1") recordImage(img);
 				process.stdout.write(`pulled ${img}\n`);
+				break;
+			}
+			if (recordedImages().has(img)) {
+				process.stdout.write(`[{"Id":"${img}"}]\n`);
 				break;
 			}
 			const present = knob("IMAGE_PRESENT");
@@ -420,14 +439,20 @@ async function main() {
 		}
 		case "pull": {
 			const [img] = args;
+			if (knob("PULL_HANG") === "1") await sleep(60_000);
 			if (knob("PULL_FAIL") === "1") fail(`pull ${img} failed`);
+			if (knob("PULL_NO_RECORD") !== "1") recordImage(img);
 			process.stdout.write(`pulled ${img}\n`);
 			break;
 		}
-		case "build":
+		case "build": {
+			if (knob("BUILD_HANG") === "1") await sleep(60_000);
 			if (knob("BUILD_FAIL") === "1") fail("build failed");
+			const { options } = parseRun(args);
+			recordImage(options["--tag"] ?? options["-t"]);
 			process.stdout.write("built\n");
 			break;
+		}
 		case "run":
 			return run(args);
 		case "exec":

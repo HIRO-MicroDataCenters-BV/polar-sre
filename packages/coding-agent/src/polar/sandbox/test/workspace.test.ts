@@ -863,10 +863,13 @@ describe("shutdown", () => {
 				sessionManager: { getSessionId: () => "late-session" },
 			} as unknown as ExtensionContext;
 
-			const controller = new SandboxController(host, () => {
-				if (invalidated) throw new Error("context invalidated");
-				registered += 1;
-			});
+			const controller = new SandboxController(
+				() => host,
+				() => {
+					if (invalidated) throw new Error("context invalidated");
+					registered += 1;
+				},
+			);
 			const starting = controller.start(ctx);
 			await until(() => listEntered);
 			const lateLock = join(artifactsRoot(), "late-session", "lock");
@@ -944,7 +947,10 @@ describe("shutdown", () => {
 				sessionManager: { getSessionId: () => "inspect-shutdown" },
 			} as unknown as ExtensionContext;
 
-			const controller = new SandboxController(host, () => {});
+			const controller = new SandboxController(
+				() => host,
+				() => {},
+			);
 			const starting = controller.start(ctx);
 			await until(() => inspectEntered);
 
@@ -1033,9 +1039,12 @@ describe("shutdown", () => {
 					sessionManager: { getSessionId: () => sessionId },
 				} as unknown as ExtensionContext;
 
-				const controller = new SandboxController(host, () => {
-					if (invalidated) throw new Error("context invalidated");
-				});
+				const controller = new SandboxController(
+					() => host,
+					() => {
+						if (invalidated) throw new Error("context invalidated");
+					},
+				);
 				const starting = controller.start(ctx);
 				await until(() => listEntered);
 				const lateLock = join(artifactsRoot(), sessionId, "lock");

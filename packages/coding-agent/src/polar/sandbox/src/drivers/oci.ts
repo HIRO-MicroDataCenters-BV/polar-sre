@@ -605,7 +605,12 @@ export class OciDriver implements SandboxDriver {
 				reason: `invalid --sandbox-oci-engine "${String(this.engineChoice)}"; expected auto, podman, or docker`,
 			};
 		}
-		const candidates: OciEngine[] = this.engineChoice === "auto" ? ["podman", "docker"] : [this.engineChoice];
+		const pinned = this.runtime.state !== "unready";
+		const candidates: OciEngine[] = pinned
+			? [this.engine]
+			: this.engineChoice === "auto"
+				? ["podman", "docker"]
+				: [this.engineChoice];
 		const reasons: string[] = [];
 		for (const candidate of candidates) {
 			const command = this.customCommand ?? candidate;
@@ -622,12 +627,14 @@ export class OciDriver implements SandboxDriver {
 				reasons.push(parsed.reason);
 				continue;
 			}
-			this.engine = candidate;
-			this.runtime.containerCommand = command;
-			this.rootless = parsed.rootless;
-			this.cpuDelegated = parsed.cpuDelegated;
-			this.detectedRuntime = parsed.detectedRuntime;
-			this.gvisor = parsed.gvisor;
+			if (!pinned) {
+				this.engine = candidate;
+				this.runtime.containerCommand = command;
+				this.rootless = parsed.rootless;
+				this.cpuDelegated = parsed.cpuDelegated;
+				this.detectedRuntime = parsed.detectedRuntime;
+				this.gvisor = parsed.gvisor;
+			}
 			return parsed.version === undefined ? { kind: "ready" } : { kind: "ready", version: parsed.version };
 		}
 		if (reasons.length === 0) {

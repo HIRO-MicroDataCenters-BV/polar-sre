@@ -335,6 +335,7 @@ async function handleSystem(args) {
 		process.exit(0);
 	}
 	if (knob("STATUS_HANG") === "1") await sleep(60_000);
+	await sleep(Number(knob("STATUS_DELAY_MS", 0)));
 	const statusExitKnob = knob("STATUS_EXIT");
 	const exitCode = Number(statusExitKnob ?? 0);
 	if (knob("STATUS_GARBAGE") === "1") {
@@ -404,7 +405,7 @@ async function main() {
 				maybeSpawnStdoutHolder("PULL_SPAWN_HOLDER");
 				if (knob("PULL_HANG") === "1") await sleep(60_000);
 				if (knob("PULL_FAIL") === "1") fail(`pull ${img} failed`);
-				recordImage(img);
+				if (knob("PULL_NO_RECORD") !== "1") recordImage(img);
 				process.stdout.write(`pulled ${img}\n`);
 				break;
 			}

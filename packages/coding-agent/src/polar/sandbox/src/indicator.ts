@@ -135,7 +135,7 @@ class ProgressLine implements Component {
 		if (state.measured && state.progress) {
 			return [renderBarLine(state.progress, width, state.widths, spinner, this.theme)];
 		}
-		const title = state.kind === "download" ? "Downloading" : "Building";
+		const title = state.kind === "download" ? "Downloading" : state.kind === "service" ? "Starting" : "Building";
 		return [renderPlainLine(title, state.progress?.line ?? "", formatElapsed(elapsedMs), width, spinner, this.theme)];
 	}
 }
@@ -148,14 +148,20 @@ export function showImageOperation(ui: ExtensionUIContext, kind: ImageOperationK
 		widths: { activity: ACTIVITY_WIDTH, step: 0, amount: AMOUNT_WIDTH },
 	};
 	const reader = new ProgressReader();
+	let ended = false;
 	ui.setWidget(WIDGET_KEY, (tui, theme) => new ProgressLine(tui, theme, state));
 	return {
 		output(line) {
+			if (ended) return;
 			const progress = reader.read(line);
 			state.progress = progress;
-			if (kind === "build") return; // Keep plain status + elapsed time; [i/n] stage headers are not download progress
+			if (kind === "build" || kind === "service") return; // Keep plain status + elapsed time; [i/n] stage headers are not download progress
 			if (progress?.step || progress?.fraction !== undefined || progress?.amount) state.measured = true;
 		},
-		end: () => ui.setWidget(WIDGET_KEY, undefined),
+		end: () => {
+			if (ended) return;
+			ended = true;
+			ui.setWidget(WIDGET_KEY, undefined);
+		},
 	};
 }

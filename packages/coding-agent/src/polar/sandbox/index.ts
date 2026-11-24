@@ -3,6 +3,7 @@ import { type AgentToolResult, defineTool, type ExtensionAPI } from "../../core/
 import { describeBytes, READ_MAX_BYTES } from "../shared/store.ts";
 import { nulCharacterError } from "../shared/validation.ts";
 import { describeCleanupErrors } from "./src/cli.ts";
+import { runSandboxCommand } from "./src/command.ts";
 import { SandboxController } from "./src/controller.ts";
 import {
 	AppleContainerDriver,
@@ -246,6 +247,13 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
 		type: "string",
 	});
 
+	pi.registerCommand("sandbox", {
+		description: "Inspect, set up, or toggle the local analytics sandbox",
+		handler: async (_args, ctx) => {
+			if (current !== undefined) await runSandboxCommand(current, ctx);
+		},
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		const flag = pi.getFlag("sandbox-image");
 		const image = typeof flag === "string" && flag !== "" ? flag : DEFAULT_IMAGE;
@@ -263,15 +271,19 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
 		const ociRuntime = typeof ociRuntimeFlag === "string" && ociRuntimeFlag !== "" ? ociRuntimeFlag : undefined;
 		const k8sPvcFlag = pi.getFlag("sandbox-k8s-pvc");
 		const k8sPvc = typeof k8sPvcFlag === "string" && k8sPvcFlag !== "" ? k8sPvcFlag : undefined;
-		const host = createHost(image, process.env, {
-			registryImage,
-			customImage,
-			driver,
-			ociEngine,
-			ociRuntime,
-			k8sPvc,
+		const buildHost = () =>
+			createHost(image, process.env, {
+				registryImage,
+				customImage,
+				driver,
+				ociEngine,
+				ociRuntime,
+				k8sPvc,
+			});
+		const controller = new SandboxController(buildHost, (runtime, options) => {
+			const tool = createRunCodeTool(runtime);
+			pi.registerTool(options?.hidden ? { ...tool, exposure: "hidden" } : tool);
 		});
-		const controller = new SandboxController(host, (runtime) => pi.registerTool(createRunCodeTool(runtime)));
 		current = controller;
 		await controller.start(ctx);
 	});
