@@ -1,7 +1,7 @@
-import { CancellableLoader } from "@earendil-works/pi-tui";
 import { setTimeout as sleep } from "timers/promises";
 import type { ExtensionCommandContext } from "../../../core/extensions/types.ts";
 import type { SandboxController } from "./controller.ts";
+import { ForegroundActionDialog } from "./indicator.ts";
 import type { ActionIO, ActionResult, HostDiagnosis, Remedy, SetupAction } from "./types.ts";
 
 const ENABLE_SANDBOX = "Enable sandbox";
@@ -16,15 +16,6 @@ const INSTALL_CANCEL_HINT = "Esc cancels. Nothing is installed until you enter y
 
 function isAgentIdle(ctx: ExtensionCommandContext): boolean {
 	return ctx.isIdle() && !ctx.hasPendingMessages();
-}
-
-function formatInstallLoaderMessage(header: string, doneBytes: number, totalBytes?: number): string {
-	if (totalBytes === undefined || !(totalBytes > 0)) {
-		return [header, "Downloading the installer...", INSTALL_CANCEL_HINT].join("\n");
-	}
-	const totalMb = Math.max(1, Math.round(totalBytes / 1_000_000));
-	const doneMb = doneBytes >= totalBytes ? totalMb : Math.min(totalMb, Math.max(0, Math.floor(doneBytes / 1_000_000)));
-	return [header, `Downloading the installer: ${doneMb} of ${totalMb} MB`, INSTALL_CANCEL_HINT].join("\n");
 }
 
 async function waitForAgentIdle(ctx: ExtensionCommandContext, signal: AbortSignal): Promise<void> {
@@ -52,41 +43,33 @@ async function runForegroundActionInTui(
 ): Promise<ActionResult> {
 	const header = action.title ?? action.label;
 	const result = await ctx.ui.custom<ActionResult>((tui, theme, _kb, done) => {
-		const loader = new CancellableLoader(
-			tui,
-			(text) => theme.fg("accent", text),
-			(text) => theme.fg("muted", text),
-			formatInstallLoaderMessage(header, 0),
-		);
+		const dialog = new ForegroundActionDialog(tui, theme, header, INSTALL_CANCEL_HINT);
 		let handoffStarted = false;
-		loader.onAbort = () => {
+		dialog.onAbort = () => {
 			void controller.cancelSetup();
 		};
 		const onExternalAbort = () => {
 			if (!handoffStarted) {
-				loader.stop();
+				dialog.stop();
 			}
 		};
 		signal.addEventListener("abort", onExternalAbort, { once: true });
 
 		const onDownloadProgress = (doneBytes: number, totalBytes?: number) => {
-			if (handoffStarted || signal.aborted || loader.aborted) return;
-			loader.setMessage(formatInstallLoaderMessage(header, doneBytes, totalBytes));
+			if (handoffStarted || signal.aborted || dialog.aborted) return;
+			dialog.setDownloadProgress(doneBytes, totalBytes);
 		};
 
 		const handoffTerminal = async <T>(fn: () => Promise<T>): Promise<T> => {
 			if (!isAgentIdle(ctx)) {
-				loader.setMessage(
-					[header, "Waiting for the current response to finish...", INSTALL_CANCEL_HINT].join("\n"),
-				);
+				dialog.setStatus("Waiting for the current response to finish...");
 				await waitForAgentIdle(ctx, signal);
 			}
-			if (signal.aborted || loader.aborted) {
+			if (signal.aborted || dialog.aborted) {
 				throw new Error("cancelled");
 			}
 			handoffStarted = true;
-			loader.stop();
-			loader.setMessage(header);
+			dialog.enterHandoff();
 			tui.renderNow();
 			await tui.terminal.drainInput();
 			tui.stop({ preserveScreen: tui.mode === "fullscreen" });
@@ -106,7 +89,7 @@ async function runForegroundActionInTui(
 				(error) => {
 					const reason = error instanceof Error ? error.message : String(error);
 					done(
-						signal.aborted || loader.aborted
+						signal.aborted || dialog.aborted
 							? { ok: false, cancelled: true, reason: "cancelled" }
 							: { ok: false, reason },
 					);
@@ -114,10 +97,10 @@ async function runForegroundActionInTui(
 			)
 			.finally(() => {
 				signal.removeEventListener("abort", onExternalAbort);
-				loader.stop();
+				dialog.stop();
 			});
 
-		return loader;
+		return dialog;
 	});
 	return result ?? { ok: false, cancelled: true, reason: "cancelled" };
 }

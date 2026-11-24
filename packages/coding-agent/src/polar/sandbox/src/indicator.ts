@@ -1,5 +1,6 @@
-import { type Component, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { type Component, getKeybindings, Text, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { ExtensionUIContext } from "../../../core/extensions/types.ts";
+import { DynamicBorder } from "../../../modes/interactive/components/dynamic-border.ts";
 import type { Theme } from "../../../modes/interactive/theme/theme.ts";
 import { type ImageProgress, ProgressReader } from "./progress.ts";
 import type { ImageOperation, ImageOperationKind } from "./types.ts";
@@ -48,6 +49,11 @@ function formatElapsed(milliseconds: number): string {
 	const seconds = Math.max(0, Math.floor(milliseconds / 1000));
 	if (seconds < 60) return `${seconds}s`;
 	return `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s`;
+}
+
+function spinnerFrame(startedAt: number): string {
+	const elapsedMs = Date.now() - startedAt;
+	return SPINNER[Math.max(0, Math.floor(elapsedMs / TICK_MS)) % SPINNER.length];
 }
 
 function renderBarLine(
@@ -130,13 +136,132 @@ class ProgressLine implements Component {
 
 	render(width: number): string[] {
 		const state = this.state;
-		const elapsedMs = Date.now() - state.startedAt;
-		const spinner = SPINNER[Math.max(0, Math.floor(elapsedMs / TICK_MS)) % SPINNER.length];
+		const spinner = spinnerFrame(state.startedAt);
 		if (state.measured && state.progress) {
 			return [renderBarLine(state.progress, width, state.widths, spinner, this.theme)];
 		}
 		const title = state.kind === "download" ? "Downloading" : state.kind === "service" ? "Starting" : "Building";
-		return [renderPlainLine(title, state.progress?.line ?? "", formatElapsed(elapsedMs), width, spinner, this.theme)];
+		return [
+			renderPlainLine(
+				title,
+				state.progress?.line ?? "",
+				formatElapsed(Date.now() - state.startedAt),
+				width,
+				spinner,
+				this.theme,
+			),
+		];
+	}
+}
+
+type ForegroundDialogState =
+	| { kind: "downloading"; progress?: ImageProgress }
+	| { kind: "status"; text: string }
+	| { kind: "handoff" };
+
+export class ForegroundActionDialog implements Component {
+	private readonly tui: TUI;
+	private readonly theme: Theme;
+	private readonly startedAt: number;
+	private readonly border: DynamicBorder;
+	private readonly titleText: Text;
+	private readonly hintText: Text;
+	private readonly widths: LineWidths = { activity: ACTIVITY_WIDTH, step: 0, amount: AMOUNT_WIDTH };
+	private state: ForegroundDialogState = { kind: "downloading" };
+	private timer: NodeJS.Timeout | undefined;
+	private _aborted = false;
+
+	onAbort?: () => void;
+
+	constructor(tui: TUI, theme: Theme, title: string, cancelHint: string) {
+		this.tui = tui;
+		this.theme = theme;
+		this.startedAt = Date.now();
+		this.border = new DynamicBorder((s) => theme.fg("border", s));
+		this.titleText = new Text(theme.fg("accent", theme.bold(title)), 1, 0);
+		this.hintText = new Text(theme.fg("dim", cancelHint), 1, 0);
+		this.timer = setInterval(() => this.tui.requestRender(), TICK_MS);
+	}
+
+	get aborted(): boolean {
+		return this._aborted;
+	}
+
+	setDownloadProgress(doneBytes: number, totalBytes?: number): void {
+		if (totalBytes !== undefined && totalBytes > 0) {
+			const clampedDone = Math.min(totalBytes, Math.max(0, doneBytes));
+			this.state = {
+				kind: "downloading",
+				progress: {
+					activity: "Downloading",
+					fraction: clampedDone / totalBytes,
+					amount: {
+						done: clampedDone / 1_000_000,
+						total: totalBytes / 1_000_000,
+						unit: "megabytes",
+					},
+					line: "",
+				},
+			};
+		}
+		this.tui.requestRender();
+	}
+
+	setStatus(text: string): void {
+		this.state = { kind: "status", text };
+		this.tui.requestRender();
+	}
+
+	enterHandoff(): void {
+		this.stop();
+		this.state = { kind: "handoff" };
+	}
+
+	stop(): void {
+		if (this.timer !== undefined) {
+			clearInterval(this.timer);
+			this.timer = undefined;
+		}
+	}
+
+	dispose(): void {
+		this.stop();
+	}
+
+	invalidate(): void {
+		this.border.invalidate();
+		this.titleText.invalidate();
+		this.hintText.invalidate();
+	}
+
+	handleInput(data: string): void {
+		if (getKeybindings().matches(data, "tui.select.cancel")) {
+			this._aborted = true;
+			this.onAbort?.();
+		}
+	}
+
+	render(width: number): string[] {
+		const border = this.border.render(width);
+		const title = this.titleText.render(width);
+		if (this.state.kind === "handoff") {
+			return [...border, "", ...title, "", ...border];
+		}
+		const spinner = spinnerFrame(this.startedAt);
+		const middle =
+			this.state.kind === "status"
+				? truncateToWidth(` ${this.theme.fg("accent", spinner)} ${this.theme.fg("muted", this.state.text)}`, width)
+				: this.state.progress !== undefined
+					? renderBarLine(this.state.progress, width, this.widths, spinner, this.theme)
+					: renderPlainLine(
+							"Downloading",
+							"",
+							formatElapsed(Date.now() - this.startedAt),
+							width,
+							spinner,
+							this.theme,
+						);
+		return [...border, "", ...title, middle, "", ...this.hintText.render(width), "", ...border];
 	}
 }
 

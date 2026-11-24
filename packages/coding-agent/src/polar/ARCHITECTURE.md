@@ -135,7 +135,7 @@ packages/coding-agent/src/polar/
 │   │   ├── controller.ts            # Sandbox state of the session (`off`/`activating`/`active`/`disabled`/`closing`/`closed`), host probe, setup task, activation, footer status, run_code registration, shutdown
 │   │   ├── command.ts               # `/sandbox` command screens, menus, installer download dialog, and terminal handoff
 │   │   ├── progress.ts              # CLI pull progress parser (`container` and `docker` output)
-│   │   └── indicator.ts             # TUI single-line progress widget (`"download" | "build" | "service"`)
+│   │   └── indicator.ts             # TUI single-line progress widget (`"download" | "build" | "service"`) and `ForegroundActionDialog`
 │   └── test/
 │
 └── test/                            # Cross-extension architectural tests

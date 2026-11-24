@@ -185,7 +185,7 @@ function fakeContext(options: FakeContextOptions = {}) {
 			custom: async <T>(
 				factory: (
 					tui: TUI,
-					theme: { fg: (color: string, text: string) => string },
+					theme: { fg: (color: string, text: string) => string; bold: (text: string) => string },
 					keybindings: unknown,
 					done: (result: T) => void,
 				) => (Component & { dispose?(): void }) | Promise<Component & { dispose?(): void }>,
@@ -193,13 +193,16 @@ function fakeContext(options: FakeContextOptions = {}) {
 				assertValid();
 				if (context.mode !== "tui") return undefined as T;
 				return new Promise<T>((resolve) => {
+					let recordRender = () => {};
 					const fakeTui = {
 						mode: options.tuiMode ?? "regular",
 						renderNow: () => {
 							tuiEvents.push("renderNow");
+							recordRender();
 						},
 						requestRender: (force?: boolean) => {
 							if (force) tuiEvents.push("requestRender:force");
+							if (!tuiStopped) recordRender();
 						},
 						stop: (opts?: { preserveScreen?: boolean }) => {
 							tuiStopped = true;
@@ -215,7 +218,10 @@ function fakeContext(options: FakeContextOptions = {}) {
 							},
 						},
 					} as unknown as TUI;
-					const fakeTheme = { fg: (_color: string, text: string) => text };
+					const fakeTheme = {
+						fg: (_color: string, text: string) => text,
+						bold: (text: string) => text,
+					};
 					const finish = (result: T) => {
 						activeCustomComponent?.dispose?.();
 						activeCustomComponent = undefined;
@@ -223,13 +229,13 @@ function fakeContext(options: FakeContextOptions = {}) {
 					};
 					void Promise.resolve(factory(fakeTui, fakeTheme, {}, finish)).then((component) => {
 						activeCustomComponent = component;
-						const recordRender = () => {
+						recordRender = () => {
 							const rendered = component
 								.render(100)
-								.map((line) => line.trim())
+								.map((line) => line.replace(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/g, "⠋").trim())
 								.filter((line) => line !== "")
 								.join("\n");
-							if (rendered !== "") {
+							if (rendered !== "" && rendered !== loaderMessages.at(-1)) {
 								loaderMessages.push(rendered);
 								onLoaderMessageFn?.(rendered, () => {
 									component.handleInput?.("\x1b");
@@ -237,16 +243,6 @@ function fakeContext(options: FakeContextOptions = {}) {
 							}
 						};
 						recordRender();
-						const maybeLoader = component as unknown as {
-							setMessage?: (message: string) => void;
-						};
-						if (typeof maybeLoader.setMessage === "function") {
-							const originalSetMessage = maybeLoader.setMessage.bind(maybeLoader);
-							maybeLoader.setMessage = (message: string) => {
-								originalSetMessage(message);
-								recordRender();
-							};
-						}
 					});
 				});
 			},
@@ -1899,12 +1895,12 @@ describe("sandbox extension", () => {
 			expect(selectTitle).toContain("3. Download the sandbox image — 240 MB.");
 			expect(selectItems).toEqual(["Install and set up", "Show commands", "Disable sandbox", "Cancel"]);
 
-			expect(session.loaderMessages[0]).toContain("Downloading the installer...");
+			expect(session.loaderMessages[0]).toContain("Downloading");
 			expect(
 				session.loaderMessages.some(
 					(m) =>
 						m.includes("Installing Apple container 1.7.1") &&
-						m.includes("Downloading the installer: 1 of 2 MB") &&
+						m.split("\n").some((line) => line.includes("Downloading") && line.includes("1.0/2.0 MB")) &&
 						m.includes("Esc cancels. Nothing is installed until you enter your password."),
 				),
 			).toBe(true);
@@ -1912,7 +1908,7 @@ describe("sandbox extension", () => {
 				session.loaderMessages.some(
 					(m) =>
 						m.includes("Installing Apple container 1.7.1") &&
-						m.includes("Downloading the installer: 2 of 2 MB") &&
+						m.split("\n").some((line) => line.includes("Downloading") && line.includes("2.0/2.0 MB")) &&
 						m.includes("Esc cancels. Nothing is installed until you enter your password."),
 				),
 			).toBe(true);
@@ -2005,7 +2001,7 @@ describe("sandbox extension", () => {
 				{
 					selectChoice: "Install and set up",
 					onLoaderMessage: (msg, pressEscape) => {
-						if (msg.includes("Downloading the installer: 1 of 2 MB")) {
+						if (msg.includes("1.0/2.0 MB")) {
 							partFilesAtEscape = readdirSync(
 								join(process.env.POLAR_CODING_AGENT_DIR!, "container-install"),
 							).filter((name) => name.endsWith(".pkg.part"));
@@ -2036,7 +2032,7 @@ describe("sandbox extension", () => {
 				{
 					selectChoice: "Install and set up",
 					onLoaderMessage: (msg) => {
-						if (msg.includes("Downloading the installer: 1 of 2 MB")) {
+						if (msg.includes("1.0/2.0 MB")) {
 							session.setIdleState(false);
 						}
 					},
@@ -2055,7 +2051,11 @@ describe("sandbox extension", () => {
 			try {
 				await until(() => waitForIdleStarted);
 				expect(
-					session.loaderMessages.some((m) => m.includes("Waiting for the current response to finish...")),
+					session.loaderMessages.some(
+						(m) =>
+							m.includes("Waiting for the current response to finish...") &&
+							m.includes("Esc cancels. Nothing is installed until you enter your password."),
+					),
 				).toBe(true);
 				session.pressEscape();
 				await until(() => commandDone, 1000);
@@ -2080,7 +2080,7 @@ describe("sandbox extension", () => {
 				{
 					selectChoice: "Install and set up",
 					onLoaderMessage: (msg) => {
-						if (msg.includes("Downloading the installer: 1 of 2 MB")) {
+						if (msg.includes("1.0/2.0 MB")) {
 							session.setIdleState(true, true);
 						}
 					},
@@ -2095,9 +2095,13 @@ describe("sandbox extension", () => {
 
 			await until(() => waitForIdleCalls >= 1);
 			await new Promise((resolve) => setTimeout(resolve, 50));
-			expect(session.loaderMessages.some((m) => m.includes("Waiting for the current response to finish..."))).toBe(
-				true,
-			);
+			expect(
+				session.loaderMessages.some(
+					(m) =>
+						m.includes("Waiting for the current response to finish...") &&
+						m.includes("Esc cancels. Nothing is installed until you enter your password."),
+				),
+			).toBe(true);
 			expect(session.tuiEvents.some((e) => e.startsWith("stop:"))).toBe(false);
 			expect(await readInstallerCalls()).toEqual([]);
 
