@@ -17,6 +17,7 @@ Polar integrates into the monorepo core at:
 - `packages/coding-agent/src/core/slash-commands.ts`
 - `packages/coding-agent/src/core/settings-manager.ts`
 - `packages/coding-agent/src/modes/interactive/interactive-mode.ts`
+- `packages/coding-agent/src/modes/interactive/components/footer.ts`
 - `packages/ai/src/utils/pi-user-agent.ts`
 - `packages/tui/src/tui-main-screen.ts`
 

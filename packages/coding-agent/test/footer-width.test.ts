@@ -3,7 +3,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import type { AgentSession } from "../src/core/agent-session.ts";
 import type { ReadonlyFooterDataProvider } from "../src/core/footer-data-provider.ts";
 import { FooterComponent, formatCwdForFooter } from "../src/modes/interactive/components/footer.ts";
-import { initTheme } from "../src/modes/interactive/theme/theme.ts";
+import { initTheme, theme } from "../src/modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../src/utils/ansi.ts";
 
 type AssistantUsage = {
@@ -92,10 +92,13 @@ function createSession(options: {
 	return session as unknown as AgentSession;
 }
 
-function createFooterData(providerCount: number): ReadonlyFooterDataProvider {
+function createFooterData(
+	providerCount: number,
+	extensionStatuses: ReadonlyMap<string, string> = new Map(),
+): ReadonlyFooterDataProvider {
 	const provider = {
 		getGitBranch: () => "main",
-		getExtensionStatuses: () => new Map<string, string>(),
+		getExtensionStatuses: () => extensionStatuses,
 		getAvailableProviderCount: () => providerCount,
 		onBranchChange: (callback: () => void) => {
 			void callback;
@@ -278,5 +281,106 @@ describe("FooterComponent width handling", () => {
 
 		expect(stats).toContain("$1.234");
 		expect(stats).not.toContain("(sub)");
+	});
+
+	it("joins extension statuses with ' · ' and omits empty statuses without dangling separators", () => {
+		const session = createSession({ sessionName: "" });
+		const statuses = new Map<string, string>([
+			["a-empty", "   \n\t  "],
+			["d-ansi-empty", theme.fg("dim", "")],
+			["k8s", "kubeconfig: prod-eu-west-1"],
+			["m-empty", ""],
+			["sandbox", "sandbox: off, run /sandbox"],
+			["z-empty", "\r\n"],
+		]);
+		const footer = new FooterComponent(session, createFooterData(1, statuses));
+
+		const lines = footer.render(80);
+		expect(lines).toHaveLength(3);
+		expect(stripAnsi(lines[1])).toContain("12.3%/200k (auto)");
+		expect(stripAnsi(lines[2])).toBe("kubeconfig: prod-eu-west-1 · sandbox: off, run /sandbox");
+
+		const emptyOnlyFooter = new FooterComponent(
+			session,
+			createFooterData(
+				1,
+				new Map([
+					["ansi", theme.fg("dim", "")],
+					["k8s", "  \t\n "],
+					["sandbox", ""],
+				]),
+			),
+		);
+		const emptyOnlyLines = emptyOnlyFooter.render(80);
+		expect(emptyOnlyLines).toHaveLength(2);
+		expect(stripAnsi(emptyOnlyLines[1])).toContain("12.3%/200k (auto)");
+	});
+
+	it("wraps extension statuses across lines without ellipsis and truncates single oversized status", () => {
+		const width = 80;
+		const session = createSession({ sessionName: "" });
+		const clusterStatus = "kubeconfig: arn:aws:eks:eu-west-1:123456789012:cluster/production-main";
+		const sandboxStatus = "sandbox: off, run /sandbox";
+		const thirdStatus = "extra: ok";
+		const footer = new FooterComponent(
+			session,
+			createFooterData(
+				1,
+				new Map([
+					["1-k8s", clusterStatus],
+					["2-sandbox", sandboxStatus],
+					["3-extra", thirdStatus],
+				]),
+			),
+		);
+
+		const lines = footer.render(width);
+		for (const line of lines) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+		}
+		expect(lines.slice(2).map(stripAnsi)).toEqual([clusterStatus, `${sandboxStatus} · ${thirdStatus}`]);
+
+		const narrowWidth = 40;
+		const narrowLines = footer.render(narrowWidth);
+		for (const line of narrowLines) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(narrowWidth);
+		}
+		expect(stripAnsi(narrowLines[2])).toBe(`${clusterStatus.slice(0, narrowWidth - 3)}...`);
+		expect(stripAnsi(narrowLines[3])).toBe(`${sandboxStatus} · ${thirdStatus}`);
+	});
+
+	it("measures extension status width with visibleWidth for ANSI codes and wide characters", () => {
+		const session = createSession({ sessionName: "" });
+
+		// ANSI codes increase string.length (43 total with separator) while visibleWidth is 33.
+		const ansiStatuses = new Map<string, string>([
+			["1-k8s", "\x1b[32mkubeconfig: prod\x1b[39m"],
+			["2-sandbox", "sandbox: ready"],
+		]);
+		const ansiFooter = new FooterComponent(session, createFooterData(1, ansiStatuses));
+		const ansiLines = ansiFooter.render(33);
+		expect(ansiLines).toHaveLength(3);
+		expect(visibleWidth(ansiLines[2])).toBe(33);
+		expect(stripAnsi(ansiLines[2])).toBe("kubeconfig: prod · sandbox: ready");
+
+		const wrappedAnsiLines = ansiFooter.render(32);
+		for (const line of wrappedAnsiLines) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(32);
+		}
+		expect(wrappedAnsiLines.slice(2).map(stripAnsi)).toEqual(["kubeconfig: prod", "sandbox: ready"]);
+
+		// Wide characters have string.length 26 (55 total with separator <= 60) while visibleWidth is 50 (79 total > 60).
+		const wideCluster = `클러스터: ${"한글".repeat(10)}`;
+		const sandboxStatus = "sandbox: off, run /sandbox";
+		const wideStatuses = new Map<string, string>([
+			["1-k8s", wideCluster],
+			["2-sandbox", sandboxStatus],
+		]);
+		const wideFooter = new FooterComponent(session, createFooterData(1, wideStatuses));
+		const wideLines = wideFooter.render(60);
+		for (const line of wideLines) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(60);
+		}
+		expect(wideLines.slice(2).map(stripAnsi)).toEqual([wideCluster, sandboxStatus]);
 	});
 });
